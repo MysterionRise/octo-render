@@ -10,3 +10,9 @@ Possibility to implement with:
 - elm (http://elm-lang.org/)
 - http://vertx.io/ is it possible to use it?
 - ???
+- 
+
+Problems:
+- How to load TGA to follow up the course?
+- Rewrite https://github.com/ssloy/tinyrenderer/blob/909fe20934ba5334144d2c748805690a1fa4c89f/tgaimage.cpp ?  
+- 
