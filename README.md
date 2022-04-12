@@ -1,6 +1,5 @@
 # octo-render
-Repository for creating some small subset of OpenGL functionality with the help of this article - https://habr.com/en/post/248153/
+Repository for creating some small subset of OpenGL functionality with the help of these lessons - https://github.com/ssloy/tinyrenderer/wiki/
 
 ### Extra resources
 
-- How OpenGL works: https://github.com/ssloy/tinyrenderer/wiki
