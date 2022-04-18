@@ -2,22 +2,35 @@ use image::{Rgb, RgbImage};
 use std::fs::File;
 use std::io;
 use std::io::{BufRead};
-use std::path::Path;
 use io::BufReader;
 
-pub fn read_waveform_obj_file(filename: &str) {
+pub fn read_waveform_obj_file(filename: &str) -> (Vec<(f32, f32, f32)>, Vec<(i32, i32, i32)>) {
     let file = File::open(filename).unwrap();
     let reader = BufReader::new(file);
     let lines = reader.lines();
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
     for line in lines {
         let line = line.unwrap();
         if line.starts_with("f") {
-            println!("{}", line);
+            // println!("{}", line);
+            let mut parts = line.split_whitespace();
+            parts.next();
+            let v1 = parts.next().unwrap().parse::<i32>().unwrap();
+            let v2 = parts.next().unwrap().parse::<i32>().unwrap();
+            let v3 = parts.next().unwrap().parse::<i32>().unwrap();
+            faces.push((v1, v2, v3));
         } else if line.starts_with("v") {
-            println!("{}", line);
+            // println!("{}", line);
+            let mut parts = line.split_whitespace();
+            parts.next();
+            let x = parts.next().unwrap().parse::<f32>().unwrap();
+            let y = parts.next().unwrap().parse::<f32>().unwrap();
+            let z = parts.next().unwrap().parse::<f32>().unwrap();
+            vertices.push((x, y, z));
         }
-
     }
+    (vertices, faces)
 }
 
 pub fn draw_line(mut x1: i32, mut y1: i32, mut x2: i32, mut y2: i32, image: &mut RgbImage, colour: Rgb<u8>) {
@@ -47,7 +60,6 @@ pub fn draw_line(mut x1: i32, mut y1: i32, mut x2: i32, mut y2: i32, image: &mut
             y += if y2 > y1 { 1 } else { -1 };
             error2 -= dx * 2;
         }
-
     }
 }
 
