@@ -1,0 +1,11 @@
+[package]
+name = "octo-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "24"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+octo-core = { path = "../core" }
+log = "0.4"

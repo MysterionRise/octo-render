@@ -1,0 +1,9 @@
+[package]
+name = "octo-asset"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+octo-core = { path = "../core" }
+glam = "0.32"
+log = "0.4"

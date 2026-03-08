@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use renderer::{draw_line};
 use rand::Rng;
 use image::{Rgb, RgbImage, ImageBuffer};
@@ -15,7 +15,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     }).collect::<Vec<Pairs>>();
 
     let tga_red = Rgb([255, 0, 0]);
-    let tga_white = Rgb([255, 255, 255]);
+    let _tga_white = Rgb([255, 255, 255]);
     let mut image: RgbImage = ImageBuffer::new(to as u32, to as u32);
     let mut group = c.benchmark_group("drawing line");
 

@@ -1,0 +1,24 @@
+[package]
+name = "octo-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "octo-app"
+path = "src/main.rs"
+
+[dependencies]
+octo-core = { path = "../core" }
+octo-asset = { path = "../asset" }
+octo-gpu = { path = "../gpu" }
+octo-renderer = { path = "../renderer" }
+wgpu = "24"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+glam = "0.32"
+env_logger = "0.11"
+log = "0.4"
