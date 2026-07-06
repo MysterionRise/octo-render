@@ -55,8 +55,8 @@ fn resolve_index(s: &str, count: usize) -> Option<usize> {
 
 /// Load an OBJ file into a Model.
 pub fn load_obj(filename: &str) -> Result<Model, String> {
-    let file =
-        File::open(filename).map_err(|e| format!("Failed to open OBJ file '{}': {}", filename, e))?;
+    let file = File::open(filename)
+        .map_err(|e| format!("Failed to open OBJ file '{}': {}", filename, e))?;
     let reader = BufReader::new(file);
     let mut vertices = Vec::new();
     let mut texcoords = Vec::new();
@@ -103,18 +103,16 @@ pub fn load_obj(filename: &str) -> Result<Model, String> {
             let mut parts = line.split_whitespace();
             parts.next();
             match (parts.next(), parts.next()) {
-                (Some(u_str), Some(v_str)) => {
-                    match (u_str.parse::<f32>(), v_str.parse::<f32>()) {
-                        (Ok(u), Ok(v)) => texcoords.push(Vec2::new(u, v)),
-                        _ => {
-                            log::warn!(
-                                "{}:{}: skipping malformed texcoord line",
-                                filename,
-                                line_num + 1
-                            );
-                        }
+                (Some(u_str), Some(v_str)) => match (u_str.parse::<f32>(), v_str.parse::<f32>()) {
+                    (Ok(u), Ok(v)) => texcoords.push(Vec2::new(u, v)),
+                    _ => {
+                        log::warn!(
+                            "{}:{}: skipping malformed texcoord line",
+                            filename,
+                            line_num + 1
+                        );
                     }
-                }
+                },
                 _ => {
                     log::warn!(
                         "{}:{}: skipping incomplete texcoord line",

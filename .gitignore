@@ -14,3 +14,11 @@ Cargo.lock
 *.pdb
 
 .idea
+
+# Local agent/editor state
+.claude/
+.codex/
+AGENTS.md
+
+# Legacy single-output render artifact. Portfolio renders live in renders/.
+output.tga

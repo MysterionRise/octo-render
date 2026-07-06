@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use octo_core::Model;
 use wgpu::util::DeviceExt;
 
@@ -8,12 +8,14 @@ use wgpu::util::DeviceExt;
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub texcoord: [f32; 2],
 }
 
 impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
+        2 => Float32x2,
     ];
 
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -49,21 +51,21 @@ impl GpuMesh {
 
             for fv in face {
                 let position = model.vertices[fv.v];
-                let normal = fv
-                    .vn
-                    .map(|ni| model.normals[ni])
-                    .unwrap_or(face_normal);
+                let normal = fv.vn.map(|ni| model.normals[ni]).unwrap_or(face_normal);
 
                 // Handle NaN normals from degenerate triangles
-                let normal = if normal.is_nan() {
-                    Vec3::Y
-                } else {
-                    normal
-                };
+                let normal = if normal.is_nan() { Vec3::Y } else { normal };
+
+                let texcoord: [f32; 2] = fv
+                    .vt
+                    .map(|ti| model.texcoords[ti])
+                    .unwrap_or(Vec2::ZERO)
+                    .into();
 
                 vertices.push(Vertex {
                     position: position.into(),
                     normal: normal.into(),
+                    texcoord,
                 });
             }
 

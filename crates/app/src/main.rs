@@ -3,8 +3,10 @@ use std::sync::Arc;
 use glam::{Mat4, Vec3};
 use octo_asset::load_obj;
 use octo_gpu::GpuContext;
-use octo_renderer::{ForwardPass, GpuMesh, OrbitCamera};
-use octo_renderer::forward::ForwardUniforms;
+use octo_renderer::blit::PostProcessParams;
+use octo_renderer::forward::{ForwardUniforms, MaterialParams, ShadowParams};
+use octo_renderer::shadow::ShadowUniforms;
+use octo_renderer::{ForwardPass, Framebuffer, GpuMesh, OrbitCamera, PostProcessPass, ShadowPass};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -20,7 +22,10 @@ const MODELS: &[(&str, &str)] = &[
 
 struct RenderState {
     gpu: GpuContext,
+    shadow_pass: ShadowPass,
     forward_pass: ForwardPass,
+    framebuffer: Framebuffer,
+    post_process: PostProcessPass,
     mesh: GpuMesh,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -38,6 +43,25 @@ struct App {
     light_dir: [f32; 3],
     current_model_idx: usize,
     model_changed: bool,
+    // Material
+    base_color: [f32; 3],
+    shininess: f32,
+    specular_strength: f32,
+    ambient_strength: f32,
+    // Shadows
+    shadow_enabled: bool,
+    shadow_bias: f32,
+    shadow_strength: f32,
+    // Post-processing
+    exposure: f32,
+    contrast: f32,
+    saturation: f32,
+    vignette: f32,
+    fog_enabled: bool,
+    fog_near: f32,
+    fog_far: f32,
+    fog_color: [f32; 3],
+    tint: [f32; 3],
 }
 
 impl App {
@@ -51,9 +75,24 @@ impl App {
             light_dir: [1.0, 1.0, -1.0],
             current_model_idx: 0,
             model_changed: false,
+            base_color: [0.8, 0.6, 0.4],
+            shininess: 32.0,
+            specular_strength: 0.5,
+            ambient_strength: 0.1,
+            shadow_enabled: true,
+            shadow_bias: 0.005,
+            shadow_strength: 0.5,
+            exposure: 1.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            vignette: 0.0,
+            fog_enabled: false,
+            fog_near: 50.0,
+            fog_far: 500.0,
+            fog_color: [0.6, 0.65, 0.7],
+            tint: [1.0, 1.0, 1.0],
         }
     }
-
 }
 
 impl ApplicationHandler for App {
@@ -72,8 +111,15 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         self.camera.aspect = size.width as f32 / size.height as f32;
 
-        let forward_pass =
-            ForwardPass::new(&gpu.device, gpu.surface_format, size.width, size.height);
+        let shadow_pass = ShadowPass::new(&gpu.device);
+        let forward_pass = ForwardPass::new(&gpu.device, &gpu.queue, &shadow_pass);
+        let framebuffer = Framebuffer::new(&gpu.device, size.width, size.height);
+        let mut post_process = PostProcessPass::new(&gpu.device, gpu.surface_format);
+        post_process.update_source(
+            &gpu.device,
+            &framebuffer.color_view,
+            &framebuffer.depth_view,
+        );
 
         // Load initial model
         let (_, path) = MODELS[self.current_model_idx];
@@ -91,17 +137,15 @@ impl ApplicationHandler for App {
             None,
             None,
         );
-        let egui_renderer = egui_wgpu::Renderer::new(
-            &gpu.device,
-            gpu.surface_format,
-            None,
-            1,
-            false,
-        );
+        let egui_renderer =
+            egui_wgpu::Renderer::new(&gpu.device, gpu.surface_format, None, 1, false);
 
         self.render = Some(RenderState {
             gpu,
+            shadow_pass,
             forward_pass,
+            framebuffer,
+            post_process,
             mesh,
             egui_ctx,
             egui_state,
@@ -133,8 +177,13 @@ impl ApplicationHandler for App {
                 if let Some(render) = &mut self.render {
                     render.gpu.resize(new_size.width, new_size.height);
                     render
-                        .forward_pass
+                        .framebuffer
                         .resize(&render.gpu.device, new_size.width, new_size.height);
+                    render.post_process.update_source(
+                        &render.gpu.device,
+                        &render.framebuffer.color_view,
+                        &render.framebuffer.depth_view,
+                    );
                     self.camera.aspect = new_size.width as f32 / new_size.height as f32;
                 }
             }
@@ -201,11 +250,7 @@ impl App {
                         .show_ui(ui, |ui| {
                             for (i, (name, _)) in MODELS.iter().enumerate() {
                                 if ui
-                                    .selectable_value(
-                                        &mut self.current_model_idx,
-                                        i,
-                                        *name,
-                                    )
+                                    .selectable_value(&mut self.current_model_idx, i, *name)
                                     .changed()
                                 {
                                     self.model_changed = true;
@@ -218,6 +263,57 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.light_dir[0], -1.0..=1.0).text("X"));
                     ui.add(egui::Slider::new(&mut self.light_dir[1], -1.0..=1.0).text("Y"));
                     ui.add(egui::Slider::new(&mut self.light_dir[2], -1.0..=1.0).text("Z"));
+
+                    ui.separator();
+                    ui.label("Material:");
+                    ui.horizontal(|ui| {
+                        ui.label("Color:");
+                        ui.color_edit_button_rgb(&mut self.base_color);
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut self.shininess, 2.0..=256.0)
+                            .logarithmic(true)
+                            .text("Shininess"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.specular_strength, 0.0..=2.0).text("Specular"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.ambient_strength, 0.0..=1.0).text("Ambient"),
+                    );
+
+                    ui.separator();
+                    ui.label("Shadows:");
+                    ui.checkbox(&mut self.shadow_enabled, "Enable Shadows");
+                    ui.add(egui::Slider::new(&mut self.shadow_bias, 0.0..=0.05).text("Bias"));
+                    ui.add(
+                        egui::Slider::new(&mut self.shadow_strength, 0.0..=1.0).text("Strength"),
+                    );
+
+                    ui.separator();
+                    ui.label("Post-Processing:");
+                    ui.add(
+                        egui::Slider::new(&mut self.exposure, 0.1..=5.0)
+                            .logarithmic(true)
+                            .text("Exposure"),
+                    );
+                    ui.add(egui::Slider::new(&mut self.contrast, 0.5..=2.0).text("Contrast"));
+                    ui.add(egui::Slider::new(&mut self.saturation, 0.0..=2.0).text("Saturation"));
+                    ui.add(egui::Slider::new(&mut self.vignette, 0.0..=1.0).text("Vignette"));
+                    ui.horizontal(|ui| {
+                        ui.label("Tint:");
+                        ui.color_edit_button_rgb(&mut self.tint);
+                    });
+
+                    ui.separator();
+                    ui.label("Fog:");
+                    ui.checkbox(&mut self.fog_enabled, "Enable Fog");
+                    ui.add(egui::Slider::new(&mut self.fog_near, 1.0..=200.0).text("Near"));
+                    ui.add(egui::Slider::new(&mut self.fog_far, 50.0..=1000.0).text("Far"));
+                    ui.horizontal(|ui| {
+                        ui.label("Color:");
+                        ui.color_edit_button_rgb(&mut self.fog_color);
+                    });
 
                     ui.separator();
                     ui.label(format!(
@@ -258,10 +354,7 @@ impl App {
             Ok(tex) => tex,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 let config = &render.gpu.surface_config;
-                render
-                    .gpu
-                    .surface
-                    .configure(&render.gpu.device, config);
+                render.gpu.surface.configure(&render.gpu.device, config);
                 return;
             }
             Err(e) => {
@@ -282,23 +375,83 @@ impl App {
                     label: Some("Render Encoder"),
                 });
 
-        // Forward pass — Gouraud shading
         let raw_light = Vec3::new(self.light_dir[0], self.light_dir[1], self.light_dir[2]);
         let light = if raw_light.length_squared() < 1e-6 {
             Vec3::Y
         } else {
             raw_light.normalize()
         };
+
+        // Compute light view-proj for shadow mapping
+        let light_pos = light * 500.0;
+        let light_view = Mat4::look_at_rh(light_pos, Vec3::ZERO, Vec3::Y);
+        let light_proj = Mat4::orthographic_rh(-300.0, 300.0, -300.0, 300.0, 1.0, 1000.0);
+        let light_view_proj = light_proj * light_view;
+
+        // Shadow pass — depth-only from light POV
+        let shadow_uniforms = ShadowUniforms {
+            light_view_proj: light_view_proj.to_cols_array_2d(),
+            model: Mat4::IDENTITY.to_cols_array_2d(),
+        };
+        render.shadow_pass.render(
+            &mut encoder,
+            &render.gpu.queue,
+            &shadow_uniforms,
+            &[&render.mesh],
+        );
+
+        // Forward pass — Blinn-Phong shading → framebuffer (HDR)
+        let material = MaterialParams {
+            base_color: [
+                self.base_color[0],
+                self.base_color[1],
+                self.base_color[2],
+                1.0,
+            ],
+            specular_strength: self.specular_strength,
+            shininess: self.shininess,
+            ambient_strength: self.ambient_strength,
+            has_texture: false,
+        };
+        let shadow = ShadowParams {
+            light_view_proj,
+            enabled: self.shadow_enabled,
+            bias: self.shadow_bias,
+            strength: self.shadow_strength,
+        };
         let uniforms = ForwardUniforms::new(
             &self.camera.uniforms(),
             Mat4::IDENTITY,
             [light.x, light.y, light.z],
+            &material,
+            &shadow,
         );
-        render
-            .forward_pass
-            .render(&mut encoder, &view, &render.gpu.queue, &uniforms, &[&render.mesh]);
+        render.forward_pass.render(
+            &mut encoder,
+            &render.framebuffer,
+            &render.gpu.queue,
+            &uniforms,
+            &[&render.mesh],
+            None,
+        );
 
-        // egui render
+        // Post-process pass — framebuffer → swapchain (tone mapping, fog, color grading)
+        let pp_params = PostProcessParams {
+            fog_color: [self.fog_color[0], self.fog_color[1], self.fog_color[2], 1.0],
+            fog_params: [
+                if self.fog_enabled { 1.0 } else { 0.0 },
+                self.fog_near,
+                self.fog_far,
+                1.0,
+            ],
+            color_grade: [self.exposure, self.contrast, self.saturation, self.vignette],
+            tint: [self.tint[0], self.tint[1], self.tint[2], 1.0],
+        };
+        render
+            .post_process
+            .render(&mut encoder, &view, &render.gpu.queue, &pp_params);
+
+        // egui render (on top of swapchain)
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [
                 render.gpu.surface_config.width,
