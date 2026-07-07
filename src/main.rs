@@ -1,9 +1,9 @@
 use glam::Vec3;
 use image::Rgb;
 use renderer::{
-    render_model, CullMode, DepthState, FillMode, FrontFace, Material, Model, RenderMode,
-    RenderOptions, RenderState, ScissorRect, ShadowFilter, ShadowOptions, TextureFilter,
-    TextureSampler, TextureWrap,
+    build_mipmaps, render_model, BlendMode, CullMode, DepthState, FillMode, FrontFace, Material,
+    Model, ObjMaterial, RenderMode, RenderOptions, RenderState, ScissorRect, ShadowFilter,
+    ShadowOptions, TextureFilter, TextureSampler, TextureWrap,
 };
 use std::env;
 use std::fs;
@@ -31,12 +31,25 @@ struct Cli {
     clear_color: Rgb<u8>,
     clear_depth: f32,
     color_write: bool,
+    blend_mode: BlendMode,
     texture: Option<PathBuf>,
     normal_map: Option<PathBuf>,
     texture_wrap: TextureWrap,
     texture_filter: TextureFilter,
+    material_name: Option<String>,
     material: Material,
+    material_overrides: MaterialOverrides,
     shadow: ShadowOptions,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MaterialOverrides {
+    base_color: bool,
+    ambient: bool,
+    diffuse: bool,
+    specular: bool,
+    shininess: bool,
+    alpha: bool,
 }
 
 impl Default for Cli {
@@ -59,11 +72,14 @@ impl Default for Cli {
             clear_color: Rgb([18, 20, 24]),
             clear_depth: f32::NEG_INFINITY,
             color_write: true,
+            blend_mode: BlendMode::Off,
             texture: None,
             normal_map: None,
             texture_wrap: TextureWrap::Repeat,
             texture_filter: TextureFilter::Nearest,
+            material_name: None,
             material: Material::default(),
+            material_overrides: MaterialOverrides::default(),
             shadow: ShadowOptions::default(),
         }
     }
@@ -80,13 +96,36 @@ fn run() -> Result<(), String> {
     let cli = parse_args(env::args().skip(1))?;
 
     let model = Model::load(&cli.model)?;
-    let texture = match &cli.texture {
+    let selected_material = select_material(&model, cli.material_name.as_deref())?;
+    let material = resolve_material(&cli, selected_material);
+    let texture_path = cli
+        .texture
+        .clone()
+        .or_else(|| selected_material.and_then(|material| material.diffuse_map.clone()));
+    let normal_map_path = cli
+        .normal_map
+        .clone()
+        .or_else(|| selected_material.and_then(|material| material.normal_map.clone()));
+    let texture = match &texture_path {
         Some(path) => Some(load_texture(path)?),
         None => None,
     };
-    let normal_map = match &cli.normal_map {
+    let normal_map = match &normal_map_path {
         Some(path) => Some(load_texture(path)?),
         None => None,
+    };
+    let texture_mipmaps = if cli.texture_filter == TextureFilter::Mipmap {
+        texture.as_ref().map(build_mipmaps).unwrap_or_else(Vec::new)
+    } else {
+        Vec::new()
+    };
+    let normal_map_mipmaps = if cli.texture_filter == TextureFilter::Mipmap {
+        normal_map
+            .as_ref()
+            .map(build_mipmaps)
+            .unwrap_or_else(Vec::new)
+    } else {
+        Vec::new()
     };
     let options = RenderOptions {
         width: cli.width,
@@ -107,16 +146,20 @@ fn run() -> Result<(), String> {
             clear_color: cli.clear_color,
             clear_depth: cli.clear_depth,
             color_write: cli.color_write,
+            blend_mode: cli.blend_mode,
         },
         texture,
+        texture_mipmaps,
         normal_map,
+        normal_map_mipmaps,
         texture_sampler: TextureSampler {
             wrap: cli.texture_wrap,
             filter: cli.texture_filter,
         },
-        material: cli.material,
+        material,
         shadow: cli.shadow,
         near_plane: 0.01,
+        far_plane: 1000.0,
     };
 
     let started = Instant::now();
@@ -161,6 +204,63 @@ fn run() -> Result<(), String> {
     );
 
     Ok(())
+}
+
+fn select_material<'a>(
+    model: &'a Model,
+    requested: Option<&str>,
+) -> Result<Option<&'a ObjMaterial>, String> {
+    if let Some(name) = requested {
+        return model
+            .materials
+            .iter()
+            .find(|material| material.name == name)
+            .map(Some)
+            .ok_or_else(|| {
+                let available = model
+                    .materials
+                    .iter()
+                    .map(|material| material.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "unknown material '{}'; available materials: {}",
+                    name,
+                    if available.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        available
+                    }
+                )
+            });
+    }
+
+    Ok(model.materials.first())
+}
+
+fn resolve_material(cli: &Cli, selected: Option<&ObjMaterial>) -> Material {
+    let mut material = selected
+        .map(|material| material.material)
+        .unwrap_or_default();
+    if cli.material_overrides.base_color {
+        material.base_color = cli.material.base_color;
+    }
+    if cli.material_overrides.ambient {
+        material.ambient = cli.material.ambient;
+    }
+    if cli.material_overrides.diffuse {
+        material.diffuse = cli.material.diffuse;
+    }
+    if cli.material_overrides.specular {
+        material.specular = cli.material.specular;
+    }
+    if cli.material_overrides.shininess {
+        material.shininess = cli.material.shininess;
+    }
+    if cli.material_overrides.alpha {
+        material.alpha = cli.material.alpha;
+    }
+    material
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -215,6 +315,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--color-write" => {
                 cli.color_write = parse_on_off(&value("--color-write")?, "--color-write")?
             }
+            "--blend" => cli.blend_mode = BlendMode::from_str(&value("--blend")?)?,
             "--texture" => cli.texture = Some(PathBuf::from(value("--texture")?)),
             "--normal-map" => cli.normal_map = Some(PathBuf::from(value("--normal-map")?)),
             "--texture-wrap" => {
@@ -223,16 +324,30 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--texture-filter" => {
                 cli.texture_filter = TextureFilter::from_str(&value("--texture-filter")?)?
             }
+            "--material" => cli.material_name = Some(value("--material")?),
             "--base-color" => {
-                cli.material.base_color = parse_rgb(&value("--base-color")?, "--base-color")?
+                cli.material.base_color = parse_rgb(&value("--base-color")?, "--base-color")?;
+                cli.material_overrides.base_color = true;
             }
-            "--ambient" => cli.material.ambient = parse_f32_arg(&value("--ambient")?, "--ambient")?,
-            "--diffuse" => cli.material.diffuse = parse_f32_arg(&value("--diffuse")?, "--diffuse")?,
+            "--ambient" => {
+                cli.material.ambient = parse_f32_arg(&value("--ambient")?, "--ambient")?;
+                cli.material_overrides.ambient = true;
+            }
+            "--diffuse" => {
+                cli.material.diffuse = parse_f32_arg(&value("--diffuse")?, "--diffuse")?;
+                cli.material_overrides.diffuse = true;
+            }
             "--specular" => {
-                cli.material.specular = parse_f32_arg(&value("--specular")?, "--specular")?
+                cli.material.specular = parse_f32_arg(&value("--specular")?, "--specular")?;
+                cli.material_overrides.specular = true;
             }
             "--shininess" => {
-                cli.material.shininess = parse_f32_arg(&value("--shininess")?, "--shininess")?
+                cli.material.shininess = parse_f32_arg(&value("--shininess")?, "--shininess")?;
+                cli.material_overrides.shininess = true;
+            }
+            "--alpha" => {
+                cli.material.alpha = parse_f32_arg(&value("--alpha")?, "--alpha")?;
+                cli.material_overrides.alpha = true;
             }
             "--shadow-size" => {
                 cli.shadow.size = parse_positive_u32(&value("--shadow-size")?, "--shadow-size")?
@@ -262,9 +377,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         || cli.material.diffuse < 0.0
         || cli.material.specular < 0.0
         || cli.material.shininess <= 0.0
+        || !(0.0..=1.0).contains(&cli.material.alpha)
     {
         return Err(
-            "--ambient/--diffuse/--specular must be >= 0 and --shininess must be > 0".to_string(),
+            "--ambient/--diffuse/--specular must be >= 0, --shininess must be > 0, and --alpha must be 0..1".to_string(),
         );
     }
     if cli.shadow.bias < 0.0 {
@@ -397,15 +513,18 @@ Options:
   --clear-color <r,g,b> Clear color [default: 18,20,24]
   --clear-depth <z>    Clear depth [default: -inf]
   --color-write <on|off> Enable/disable color writes [default: on]
+  --blend <mode>       Blend mode: off, alpha, additive [default: off]
   --texture <path>     Texture image used by --shader texture
   --normal-map <path>  Normal-map image used by --shader normal-map
   --texture-wrap <mode> Texture wrap: repeat, clamp [default: repeat]
-  --texture-filter <mode> Texture filter: nearest, linear [default: nearest]
+  --texture-filter <mode> Texture filter: nearest, linear, mipmap [default: nearest]
+  --material <name>    OBJ/MTL material to use when the model has materials
   --base-color <r,g,b> Material base color [default: 220,220,220]
   --ambient <value>    Ambient material factor [default: 0]
   --diffuse <value>    Diffuse material factor [default: 1]
   --specular <value>   Specular material factor [default: 0]
   --shininess <value>  Specular exponent control [default: 32]
+  --alpha <value>      Material alpha for blend modes [default: 1]
   --shadow-size <px>   Square shadow-map size [default: output dimensions]
   --shadow-bias <z>    Shadow-map depth bias [default: 4]
   --shadow-filter <mode> Shadow filter: none, pcf [default: none]
@@ -447,6 +566,10 @@ mod tests {
                 "-inf",
                 "--color-write",
                 "off",
+                "--blend",
+                "alpha",
+                "--material",
+                "painted",
                 "--base-color",
                 "200,180,160",
                 "--ambient",
@@ -457,6 +580,8 @@ mod tests {
                 "0.2",
                 "--shininess",
                 "64",
+                "--alpha",
+                "0.5",
                 "--shadow-size",
                 "256",
                 "--shadow-bias",
@@ -489,11 +614,16 @@ mod tests {
         assert_eq!(cli.clear_color, Rgb([10, 20, 30]));
         assert!(cli.clear_depth.is_infinite() && cli.clear_depth.is_sign_negative());
         assert!(!cli.color_write);
+        assert_eq!(cli.blend_mode, BlendMode::Alpha);
+        assert_eq!(cli.material_name.as_deref(), Some("painted"));
         assert_eq!(cli.material.base_color, Rgb([200, 180, 160]));
         assert_eq!(cli.material.ambient, 0.1);
         assert_eq!(cli.material.diffuse, 0.8);
         assert_eq!(cli.material.specular, 0.2);
         assert_eq!(cli.material.shininess, 64.0);
+        assert_eq!(cli.material.alpha, 0.5);
+        assert!(cli.material_overrides.base_color);
+        assert!(cli.material_overrides.alpha);
         assert_eq!(cli.shadow.size, 256);
         assert_eq!(cli.shadow.bias, 2.0);
         assert_eq!(cli.shadow.filter, ShadowFilter::Pcf);

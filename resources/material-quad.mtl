@@ -1,0 +1,8 @@
+newmtl painted
+Ka 0.06 0.06 0.06
+Kd 0.85 0.78 0.58
+Ks 0.20 0.20 0.20
+Ns 48
+d 0.72
+map_Kd checker.ppm
+map_Bump normal-checker.ppm

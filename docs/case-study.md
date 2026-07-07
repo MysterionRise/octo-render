@@ -8,30 +8,34 @@ The CPU renderer is the primary proof. The `wgpu` viewer is a separate interacti
 
 ## Implemented Pipeline
 
-The renderer loads OBJ meshes, normalizes model bounds, applies model/view/projection transforms, clips near-plane-crossing triangles, maps to the viewport, rasterizes triangles with barycentric coordinates, applies render state, runs fragment-style shading, writes a z-buffer, and optionally runs shadow mapping and SSAO/debug passes.
+The renderer loads OBJ meshes and MTL materials, normalizes model bounds, applies model/view/projection transforms, clips triangles against the view frustum, maps to the viewport, rasterizes triangles with a top-left barycentric rule, applies render state, runs fragment-style shading, writes a z-buffer, and optionally runs shadow mapping and SSAO/debug passes.
 
 The current renderer supports:
 
 - wireframe, flat, Gouraud, texture, normal-map, normal-debug, shadow, and SSAO modes
-- OBJ positions, UVs, normals, polygon triangulation, and negative indices
+- OBJ positions, UVs, normals, polygon triangulation, negative indices, `mtllib`, and `usemtl`
+- MTL material values, diffuse texture maps, normal-map keys, and CLI overrides
 - perspective-correct interpolation for shader varyings
-- near-plane clipped-triangle emission that preserves original-face barycentrics
-- culling, front-face winding, depth test/write, fill mode, scissor, clear state, and color-write state
-- repeat/clamp wrapping and nearest/linear filtering
-- material controls for base color, ambient, diffuse, specular, and shininess
+- six-plane clipped-triangle emission that preserves original-face barycentrics
+- deterministic top-left triangle fill behavior
+- culling, front-face winding, depth test/write, fill mode, scissor, clear state, color-write state, and blending
+- repeat/clamp wrapping and nearest/linear/mipmap filtering
+- material controls for base color, ambient, diffuse, specular, shininess, and alpha
 - configurable shadow-map size, bias, and none/PCF filtering
 
 ## Hardest Technical Issues
 
-The most important correctness issue was clipping. A simple reject-only near-plane guard avoids crashes but is not a real raster pipeline. The current implementation clips triangles crossing the near plane and carries each clipped vertex's original barycentric coordinates. The rasterizer computes barycentrics in the emitted clipped triangle, remaps them back to the source triangle, then applies perspective-correct interpolation before fragment shading.
+The most important correctness issue was clipping. A simple reject-only near-plane guard avoids crashes but is not a real raster pipeline. The current implementation clips triangles against the frustum and carries each clipped vertex's original barycentric coordinates. The rasterizer computes barycentrics in the emitted clipped triangle, remaps them back to the source triangle, then applies perspective-correct interpolation before fragment shading.
 
 That approach keeps the existing shader trait small while preserving UVs, normals, and world-space positions through clipping.
 
-The second important issue was evidence. The project now has deterministic golden-image tests, debug outputs, gallery renders, and Criterion benchmarks instead of relying on screenshots alone.
+The second important issue was raster determinism. The top-left fill rule means adjacent triangles share edges without double-filling or leaving cracks, which turns a vague "draw triangle" helper into a more defensible rasterizer.
+
+The third important issue was evidence. The project now has deterministic golden-image tests, debug outputs, gallery renders, and Criterion benchmarks instead of relying on screenshots alone.
 
 ## Correctness Strategy
 
-The test suite covers parser behavior, rasterization, depth state, culling, front-face winding, texture wrapping/filtering, scissor/color-write state, near-plane clipping, debug outputs, SSAO determinism, and golden-image output.
+The test suite covers parser behavior, MTL loading, rasterization, top-left shared-edge behavior, depth state, culling, front-face winding, texture wrapping/filtering/mipmaps, blending, scissor/color-write state, frustum clipping, debug outputs, SSAO determinism, and golden-image output.
 
 The renderer intentionally keeps several outputs deterministic so regressions are visible in tests:
 
@@ -50,13 +54,14 @@ The README keeps only a short performance table. Detailed methodology and curren
 
 The renderer is still intentionally smaller than OpenGL:
 
-- near-plane clipping is implemented; full six-plane homogeneous clipping is future work
-- texture filtering has nearest and bilinear modes, but no mipmaps
-- no stencil buffer, blending, MSAA, cubemaps, instancing, or shader language
+- frustum clipping follows this renderer's projection convention rather than full OpenGL conformance
+- mipmap LOD is simplified and does not use shader derivatives
+- no stencil buffer, MSAA, cubemaps, instancing, or shader language
+- blending supports alpha/additive modes, not arbitrary blend equations
 - shadow mapping uses fixed bias and simple PCF
 - SSAO is deterministic and useful for pipeline demonstration, not physically based
 - CPU performance is educational and measurable, not production real-time
 
 ## Next Work
 
-The highest-value next steps are full frustum clipping, exact top-left rasterization rules, blending, mipmaps, MTL material loading, and a short recorded demo comparing CPU renders with the `wgpu` viewer.
+The highest-value next steps are deeper profiling, one measured optimization pass, richer material assets, and a short recorded demo comparing CPU renders with the `wgpu` viewer.

@@ -1,8 +1,9 @@
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use image::{imageops::flip_vertical_in_place, ImageBuffer, Rgb, RgbImage};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 const EPSILON: f32 = 1e-6;
@@ -23,6 +24,16 @@ pub struct Model {
     pub texcoords: Vec<Vec2>,
     pub normals: Vec<Vec3>,
     pub faces: Vec<[FaceVertex; 3]>,
+    pub materials: Vec<ObjMaterial>,
+    pub face_materials: Vec<Option<usize>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjMaterial {
+    pub name: String,
+    pub material: Material,
+    pub diffuse_map: Option<PathBuf>,
+    pub normal_map: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -107,6 +118,9 @@ fn load_obj(path: &Path) -> Result<Model, String> {
     let mut texcoords = Vec::new();
     let mut normals = Vec::new();
     let mut faces = Vec::new();
+    let mut mtllibs = Vec::new();
+    let mut current_material: Option<String> = None;
+    let mut face_material_names = Vec::new();
 
     for (line_idx, line_result) in reader.lines().enumerate() {
         let line_num = line_idx + 1;
@@ -146,6 +160,27 @@ fn load_obj(path: &Path) -> Result<Model, String> {
                 let z = parse_f32(parts.next(), path, line_num, "normal z")?;
                 normals.push(safe_normal(Vec3::new(x, y, z), Vec3::Z));
             }
+            "mtllib" => {
+                let mtl = parts.next().ok_or_else(|| {
+                    format!(
+                        "{}:{}: mtllib requires a file path",
+                        path.display(),
+                        line_num
+                    )
+                })?;
+                let base = path.parent().unwrap_or_else(|| Path::new(""));
+                mtllibs.push(base.join(mtl));
+            }
+            "usemtl" => {
+                let name = parts.next().ok_or_else(|| {
+                    format!(
+                        "{}:{}: usemtl requires a material name",
+                        path.display(),
+                        line_num
+                    )
+                })?;
+                current_material = Some(name.to_string());
+            }
             "f" => {
                 let face_verts = parts
                     .map(|part| {
@@ -169,6 +204,7 @@ fn load_obj(path: &Path) -> Result<Model, String> {
                 }
                 for i in 1..face_verts.len() - 1 {
                     faces.push([face_verts[0], face_verts[i], face_verts[i + 1]]);
+                    face_material_names.push(current_material.clone());
                 }
             }
             _ => {}
@@ -185,12 +221,193 @@ fn load_obj(path: &Path) -> Result<Model, String> {
         ));
     }
 
+    let materials = load_mtl_libraries(&mtllibs)?;
+    let material_indices = materials
+        .iter()
+        .enumerate()
+        .map(|(idx, material)| (material.name.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let face_materials = face_material_names
+        .into_iter()
+        .map(|name| name.and_then(|name| material_indices.get(&name).copied()))
+        .collect();
+
     Ok(Model {
         vertices,
         texcoords,
         normals,
         faces,
+        materials,
+        face_materials,
     })
+}
+
+fn load_mtl_libraries(paths: &[PathBuf]) -> Result<Vec<ObjMaterial>, String> {
+    let mut materials = Vec::new();
+    for path in paths {
+        materials.extend(load_mtl(path)?);
+    }
+    Ok(materials)
+}
+
+fn load_mtl(path: &Path) -> Result<Vec<ObjMaterial>, String> {
+    let file = File::open(path)
+        .map_err(|err| format!("failed to open MTL '{}': {}", path.display(), err))?;
+    let reader = BufReader::new(file);
+    let mut materials = Vec::new();
+    let mut current: Option<ObjMaterial> = None;
+    let base = path.parent().unwrap_or_else(|| Path::new(""));
+
+    for (line_idx, line_result) in reader.lines().enumerate() {
+        let line_num = line_idx + 1;
+        let line = line_result.map_err(|err| {
+            format!(
+                "{}:{}: failed to read line: {}",
+                path.display(),
+                line_num,
+                err
+            )
+        })?;
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(kind) = parts.next() else {
+            continue;
+        };
+
+        match kind {
+            "newmtl" => {
+                if let Some(material) = current.take() {
+                    materials.push(material);
+                }
+                let name = parts.next().ok_or_else(|| {
+                    format!(
+                        "{}:{}: newmtl requires a material name",
+                        path.display(),
+                        line_num
+                    )
+                })?;
+                current = Some(ObjMaterial {
+                    name: name.to_string(),
+                    material: Material::default(),
+                    diffuse_map: None,
+                    normal_map: None,
+                });
+            }
+            "Kd" => {
+                let rgb = parse_mtl_rgb(&mut parts, path, line_num, "Kd")?;
+                if let Some(material) = &mut current {
+                    material.material.base_color = rgb;
+                }
+            }
+            "Ka" => {
+                let ambient = parse_mtl_scalar_or_rgb(&mut parts, path, line_num, "Ka")?;
+                if let Some(material) = &mut current {
+                    material.material.ambient = ambient;
+                }
+            }
+            "Ks" => {
+                let specular = parse_mtl_scalar_or_rgb(&mut parts, path, line_num, "Ks")?;
+                if let Some(material) = &mut current {
+                    material.material.specular = specular;
+                }
+            }
+            "Ns" => {
+                let shininess = parse_f32(parts.next(), path, line_num, "Ns")?;
+                if let Some(material) = &mut current {
+                    material.material.shininess = shininess.max(1.0);
+                }
+            }
+            "d" => {
+                let alpha = parse_f32(parts.next(), path, line_num, "d")?;
+                if let Some(material) = &mut current {
+                    material.material.alpha = alpha.clamp(0.0, 1.0);
+                }
+            }
+            "Tr" => {
+                let transparency = parse_f32(parts.next(), path, line_num, "Tr")?;
+                if let Some(material) = &mut current {
+                    material.material.alpha = (1.0 - transparency).clamp(0.0, 1.0);
+                }
+            }
+            "map_Kd" => {
+                if let Some(material) = &mut current {
+                    material.diffuse_map = Some(base.join(parse_texture_map_path(parts)));
+                }
+            }
+            "map_Bump" | "map_bump" | "bump" | "norm" | "map_Kn" => {
+                if let Some(material) = &mut current {
+                    material.normal_map = Some(base.join(parse_texture_map_path(parts)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(material) = current {
+        materials.push(material);
+    }
+
+    Ok(materials)
+}
+
+fn parse_mtl_rgb<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+    path: &Path,
+    line_num: usize,
+    label: &str,
+) -> Result<Rgb<u8>, String> {
+    let r = parse_f32(parts.next(), path, line_num, label)?;
+    let g = parse_f32(parts.next(), path, line_num, label)?;
+    let b = parse_f32(parts.next(), path, line_num, label)?;
+    Ok(Rgb([
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]))
+}
+
+fn parse_mtl_scalar_or_rgb<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+    path: &Path,
+    line_num: usize,
+    label: &str,
+) -> Result<f32, String> {
+    let first = parse_f32(parts.next(), path, line_num, label)?;
+    let rest = parts
+        .map(|part| {
+            part.parse::<f32>().map_err(|err| {
+                format!(
+                    "{}:{}: invalid {} value '{}': {}",
+                    path.display(),
+                    line_num,
+                    label,
+                    part,
+                    err
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if rest.is_empty() {
+        Ok(first.max(0.0))
+    } else {
+        let sum = first + rest.iter().copied().sum::<f32>();
+        Ok((sum / (rest.len() as f32 + 1.0)).max(0.0))
+    }
+}
+
+fn parse_texture_map_path<'a>(parts: impl Iterator<Item = &'a str>) -> PathBuf {
+    let tokens = parts.collect::<Vec<_>>();
+    let path = tokens
+        .iter()
+        .rev()
+        .find(|token| !token.starts_with('-'))
+        .copied()
+        .unwrap_or("");
+    PathBuf::from(path)
 }
 
 fn parse_f32(
@@ -323,6 +540,43 @@ fn put_pixel_checked(image: &mut RgbImage, x: i32, y: i32, colour: Rgb<u8>) {
     }
 }
 
+fn write_fragment_checked(
+    image: &mut RgbImage,
+    x: i32,
+    y: i32,
+    fragment: Fragment,
+    render_state: RenderState,
+) {
+    if x < 0 || y < 0 || x >= image.width() as i32 || y >= image.height() as i32 {
+        return;
+    }
+    let dst = *image.get_pixel(x as u32, y as u32);
+    *image.get_pixel_mut(x as u32, y as u32) =
+        blend_fragment(dst, fragment, render_state.blend_mode);
+}
+
+pub fn blend_fragment(dst: Rgb<u8>, src: Fragment, blend_mode: BlendMode) -> Rgb<u8> {
+    match blend_mode {
+        BlendMode::Off => src.colour,
+        BlendMode::Alpha => {
+            let a = src.alpha.clamp(0.0, 1.0);
+            Rgb([
+                (src.colour[0] as f32 * a + dst[0] as f32 * (1.0 - a)).round() as u8,
+                (src.colour[1] as f32 * a + dst[1] as f32 * (1.0 - a)).round() as u8,
+                (src.colour[2] as f32 * a + dst[2] as f32 * (1.0 - a)).round() as u8,
+            ])
+        }
+        BlendMode::Additive => {
+            let a = src.alpha.clamp(0.0, 1.0);
+            Rgb([
+                (dst[0] as f32 + src.colour[0] as f32 * a).clamp(0.0, 255.0) as u8,
+                (dst[1] as f32 + src.colour[1] as f32 * a).clamp(0.0, 255.0) as u8,
+                (dst[2] as f32 + src.colour[2] as f32 * a).clamp(0.0, 255.0) as u8,
+            ])
+        }
+    }
+}
+
 pub fn draw_line(
     mut x1: i32,
     mut y1: i32,
@@ -405,29 +659,6 @@ fn draw_line_with_state(
     }
 }
 
-fn barycentric(a: Vec2, b: Vec2, c: Vec2, p: Vec2) -> Option<Vec3> {
-    let v0 = c - a;
-    let v1 = b - a;
-    let v2 = p - a;
-
-    let dot00 = v0.dot(v0);
-    let dot01 = v0.dot(v1);
-    let dot02 = v0.dot(v2);
-    let dot11 = v1.dot(v1);
-    let dot12 = v1.dot(v2);
-
-    let denom = dot00 * dot11 - dot01 * dot01;
-    if denom.abs() < 1e-10 {
-        return None;
-    }
-    let inv_denom = 1.0 / denom;
-
-    let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
-    let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
-
-    Some(Vec3::new(1.0 - u - v, v, u))
-}
-
 pub fn perspective_correct_barycentric(bc: Vec3, reciprocal_w: [f32; 3]) -> Vec3 {
     let weighted = Vec3::new(
         bc.x * reciprocal_w[0],
@@ -448,17 +679,87 @@ pub fn triangle(v0: Vec2, v1: Vec2, v2: Vec2, image: &mut RgbImage, colour: Rgb<
     let max_x = v0.x.max(v1.x).max(v2.x).ceil().min(width as f32 - 1.0) as i32;
     let min_y = v0.y.min(v1.y).min(v2.y).floor().max(0.0) as i32;
     let max_y = v0.y.max(v1.y).max(v2.y).ceil().min(height as f32 - 1.0) as i32;
+    let Some(coverage) = TriangleCoverage::new(v0, v1, v2) else {
+        return;
+    };
 
     for x in min_x..=max_x {
         for y in min_y..=max_y {
             let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
-            if let Some(bc) = barycentric(v0, v1, v2, p) {
-                if bc.x >= 0.0 && bc.y >= 0.0 && bc.z >= 0.0 {
-                    put_pixel_checked(image, x, y, colour);
-                }
+            if coverage.barycentric(p).is_some() {
+                put_pixel_checked(image, x, y, colour);
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TriangleCoverage {
+    a: Vec2,
+    b: Vec2,
+    c: Vec2,
+    sign: f32,
+    inv_area: f32,
+    top_left: [bool; 3],
+}
+
+impl TriangleCoverage {
+    fn new(a: Vec2, b: Vec2, c: Vec2) -> Option<Self> {
+        let area = edge_function(a, b, c);
+        if area.abs() < EPSILON {
+            return None;
+        }
+        Some(Self {
+            a,
+            b,
+            c,
+            sign: if area > 0.0 { 1.0 } else { -1.0 },
+            inv_area: 1.0 / area,
+            top_left: [
+                is_top_left_edge(b, c),
+                is_top_left_edge(c, a),
+                is_top_left_edge(a, b),
+            ],
+        })
+    }
+
+    fn barycentric(&self, p: Vec2) -> Option<Vec3> {
+        let e0 = edge_function(self.b, self.c, p);
+        let e1 = edge_function(self.c, self.a, p);
+        let e2 = edge_function(self.a, self.b, p);
+        if edge_is_inside(e0 * self.sign, self.top_left[0])
+            && edge_is_inside(e1 * self.sign, self.top_left[1])
+            && edge_is_inside(e2 * self.sign, self.top_left[2])
+        {
+            Some(Vec3::new(
+                e0 * self.inv_area,
+                e1 * self.inv_area,
+                e2 * self.inv_area,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+fn point_in_triangle_top_left(a: Vec2, b: Vec2, c: Vec2, p: Vec2) -> bool {
+    TriangleCoverage::new(a, b, c)
+        .and_then(|coverage| coverage.barycentric(p))
+        .is_some()
+}
+
+fn edge_function(a: Vec2, b: Vec2, p: Vec2) -> f32 {
+    (p.x - a.x) * (b.y - a.y) - (p.y - a.y) * (b.x - a.x)
+}
+
+fn is_top_left_edge(a: Vec2, b: Vec2) -> bool {
+    let edge = b - a;
+    edge.y > 0.0 || (edge.y.abs() < EPSILON && edge.x < 0.0)
+}
+
+fn edge_is_inside(value: f32, top_left: bool) -> bool {
+    value > EPSILON || (top_left && value.abs() <= EPSILON)
 }
 
 // --- Transformation matrices ---
@@ -509,12 +810,31 @@ fn transform_homogeneous(m: &Mat4, v: Vec3) -> Vec4 {
 
 // --- Shader system ---
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fragment {
+    pub colour: Rgb<u8>,
+    pub alpha: f32,
+}
+
+impl Fragment {
+    pub fn new(colour: Rgb<u8>, alpha: f32) -> Self {
+        Fragment {
+            colour,
+            alpha: alpha.clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn opaque(colour: Rgb<u8>) -> Self {
+        Fragment { colour, alpha: 1.0 }
+    }
+}
+
 /// Shader trait: vertex shader transforms vertices, fragment shader computes pixel colors.
 pub trait Shader {
     /// Process vertex `vert_idx` (0..3) of face `face_idx`. Returns screen-space position.
     fn vertex(&mut self, face_idx: usize, vert_idx: usize) -> Vec3;
     /// Compute fragment color given barycentric coordinates. Return None to discard.
-    fn fragment(&self, bc: Vec3) -> Option<Rgb<u8>>;
+    fn fragment(&self, bc: Vec3) -> Option<Fragment>;
 }
 
 /// Rasterize a triangle using a shader, with z-buffer.
@@ -581,6 +901,9 @@ fn triangle_shader_perspective_with_render_state(
     let v0 = screen_coords[0];
     let v1 = screen_coords[1];
     let v2 = screen_coords[2];
+    let Some(coverage) = TriangleCoverage::new(v0.truncate(), v1.truncate(), v2.truncate()) else {
+        return;
+    };
 
     let Some((min_x, max_x, min_y, max_y)) =
         raster_bounds(screen_coords, width, height, render_state.scissor)
@@ -591,22 +914,20 @@ fn triangle_shader_perspective_with_render_state(
     for x in min_x..=max_x {
         for y in min_y..=max_y {
             let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
-            if let Some(bc) = barycentric(v0.truncate(), v1.truncate(), v2.truncate(), p) {
-                if bc.x >= 0.0 && bc.y >= 0.0 && bc.z >= 0.0 {
-                    let z = bc.x * v0.z + bc.y * v1.z + bc.z * v2.z;
-                    let idx = x as usize + y as usize * width as usize;
-                    if depth_passes(z, zbuffer[idx], render_state.depth) {
-                        let source_bc = source_barycentric[0] * bc.x
-                            + source_barycentric[1] * bc.y
-                            + source_barycentric[2] * bc.z;
-                        let corrected = perspective_correct_barycentric(source_bc, reciprocal_w);
-                        if let Some(colour) = shader.fragment(corrected) {
-                            if render_state.depth.write_enabled {
-                                zbuffer[idx] = z;
-                            }
-                            if render_state.color_write {
-                                put_pixel_checked(image, x, y, colour);
-                            }
+            if let Some(bc) = coverage.barycentric(p) {
+                let z = bc.x * v0.z + bc.y * v1.z + bc.z * v2.z;
+                let idx = x as usize + y as usize * width as usize;
+                if depth_passes(z, zbuffer[idx], render_state.depth) {
+                    let source_bc = source_barycentric[0] * bc.x
+                        + source_barycentric[1] * bc.y
+                        + source_barycentric[2] * bc.z;
+                    let corrected = perspective_correct_barycentric(source_bc, reciprocal_w);
+                    if let Some(fragment) = shader.fragment(corrected) {
+                        if render_state.depth.write_enabled {
+                            zbuffer[idx] = z;
+                        }
+                        if render_state.color_write {
+                            write_fragment_checked(image, x, y, fragment, render_state);
                         }
                     }
                 }
@@ -640,7 +961,7 @@ pub fn triangle_zbuf_with_state(
         depth: depth_state,
         ..RenderState::default()
     };
-    triangle_zbuf_with_render_state(v0, v1, v2, zbuffer, image, colour, state);
+    triangle_zbuf_with_render_state(v0, v1, v2, zbuffer, image, Fragment::opaque(colour), state);
 }
 
 fn triangle_zbuf_with_render_state(
@@ -649,11 +970,14 @@ fn triangle_zbuf_with_render_state(
     v2: Vec3,
     zbuffer: &mut [f32],
     image: &mut RgbImage,
-    colour: Rgb<u8>,
+    fragment: Fragment,
     render_state: RenderState,
 ) {
     let (width, height) = image.dimensions();
     let coords = [v0, v1, v2];
+    let Some(coverage) = TriangleCoverage::new(v0.truncate(), v1.truncate(), v2.truncate()) else {
+        return;
+    };
     let Some((min_x, max_x, min_y, max_y)) =
         raster_bounds(&coords, width, height, render_state.scissor)
     else {
@@ -663,17 +987,15 @@ fn triangle_zbuf_with_render_state(
     for x in min_x..=max_x {
         for y in min_y..=max_y {
             let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
-            if let Some(bc) = barycentric(v0.truncate(), v1.truncate(), v2.truncate(), p) {
-                if bc.x >= 0.0 && bc.y >= 0.0 && bc.z >= 0.0 {
-                    let z = bc.x * v0.z + bc.y * v1.z + bc.z * v2.z;
-                    let idx = x as usize + y as usize * width as usize;
-                    if depth_passes(z, zbuffer[idx], render_state.depth) {
-                        if render_state.depth.write_enabled {
-                            zbuffer[idx] = z;
-                        }
-                        if render_state.color_write {
-                            put_pixel_checked(image, x, y, colour);
-                        }
+            if let Some(bc) = coverage.barycentric(p) {
+                let z = bc.x * v0.z + bc.y * v1.z + bc.z * v2.z;
+                let idx = x as usize + y as usize * width as usize;
+                if depth_passes(z, zbuffer[idx], render_state.depth) {
+                    if render_state.depth.write_enabled {
+                        zbuffer[idx] = z;
+                    }
+                    if render_state.color_write {
+                        write_fragment_checked(image, x, y, fragment, render_state);
                     }
                 }
             }
@@ -777,7 +1099,7 @@ impl Shader for GouraudShader<'_> {
         transform_point(&self.transform, v)
     }
 
-    fn fragment(&self, bc: Vec3) -> Option<Rgb<u8>> {
+    fn fragment(&self, bc: Vec3) -> Option<Fragment> {
         let intensity = self.varying_intensity[0] * bc.x
             + self.varying_intensity[1] * bc.y
             + self.varying_intensity[2] * bc.z;
@@ -785,7 +1107,7 @@ impl Shader for GouraudShader<'_> {
         if colour == Rgb([0, 0, 0]) {
             return None;
         }
-        Some(colour)
+        Some(Fragment::new(colour, self.material.alpha))
     }
 }
 
@@ -796,19 +1118,23 @@ pub struct TextureShader<'a> {
     pub model_view: Mat4,
     pub light_dir: Vec3,
     pub diffuse: Option<&'a RgbImage>,
+    pub diffuse_mipmaps: Option<&'a [RgbImage]>,
     pub sampler: TextureSampler,
     pub material: Material,
     pub varying_intensity: [f32; 3],
     pub varying_uv: [Vec2; 3],
+    pub varying_screen_pos: [Vec2; 3],
 }
 
 impl<'a> TextureShader<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &'a Model,
         transform: Mat4,
         model_view: Mat4,
         light_dir: Vec3,
         diffuse: Option<&'a RgbImage>,
+        diffuse_mipmaps: Option<&'a [RgbImage]>,
         sampler: TextureSampler,
         material: Material,
     ) -> Self {
@@ -818,10 +1144,12 @@ impl<'a> TextureShader<'a> {
             model_view,
             light_dir: safe_normal(light_dir, Vec3::new(1.0, 1.0, -1.0).normalize()),
             diffuse,
+            diffuse_mipmaps,
             sampler,
             material,
             varying_intensity: [0.0; 3],
             varying_uv: [Vec2::ZERO; 3],
+            varying_screen_pos: [Vec2::ZERO; 3],
         }
     }
 }
@@ -840,10 +1168,12 @@ impl Shader for TextureShader<'_> {
         let n = safe_normal(transform_vector(&normal_matrix, normal), Vec3::Z);
         self.varying_intensity[vert_idx] = n.dot(self.light_dir).max(0.0);
 
-        transform_point(&self.transform, v)
+        let screen = transform_point(&self.transform, v);
+        self.varying_screen_pos[vert_idx] = screen.truncate();
+        screen
     }
 
-    fn fragment(&self, bc: Vec3) -> Option<Rgb<u8>> {
+    fn fragment(&self, bc: Vec3) -> Option<Fragment> {
         let intensity = self.varying_intensity[0] * bc.x
             + self.varying_intensity[1] * bc.y
             + self.varying_intensity[2] * bc.z;
@@ -855,13 +1185,27 @@ impl Shader for TextureShader<'_> {
             let uv =
                 self.varying_uv[0] * bc.x + self.varying_uv[1] * bc.y + self.varying_uv[2] * bc.z;
             tint_rgb(
-                sample_texture(tex, uv, self.sampler),
+                sample_texture_with_mipmaps(
+                    tex,
+                    self.diffuse_mipmaps,
+                    uv,
+                    self.sampler,
+                    triangle_lod(
+                        self.varying_uv,
+                        self.varying_screen_pos,
+                        tex.width(),
+                        tex.height(),
+                    ),
+                ),
                 self.material.base_color,
             )
         } else {
             self.material.base_color
         };
-        Some(shade_material(base, self.material, intensity, 0.0))
+        Some(Fragment::new(
+            shade_material(base, self.material, intensity, 0.0),
+            self.material.alpha,
+        ))
     }
 }
 
@@ -873,10 +1217,13 @@ pub struct NormalMapShader<'a> {
     pub light_dir: Vec3,
     pub diffuse: Option<&'a RgbImage>,
     pub normal_map: &'a RgbImage,
+    pub diffuse_mipmaps: Option<&'a [RgbImage]>,
+    pub normal_mipmaps: Option<&'a [RgbImage]>,
     pub sampler: TextureSampler,
     pub material: Material,
     pub varying_uv: [Vec2; 3],
     pub varying_pos: [Vec3; 3],
+    pub varying_screen_pos: [Vec2; 3],
 }
 
 impl<'a> NormalMapShader<'a> {
@@ -888,6 +1235,8 @@ impl<'a> NormalMapShader<'a> {
         light_dir: Vec3,
         diffuse: Option<&'a RgbImage>,
         normal_map: &'a RgbImage,
+        diffuse_mipmaps: Option<&'a [RgbImage]>,
+        normal_mipmaps: Option<&'a [RgbImage]>,
         sampler: TextureSampler,
         material: Material,
     ) -> Self {
@@ -898,10 +1247,13 @@ impl<'a> NormalMapShader<'a> {
             light_dir: safe_normal(light_dir, Vec3::new(1.0, 1.0, -1.0).normalize()),
             diffuse,
             normal_map,
+            diffuse_mipmaps,
+            normal_mipmaps,
             sampler,
             material,
             varying_uv: [Vec2::ZERO; 3],
             varying_pos: [Vec3::ZERO; 3],
+            varying_screen_pos: [Vec2::ZERO; 3],
         }
     }
 }
@@ -916,13 +1268,27 @@ impl Shader for NormalMapShader<'_> {
             self.varying_uv[vert_idx] = self.model.texcoords[ti];
         }
 
-        transform_point(&self.transform, v)
+        let screen = transform_point(&self.transform, v);
+        self.varying_screen_pos[vert_idx] = screen.truncate();
+        screen
     }
 
-    fn fragment(&self, bc: Vec3) -> Option<Rgb<u8>> {
+    fn fragment(&self, bc: Vec3) -> Option<Fragment> {
         let uv = self.varying_uv[0] * bc.x + self.varying_uv[1] * bc.y + self.varying_uv[2] * bc.z;
 
-        let np = sample_texture(self.normal_map, uv, self.sampler);
+        let normal_lod = triangle_lod(
+            self.varying_uv,
+            self.varying_screen_pos,
+            self.normal_map.width(),
+            self.normal_map.height(),
+        );
+        let np = sample_texture_with_mipmaps(
+            self.normal_map,
+            self.normal_mipmaps,
+            uv,
+            self.sampler,
+            normal_lod,
+        );
         let tangent_normal = Vec3::new(
             np[0] as f32 / 255.0 * 2.0 - 1.0,
             np[1] as f32 / 255.0 * 2.0 - 1.0,
@@ -961,12 +1327,26 @@ impl Shader for NormalMapShader<'_> {
             .diffuse
             .map(|tex| {
                 tint_rgb(
-                    sample_texture(tex, uv, self.sampler),
+                    sample_texture_with_mipmaps(
+                        tex,
+                        self.diffuse_mipmaps,
+                        uv,
+                        self.sampler,
+                        triangle_lod(
+                            self.varying_uv,
+                            self.varying_screen_pos,
+                            tex.width(),
+                            tex.height(),
+                        ),
+                    ),
                     self.material.base_color,
                 )
             })
             .unwrap_or(self.material.base_color);
-        Some(shade_material(base, self.material, intensity, 0.0))
+        Some(Fragment::new(
+            shade_material(base, self.material, intensity, 0.0),
+            self.material.alpha,
+        ))
     }
 }
 
@@ -1000,18 +1380,18 @@ impl Shader for NormalDebugShader<'_> {
         transform_point(&self.transform, v)
     }
 
-    fn fragment(&self, bc: Vec3) -> Option<Rgb<u8>> {
+    fn fragment(&self, bc: Vec3) -> Option<Fragment> {
         let normal = safe_normal(
             self.varying_normal[0] * bc.x
                 + self.varying_normal[1] * bc.y
                 + self.varying_normal[2] * bc.z,
             Vec3::Z,
         );
-        Some(Rgb([
+        Some(Fragment::opaque(Rgb([
             ((normal.x * 0.5 + 0.5) * 255.0) as u8,
             ((normal.y * 0.5 + 0.5) * 255.0) as u8,
             ((normal.z * 0.5 + 0.5) * 255.0) as u8,
-        ]))
+        ])))
     }
 }
 
@@ -1029,8 +1409,8 @@ impl Shader for DepthShader<'_> {
         transform_point(&self.transform, v)
     }
 
-    fn fragment(&self, _bc: Vec3) -> Option<Rgb<u8>> {
-        Some(Rgb([255, 255, 255]))
+    fn fragment(&self, _bc: Vec3) -> Option<Fragment> {
+        Some(Fragment::opaque(Rgb([255, 255, 255])))
     }
 }
 
@@ -1095,7 +1475,7 @@ impl Shader for ShadowShader<'_> {
         transform_point(&self.transform, v)
     }
 
-    fn fragment(&self, bc: Vec3) -> Option<Rgb<u8>> {
+    fn fragment(&self, bc: Vec3) -> Option<Fragment> {
         let intensity = self.varying_intensity[0] * bc.x
             + self.varying_intensity[1] * bc.y
             + self.varying_intensity[2] * bc.z;
@@ -1116,11 +1496,14 @@ impl Shader for ShadowShader<'_> {
             self.shadow_options,
         );
 
-        Some(shade_material(
-            self.material.base_color,
-            self.material,
-            intensity * shadow,
-            0.0,
+        Some(Fragment::new(
+            shade_material(
+                self.material.base_color,
+                self.material,
+                intensity * shadow,
+                0.0,
+            ),
+            self.material.alpha,
         ))
     }
 }
@@ -1392,6 +1775,7 @@ impl FromStr for TextureWrap {
 pub enum TextureFilter {
     Nearest,
     Linear,
+    Mipmap,
 }
 
 impl TextureFilter {
@@ -1399,6 +1783,7 @@ impl TextureFilter {
         match self {
             TextureFilter::Nearest => "nearest",
             TextureFilter::Linear => "linear",
+            TextureFilter::Mipmap => "mipmap",
         }
     }
 }
@@ -1410,8 +1795,9 @@ impl FromStr for TextureFilter {
         match value {
             "nearest" => Ok(TextureFilter::Nearest),
             "linear" => Ok(TextureFilter::Linear),
+            "mipmap" | "mip" | "trilinear" => Ok(TextureFilter::Mipmap),
             _ => Err(format!(
-                "unknown texture filter '{}'; expected one of: nearest, linear",
+                "unknown texture filter '{}'; expected one of: nearest, linear, mipmap",
                 value
             )),
         }
@@ -1475,6 +1861,7 @@ pub struct Material {
     pub diffuse: f32,
     pub specular: f32,
     pub shininess: f32,
+    pub alpha: f32,
 }
 
 impl Default for Material {
@@ -1485,6 +1872,40 @@ impl Default for Material {
             diffuse: 1.0,
             specular: 0.0,
             shininess: 32.0,
+            alpha: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendMode {
+    Off,
+    Alpha,
+    Additive,
+}
+
+impl BlendMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlendMode::Off => "off",
+            BlendMode::Alpha => "alpha",
+            BlendMode::Additive => "additive",
+        }
+    }
+}
+
+impl FromStr for BlendMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(BlendMode::Off),
+            "alpha" => Ok(BlendMode::Alpha),
+            "additive" | "add" => Ok(BlendMode::Additive),
+            _ => Err(format!(
+                "unknown blend mode '{}'; expected one of: off, alpha, additive",
+                value
+            )),
         }
     }
 }
@@ -1546,6 +1967,7 @@ pub struct RenderState {
     pub clear_color: Rgb<u8>,
     pub clear_depth: f32,
     pub color_write: bool,
+    pub blend_mode: BlendMode,
 }
 
 impl Default for RenderState {
@@ -1559,6 +1981,7 @@ impl Default for RenderState {
             clear_color: DEFAULT_BACKGROUND,
             clear_depth: f32::NEG_INFINITY,
             color_write: true,
+            blend_mode: BlendMode::Off,
         }
     }
 }
@@ -1623,11 +2046,14 @@ pub struct RenderOptions {
     pub debug_outputs: bool,
     pub render_state: RenderState,
     pub texture: Option<RgbImage>,
+    pub texture_mipmaps: Vec<RgbImage>,
     pub normal_map: Option<RgbImage>,
+    pub normal_map_mipmaps: Vec<RgbImage>,
     pub texture_sampler: TextureSampler,
     pub material: Material,
     pub shadow: ShadowOptions,
     pub near_plane: f32,
+    pub far_plane: f32,
 }
 
 impl Default for RenderOptions {
@@ -1641,11 +2067,14 @@ impl Default for RenderOptions {
             debug_outputs: false,
             render_state: RenderState::default(),
             texture: None,
+            texture_mipmaps: Vec::new(),
             normal_map: None,
+            normal_map_mipmaps: Vec::new(),
             texture_sampler: TextureSampler::default(),
             material: Material::default(),
             shadow: ShadowOptions::default(),
             near_plane: 0.01,
+            far_plane: 1000.0,
         }
     }
 }
@@ -1678,10 +2107,12 @@ pub struct RenderOutput {
 struct RenderTransforms {
     transform: Mat4,
     model_view: Mat4,
-    view_to_screen: Mat4,
+    view_to_clip: Mat4,
+    clip_to_screen: Mat4,
     light_transform: Mat4,
     light_model_view: Mat4,
-    light_view_to_screen: Mat4,
+    light_view_to_clip: Mat4,
+    light_clip_to_screen: Mat4,
 }
 
 pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
@@ -1731,12 +2162,25 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     .texture
                     .as_ref()
                     .or_else(|| (!model.texcoords.is_empty()).then_some(&checker));
+                let generated_mipmaps = if options.texture_sampler.filter == TextureFilter::Mipmap
+                    && options.texture_mipmaps.is_empty()
+                {
+                    diffuse.map(build_mipmaps)
+                } else {
+                    None
+                };
+                let diffuse_mipmaps = if !options.texture_mipmaps.is_empty() {
+                    Some(options.texture_mipmaps.as_slice())
+                } else {
+                    generated_mipmaps.as_deref()
+                };
                 let mut shader = TextureShader::new(
                     model,
                     transforms.transform,
                     transforms.model_view,
                     options.light_dir,
                     diffuse,
+                    diffuse_mipmaps,
                     options.texture_sampler,
                     options.material,
                 );
@@ -1753,6 +2197,32 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                 let neutral_normal_map = neutral_normal_map(2);
                 let normal_map = options.normal_map.as_ref().unwrap_or(&neutral_normal_map);
                 let diffuse = options.texture.as_ref();
+                let generated_diffuse_mipmaps = if options.texture_sampler.filter
+                    == TextureFilter::Mipmap
+                    && options.texture_mipmaps.is_empty()
+                {
+                    diffuse.map(build_mipmaps)
+                } else {
+                    None
+                };
+                let generated_normal_mipmaps = if options.texture_sampler.filter
+                    == TextureFilter::Mipmap
+                    && options.normal_map_mipmaps.is_empty()
+                {
+                    Some(build_mipmaps(normal_map))
+                } else {
+                    None
+                };
+                let diffuse_mipmaps = if !options.texture_mipmaps.is_empty() {
+                    Some(options.texture_mipmaps.as_slice())
+                } else {
+                    generated_diffuse_mipmaps.as_deref()
+                };
+                let normal_mipmaps = if !options.normal_map_mipmaps.is_empty() {
+                    Some(options.normal_map_mipmaps.as_slice())
+                } else {
+                    generated_normal_mipmaps.as_deref()
+                };
                 let mut shader = NormalMapShader::new(
                     model,
                     transforms.transform,
@@ -1760,6 +2230,8 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     options.light_dir,
                     diffuse,
                     normal_map,
+                    diffuse_mipmaps,
+                    normal_mipmaps,
                     options.texture_sampler,
                     options.material,
                 );
@@ -1889,8 +2361,9 @@ fn build_transforms(
         height as f32 - margin_y * 2.0,
         255.0,
     );
-    let view_to_screen = vp * proj;
-    let transform = view_to_screen * view * model_matrix;
+    let view_to_clip = proj;
+    let clip_to_screen = vp;
+    let transform = clip_to_screen * view_to_clip * view * model_matrix;
     let model_view = view * model_matrix;
 
     let light_dir = safe_normal(options.light_dir, Vec3::new(1.0, 1.0, -1.0).normalize());
@@ -1906,16 +2379,19 @@ fn build_transforms(
         shadow_height as f32 - shadow_margin_y * 2.0,
         255.0,
     );
-    let light_view_to_screen = shadow_vp * light_proj;
-    let light_transform = light_view_to_screen * light_view * model_matrix;
+    let light_view_to_clip = light_proj;
+    let light_clip_to_screen = shadow_vp;
+    let light_transform = light_clip_to_screen * light_view_to_clip * light_view * model_matrix;
     let light_model_view = light_view * model_matrix;
     RenderTransforms {
         transform,
         model_view,
-        view_to_screen,
+        view_to_clip,
+        clip_to_screen,
         light_transform,
         light_model_view,
-        light_view_to_screen,
+        light_view_to_clip,
+        light_clip_to_screen,
     }
 }
 
@@ -1927,9 +2403,13 @@ fn render_wireframe(
 ) {
     let colour = Rgb([235, 238, 245]);
     for face_idx in 0..model.faces.len() {
-        for primitive in
-            clipped_primitives_for_face(model, transforms, face_idx, options.near_plane)
-        {
+        for primitive in clipped_primitives_for_face(
+            model,
+            transforms,
+            face_idx,
+            options.near_plane,
+            options.far_plane,
+        ) {
             if should_cull_screen_triangle_with_front_face(
                 &primitive.screen_coords,
                 options.render_state.cull_mode,
@@ -1977,9 +2457,13 @@ fn render_flat(
         if shaded == Rgb([0, 0, 0]) {
             continue;
         }
-        for primitive in
-            clipped_primitives_for_face(model, transforms, face_idx, options.near_plane)
-        {
+        for primitive in clipped_primitives_for_face(
+            model,
+            transforms,
+            face_idx,
+            options.near_plane,
+            options.far_plane,
+        ) {
             if should_cull_screen_triangle_with_front_face(
                 &primitive.screen_coords,
                 options.render_state.cull_mode,
@@ -1993,7 +2477,7 @@ fn render_flat(
                 primitive.screen_coords[2],
                 zbuffer,
                 image,
-                shaded,
+                Fragment::new(shaded, options.material.alpha),
                 options.render_state,
             );
         }
@@ -2011,9 +2495,13 @@ fn render_shader<S: Shader>(
     for face_idx in 0..model.faces.len() {
         let _: [Vec3; 3] = std::array::from_fn(|j| shader.vertex(face_idx, j));
         let reciprocal_w = reciprocal_w_for_face(model, transforms.transform, face_idx);
-        for primitive in
-            clipped_primitives_for_face(model, transforms, face_idx, options.near_plane)
-        {
+        for primitive in clipped_primitives_for_face(
+            model,
+            transforms,
+            face_idx,
+            options.near_plane,
+            options.far_plane,
+        ) {
             if should_cull_screen_triangle_with_front_face(
                 &primitive.screen_coords,
                 options.render_state.cull_mode,
@@ -2074,6 +2562,7 @@ fn should_cull_screen_triangle_with_front_face(
 #[derive(Clone, Copy, Debug)]
 struct ClippedVertex {
     view_pos: Vec3,
+    clip_pos: Vec4,
     source_bc: Vec3,
 }
 
@@ -2088,34 +2577,168 @@ fn clipped_primitives_for_face(
     transforms: &RenderTransforms,
     face_idx: usize,
     near_plane: f32,
+    far_plane: f32,
 ) -> Vec<ClippedPrimitive> {
     let face = model.faces[face_idx];
     let triangle = [
-        ClippedVertex {
-            view_pos: transform_point(&transforms.model_view, model.vertices[face[0].v]),
-            source_bc: Vec3::X,
-        },
-        ClippedVertex {
-            view_pos: transform_point(&transforms.model_view, model.vertices[face[1].v]),
-            source_bc: Vec3::Y,
-        },
-        ClippedVertex {
-            view_pos: transform_point(&transforms.model_view, model.vertices[face[2].v]),
-            source_bc: Vec3::Z,
-        },
+        clipped_vertex_for_source(model.vertices[face[0].v], transforms, Vec3::X),
+        clipped_vertex_for_source(model.vertices[face[1].v], transforms, Vec3::Y),
+        clipped_vertex_for_source(model.vertices[face[2].v], transforms, Vec3::Z),
     ];
 
-    clip_varying_triangle_against_near_plane(triangle, near_plane)
+    clip_varying_triangle_against_frustum(triangle, near_plane, far_plane)
         .into_iter()
         .map(|tri| ClippedPrimitive {
             screen_coords: std::array::from_fn(|i| {
-                transform_point(&transforms.view_to_screen, tri[i].view_pos)
+                clip_position_to_screen(tri[i].clip_pos, transforms.clip_to_screen)
             }),
             source_barycentric: std::array::from_fn(|i| tri[i].source_bc),
         })
         .collect()
 }
 
+fn clipped_vertex_for_source(
+    model_pos: Vec3,
+    transforms: &RenderTransforms,
+    source_bc: Vec3,
+) -> ClippedVertex {
+    let view_pos = transform_point(&transforms.model_view, model_pos);
+    let clip_pos = transform_homogeneous(&transforms.view_to_clip, view_pos);
+    ClippedVertex {
+        view_pos,
+        clip_pos,
+        source_bc,
+    }
+}
+
+fn clip_position_to_screen(clip_pos: Vec4, clip_to_screen: Mat4) -> Vec3 {
+    let w = if clip_pos.w.abs() > EPSILON {
+        clip_pos.w
+    } else {
+        EPSILON
+    };
+    transform_point(
+        &clip_to_screen,
+        Vec3::new(clip_pos.x / w, clip_pos.y / w, clip_pos.z / w),
+    )
+}
+
+fn clip_varying_triangle_against_frustum(
+    triangle: [ClippedVertex; 3],
+    near: f32,
+    far: f32,
+) -> Vec<[ClippedVertex; 3]> {
+    let mut polygon = triangle.to_vec();
+    for plane in FrustumPlane::ALL {
+        polygon = clip_polygon_against_frustum_plane(&polygon, plane, near, far);
+        if polygon.len() < 3 {
+            return Vec::new();
+        }
+    }
+    triangulate_clipped_polygon(&polygon)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FrustumPlane {
+    Left,
+    Right,
+    Bottom,
+    Top,
+    Near,
+    Far,
+}
+
+impl FrustumPlane {
+    const ALL: [FrustumPlane; 6] = [
+        FrustumPlane::Left,
+        FrustumPlane::Right,
+        FrustumPlane::Bottom,
+        FrustumPlane::Top,
+        FrustumPlane::Near,
+        FrustumPlane::Far,
+    ];
+}
+
+fn frustum_plane_distance(vertex: ClippedVertex, plane: FrustumPlane, near: f32, far: f32) -> f32 {
+    match plane {
+        FrustumPlane::Left => vertex.clip_pos.x + vertex.clip_pos.w,
+        FrustumPlane::Right => vertex.clip_pos.w - vertex.clip_pos.x,
+        FrustumPlane::Bottom => vertex.clip_pos.y + vertex.clip_pos.w,
+        FrustumPlane::Top => vertex.clip_pos.w - vertex.clip_pos.y,
+        FrustumPlane::Near => -vertex.view_pos.z - near.max(EPSILON),
+        FrustumPlane::Far => far.max(near.max(EPSILON)) + vertex.view_pos.z,
+    }
+}
+
+fn clip_polygon_against_frustum_plane(
+    polygon: &[ClippedVertex],
+    plane: FrustumPlane,
+    near: f32,
+    far: f32,
+) -> Vec<ClippedVertex> {
+    let mut output = Vec::with_capacity(polygon.len() + 1);
+    for i in 0..polygon.len() {
+        let current = polygon[i];
+        let next = polygon[(i + 1) % polygon.len()];
+        let current_distance = frustum_plane_distance(current, plane, near, far);
+        let next_distance = frustum_plane_distance(next, plane, near, far);
+        let current_inside = current_distance >= -EPSILON;
+        let next_inside = next_distance >= -EPSILON;
+
+        match (current_inside, next_inside) {
+            (true, true) => output.push(next),
+            (true, false) => output.push(intersect_frustum_vertex(
+                current,
+                next,
+                current_distance,
+                next_distance,
+            )),
+            (false, true) => {
+                output.push(intersect_frustum_vertex(
+                    current,
+                    next,
+                    current_distance,
+                    next_distance,
+                ));
+                output.push(next);
+            }
+            (false, false) => {}
+        }
+    }
+    output
+}
+
+fn intersect_frustum_vertex(
+    a: ClippedVertex,
+    b: ClippedVertex,
+    distance_a: f32,
+    distance_b: f32,
+) -> ClippedVertex {
+    let denom = distance_a - distance_b;
+    let t = if denom.abs() > EPSILON {
+        (distance_a / denom).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ClippedVertex {
+        view_pos: a.view_pos + (b.view_pos - a.view_pos) * t,
+        clip_pos: a.clip_pos + (b.clip_pos - a.clip_pos) * t,
+        source_bc: a.source_bc + (b.source_bc - a.source_bc) * t,
+    }
+}
+
+fn triangulate_clipped_polygon(polygon: &[ClippedVertex]) -> Vec<[ClippedVertex; 3]> {
+    if polygon.len() < 3 {
+        return Vec::new();
+    }
+    let mut triangles = Vec::with_capacity(polygon.len() - 2);
+    for i in 1..polygon.len() - 1 {
+        triangles.push([polygon[0], polygon[i], polygon[i + 1]]);
+    }
+    triangles
+}
+
+#[cfg(test)]
 fn clip_varying_triangle_against_near_plane(
     triangle: [ClippedVertex; 3],
     near: f32,
@@ -2151,10 +2774,12 @@ fn clip_varying_triangle_against_near_plane(
     }
 }
 
+#[cfg(test)]
 fn intersect_clipped_vertex(a: ClippedVertex, b: ClippedVertex, near_z: f32) -> ClippedVertex {
     let t = (near_z - a.view_pos.z) / (b.view_pos.z - a.view_pos.z);
     ClippedVertex {
         view_pos: a.view_pos + (b.view_pos - a.view_pos) * t,
+        clip_pos: a.clip_pos + (b.clip_pos - a.clip_pos) * t,
         source_bc: a.source_bc + (b.source_bc - a.source_bc) * t,
     }
 }
@@ -2216,10 +2841,12 @@ fn render_shadow_map(
     let shadow_transforms = RenderTransforms {
         transform: transforms.light_transform,
         model_view: transforms.light_model_view,
-        view_to_screen: transforms.light_view_to_screen,
+        view_to_clip: transforms.light_view_to_clip,
+        clip_to_screen: transforms.light_clip_to_screen,
         light_transform: transforms.light_transform,
         light_model_view: transforms.light_model_view,
-        light_view_to_screen: transforms.light_view_to_screen,
+        light_view_to_clip: transforms.light_view_to_clip,
+        light_clip_to_screen: transforms.light_clip_to_screen,
     };
     render_shader(
         model,
@@ -2278,6 +2905,33 @@ fn neutral_normal_map(size: u32) -> RgbImage {
 }
 
 pub fn sample_texture(texture: &RgbImage, uv: Vec2, sampler: TextureSampler) -> Rgb<u8> {
+    sample_texture_with_mipmaps(texture, None, uv, sampler, 0.0)
+}
+
+pub fn sample_texture_with_mipmaps(
+    texture: &RgbImage,
+    mipmaps: Option<&[RgbImage]>,
+    uv: Vec2,
+    sampler: TextureSampler,
+    lod: f32,
+) -> Rgb<u8> {
+    if sampler.filter == TextureFilter::Mipmap {
+        if let Some(levels) = mipmaps {
+            if !levels.is_empty() {
+                let level = lod
+                    .round()
+                    .clamp(0.0, (levels.len().saturating_sub(1)) as f32)
+                    as usize;
+                let mut sampler = sampler;
+                sampler.filter = TextureFilter::Linear;
+                return sample_texture_level(&levels[level], uv, sampler);
+            }
+        }
+    }
+    sample_texture_level(texture, uv, sampler)
+}
+
+fn sample_texture_level(texture: &RgbImage, uv: Vec2, sampler: TextureSampler) -> Rgb<u8> {
     let (tw, th) = texture.dimensions();
     let (u, v) = match sampler.wrap {
         TextureWrap::Repeat => (uv.x.rem_euclid(1.0), uv.y.rem_euclid(1.0)),
@@ -2289,7 +2943,7 @@ pub fn sample_texture(texture: &RgbImage, uv: Vec2, sampler: TextureSampler) -> 
             let ty = ((1.0 - v) * (th - 1) as f32).round() as u32;
             *texture.get_pixel(tx, ty)
         }
-        TextureFilter::Linear => {
+        TextureFilter::Linear | TextureFilter::Mipmap => {
             let x = u * (tw - 1) as f32;
             let y = (1.0 - v) * (th - 1) as f32;
             let x0 = x.floor() as u32;
@@ -2305,6 +2959,54 @@ pub fn sample_texture(texture: &RgbImage, uv: Vec2, sampler: TextureSampler) -> 
             lerp_rgb(lerp_rgb(c00, c10, tx), lerp_rgb(c01, c11, tx), ty)
         }
     }
+}
+
+pub fn build_mipmaps(texture: &RgbImage) -> Vec<RgbImage> {
+    let mut levels = vec![texture.clone()];
+    while levels.last().unwrap().width() > 1 || levels.last().unwrap().height() > 1 {
+        let previous = levels.last().unwrap();
+        let next_width = (previous.width() / 2).max(1);
+        let next_height = (previous.height() / 2).max(1);
+        let next = ImageBuffer::from_fn(next_width, next_height, |x, y| {
+            let sx = x * 2;
+            let sy = y * 2;
+            let samples = [
+                *previous.get_pixel(sx.min(previous.width() - 1), sy.min(previous.height() - 1)),
+                *previous.get_pixel(
+                    (sx + 1).min(previous.width() - 1),
+                    sy.min(previous.height() - 1),
+                ),
+                *previous.get_pixel(
+                    sx.min(previous.width() - 1),
+                    (sy + 1).min(previous.height() - 1),
+                ),
+                *previous.get_pixel(
+                    (sx + 1).min(previous.width() - 1),
+                    (sy + 1).min(previous.height() - 1),
+                ),
+            ];
+            average_rgb(&samples)
+        });
+        levels.push(next);
+    }
+    levels
+}
+
+fn average_rgb(samples: &[Rgb<u8>; 4]) -> Rgb<u8> {
+    Rgb([
+        (samples.iter().map(|p| p[0] as u16).sum::<u16>() / 4) as u8,
+        (samples.iter().map(|p| p[1] as u16).sum::<u16>() / 4) as u8,
+        (samples.iter().map(|p| p[2] as u16).sum::<u16>() / 4) as u8,
+    ])
+}
+
+fn triangle_lod(uv: [Vec2; 3], screen: [Vec2; 3], texture_width: u32, texture_height: u32) -> f32 {
+    let screen_area = edge_function(screen[0], screen[1], screen[2])
+        .abs()
+        .max(1.0);
+    let uv_area = edge_function(uv[0], uv[1], uv[2]).abs().max(EPSILON);
+    let texel_area = uv_area * texture_width.max(1) as f32 * texture_height.max(1) as f32;
+    (texel_area / screen_area).max(1.0).log2() * 0.5
 }
 
 fn lerp_rgb(a: Rgb<u8>, b: Rgb<u8>, t: f32) -> Rgb<u8> {
@@ -2403,6 +3105,21 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    fn temp_asset_pair(obj_contents: &str, mtl_contents: &str) -> String {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let obj_path = dir.join(format!("octo-render-test-{id}.obj"));
+        let mtl_path = dir.join(format!("octo-render-test-{id}.mtl"));
+        let obj_contents =
+            obj_contents.replace("{MTL}", mtl_path.file_name().unwrap().to_str().unwrap());
+        fs::write(&obj_path, obj_contents).unwrap();
+        fs::write(&mtl_path, mtl_contents).unwrap();
+        obj_path.to_string_lossy().into_owned()
+    }
+
     fn tiny_model() -> Model {
         Model {
             vertices: vec![
@@ -2429,6 +3146,16 @@ mod tests {
                     vn: Some(0),
                 },
             ]],
+            materials: Vec::new(),
+            face_materials: vec![None],
+        }
+    }
+
+    fn clip_test_vertex(clip_pos: Vec4, source_bc: Vec3) -> ClippedVertex {
+        ClippedVertex {
+            view_pos: Vec3::new(clip_pos.x, clip_pos.y, -1.0),
+            clip_pos,
+            source_bc,
         }
     }
 
@@ -2479,6 +3206,42 @@ f 1/1/1 2/2/1 3/3/1
     }
 
     #[test]
+    fn obj_loader_parses_mtl_materials_and_face_assignments() {
+        let path = temp_asset_pair(
+            "\
+mtllib {MTL}
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+vn 0 0 -1
+usemtl painted
+f 1/1/1 2/2/1 3/3/1
+",
+            "\
+newmtl painted
+Kd 0.25 0.50 0.75
+Ka 0.10 0.10 0.10
+Ks 0.20 0.20 0.20
+Ns 64
+d 0.5
+map_Kd checker.ppm
+map_Bump normal-checker.ppm
+",
+        );
+        let model = Model::load(path).unwrap();
+        assert_eq!(model.materials.len(), 1);
+        assert_eq!(model.materials[0].name, "painted");
+        assert_eq!(model.materials[0].material.base_color, Rgb([64, 128, 191]));
+        assert_eq!(model.materials[0].material.alpha, 0.5);
+        assert!(model.materials[0].diffuse_map.is_some());
+        assert!(model.materials[0].normal_map.is_some());
+        assert_eq!(model.face_materials, vec![Some(0)]);
+    }
+
+    #[test]
     fn draw_line_includes_both_endpoints() {
         let red = Rgb([255, 0, 0]);
         let mut image = ImageBuffer::from_pixel(4, 1, Rgb([0, 0, 0]));
@@ -2502,6 +3265,24 @@ f 1/1/1 2/2/1 3/3/1
         );
         assert_eq!(*image.get_pixel(1, 1), red);
         assert_eq!(*image.get_pixel(3, 3), Rgb([0, 0, 0]));
+    }
+
+    #[test]
+    fn top_left_rule_assigns_shared_edge_to_one_triangle() {
+        let p = Vec2::new(1.5, 1.5);
+        let first = point_in_triangle_top_left(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(2.0, 0.0),
+            Vec2::new(2.0, 2.0),
+            p,
+        );
+        let second = point_in_triangle_top_left(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(2.0, 2.0),
+            Vec2::new(0.0, 2.0),
+            p,
+        );
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -2672,6 +3453,29 @@ f 1/1/1 2/2/1 3/3/1
     }
 
     #[test]
+    fn mipmap_generation_and_sampling_are_deterministic() {
+        let tex = ImageBuffer::from_fn(4, 4, |x, y| {
+            Rgb([(x * 40) as u8, (y * 40) as u8, ((x + y) * 20) as u8])
+        });
+        let mipmaps = build_mipmaps(&tex);
+        assert_eq!(mipmaps.len(), 3);
+        assert_eq!(mipmaps[0].dimensions(), (4, 4));
+        assert_eq!(mipmaps[1].dimensions(), (2, 2));
+        assert_eq!(mipmaps[2].dimensions(), (1, 1));
+        let sampled = sample_texture_with_mipmaps(
+            &tex,
+            Some(&mipmaps),
+            Vec2::new(0.25, 0.75),
+            TextureSampler {
+                wrap: TextureWrap::Clamp,
+                filter: TextureFilter::Mipmap,
+            },
+            1.0,
+        );
+        assert_eq!(sampled, Rgb([40, 40, 40]));
+    }
+
+    #[test]
     fn near_plane_clip_splits_crossing_triangle() {
         let clipped = clip_triangle_against_near_plane(
             [
@@ -2694,14 +3498,17 @@ f 1/1/1 2/2/1 3/3/1
             [
                 ClippedVertex {
                     view_pos: Vec3::new(-1.0, -1.0, -2.0),
+                    clip_pos: Vec4::new(-1.0, -1.0, -2.0, 1.0),
                     source_bc: Vec3::X,
                 },
                 ClippedVertex {
                     view_pos: Vec3::new(1.0, -1.0, -2.0),
+                    clip_pos: Vec4::new(1.0, -1.0, -2.0, 1.0),
                     source_bc: Vec3::Y,
                 },
                 ClippedVertex {
                     view_pos: Vec3::new(0.0, 1.0, 0.5),
+                    clip_pos: Vec4::new(0.0, 1.0, 0.5, 1.0),
                     source_bc: Vec3::Z,
                 },
             ],
@@ -2711,6 +3518,59 @@ f 1/1/1 2/2/1 3/3/1
         assert!(clipped.iter().flatten().all(|vertex| {
             (vertex.source_bc.x + vertex.source_bc.y + vertex.source_bc.z - 1.0).abs() < EPSILON
         }));
+    }
+
+    #[test]
+    fn frustum_clip_rejects_fully_outside_triangle() {
+        let clipped = clip_varying_triangle_against_frustum(
+            [
+                clip_test_vertex(Vec4::new(-3.0, 0.0, 0.0, 1.0), Vec3::X),
+                clip_test_vertex(Vec4::new(-2.5, 0.5, 0.0, 1.0), Vec3::Y),
+                clip_test_vertex(Vec4::new(-2.5, -0.5, 0.0, 1.0), Vec3::Z),
+            ],
+            0.1,
+            10.0,
+        );
+        assert!(clipped.is_empty());
+    }
+
+    #[test]
+    fn frustum_clip_preserves_varyings_when_crossing_multiple_planes() {
+        let clipped = clip_varying_triangle_against_frustum(
+            [
+                clip_test_vertex(Vec4::new(-2.0, 0.0, 0.0, 1.0), Vec3::X),
+                clip_test_vertex(Vec4::new(0.0, 2.0, 0.0, 1.0), Vec3::Y),
+                clip_test_vertex(Vec4::new(0.4, 0.4, 0.0, 1.0), Vec3::Z),
+            ],
+            0.1,
+            10.0,
+        );
+        assert!(!clipped.is_empty());
+        for vertex in clipped.iter().flatten() {
+            assert!(vertex.clip_pos.x + vertex.clip_pos.w >= -EPSILON);
+            assert!(vertex.clip_pos.w - vertex.clip_pos.x >= -EPSILON);
+            assert!(vertex.clip_pos.y + vertex.clip_pos.w >= -EPSILON);
+            assert!(vertex.clip_pos.w - vertex.clip_pos.y >= -EPSILON);
+            assert!(
+                (vertex.source_bc.x + vertex.source_bc.y + vertex.source_bc.z - 1.0).abs()
+                    < EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn blend_modes_apply_alpha_and_additive_math() {
+        let dst = Rgb([100, 20, 10]);
+        let src = Fragment::new(Rgb([200, 100, 50]), 0.5);
+        assert_eq!(
+            blend_fragment(dst, src, BlendMode::Alpha),
+            Rgb([150, 60, 30])
+        );
+        assert_eq!(
+            blend_fragment(dst, src, BlendMode::Additive),
+            Rgb([200, 70, 35])
+        );
+        assert_eq!(blend_fragment(dst, src, BlendMode::Off), src.colour);
     }
 
     #[test]
@@ -2868,6 +3728,84 @@ f 1/1/1 2/2/1 3/3/1
             .unwrap()
             .to_rgb8();
         assert_images_close(&output.image, &golden, 1);
+    }
+
+    #[test]
+    fn mtl_textured_quad_matches_golden_image_with_tolerance() {
+        let output = render_material_quad(TextureFilter::Nearest, BlendMode::Off, None);
+        let golden =
+            image::load_from_memory(include_bytes!("../tests/golden/material-quad-32.png"))
+                .unwrap()
+                .to_rgb8();
+        assert_images_close(&output, &golden, 1);
+    }
+
+    #[test]
+    fn alpha_blended_quad_matches_golden_image_with_tolerance() {
+        let output = render_material_quad(TextureFilter::Nearest, BlendMode::Alpha, Some(0.45));
+        let golden =
+            image::load_from_memory(include_bytes!("../tests/golden/material-quad-alpha-32.png"))
+                .unwrap()
+                .to_rgb8();
+        assert_images_close(&output, &golden, 1);
+    }
+
+    #[test]
+    fn mipmapped_quad_matches_golden_image_with_tolerance() {
+        let output = render_material_quad(TextureFilter::Mipmap, BlendMode::Off, None);
+        let golden = image::load_from_memory(include_bytes!(
+            "../tests/golden/material-quad-mipmap-32.png"
+        ))
+        .unwrap()
+        .to_rgb8();
+        assert_images_close(&output, &golden, 1);
+    }
+
+    fn render_material_quad(
+        filter: TextureFilter,
+        blend_mode: BlendMode,
+        alpha_override: Option<f32>,
+    ) -> RgbImage {
+        let model = Model::load("resources/material-quad.obj").unwrap();
+        let material = model.materials.first().unwrap();
+        let texture = image::open(material.diffuse_map.as_ref().unwrap())
+            .unwrap()
+            .to_rgb8();
+        let texture_mipmaps = if filter == TextureFilter::Mipmap {
+            build_mipmaps(&texture)
+        } else {
+            Vec::new()
+        };
+        let mut material_state = material.material;
+        if let Some(alpha) = alpha_override {
+            material_state.alpha = alpha;
+        }
+        let mut render_state = RenderState {
+            blend_mode,
+            ..RenderState::default()
+        };
+        if blend_mode != BlendMode::Off {
+            render_state.depth = DepthState {
+                test_enabled: false,
+                write_enabled: false,
+            };
+        }
+        let options = RenderOptions {
+            width: 32,
+            height: 32,
+            mode: RenderMode::Texture,
+            light_dir: Vec3::new(0.0, 0.0, 1.0),
+            texture: Some(texture),
+            texture_mipmaps,
+            texture_sampler: TextureSampler {
+                wrap: TextureWrap::Clamp,
+                filter,
+            },
+            material: material_state,
+            render_state,
+            ..RenderOptions::default()
+        };
+        render_model(&model, &options).image
     }
 
     fn image_checksum(image: &RgbImage) -> u64 {

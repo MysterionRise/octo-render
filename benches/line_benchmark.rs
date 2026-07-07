@@ -3,8 +3,9 @@ use glam::Vec3;
 use image::{ImageBuffer, Rgb, RgbImage};
 use rand::Rng;
 use renderer::{
-    draw_line, render_model, triangle_zbuf, FaceVertex, Model, RenderMode, RenderOptions,
-    ShadowFilter, ShadowOptions, TextureFilter, TextureSampler, TextureWrap,
+    build_mipmaps, draw_line, render_model, triangle_zbuf, BlendMode, FaceVertex, Material, Model,
+    RenderMode, RenderOptions, RenderState, ShadowFilter, ShadowOptions, TextureFilter,
+    TextureSampler, TextureWrap,
 };
 
 type Pairs = (i32, i32, i32, i32);
@@ -15,6 +16,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     bench_full_model_render(c);
     bench_clipped_model_render(c);
     bench_texture_filter_variants(c);
+    bench_blend_variants(c);
     bench_shadow_filter_variants(c);
 }
 
@@ -154,12 +156,22 @@ fn bench_texture_filter_variants(c: &mut Criterion) {
     let mut group = c.benchmark_group("software renderer texture filtering");
     group.sample_size(10);
 
-    for filter in [TextureFilter::Nearest, TextureFilter::Linear] {
+    let mipmaps = build_mipmaps(&texture);
+    for filter in [
+        TextureFilter::Nearest,
+        TextureFilter::Linear,
+        TextureFilter::Mipmap,
+    ] {
         let options = RenderOptions {
             width: 256,
             height: 256,
             mode: RenderMode::Texture,
             texture: Some(texture.clone()),
+            texture_mipmaps: if filter == TextureFilter::Mipmap {
+                mipmaps.clone()
+            } else {
+                Vec::new()
+            },
             texture_sampler: TextureSampler {
                 wrap: TextureWrap::Repeat,
                 filter,
@@ -167,6 +179,43 @@ fn bench_texture_filter_variants(c: &mut Criterion) {
             ..RenderOptions::default()
         };
         group.bench_function(filter.as_str(), |b| {
+            b.iter(|| {
+                let output = render_model(black_box(&model), black_box(&options));
+                black_box(output.image);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_blend_variants(c: &mut Criterion) {
+    let model = Model::from_file("resources/textured-quad.obj");
+    let texture = image::open("resources/checker.ppm").unwrap().to_rgb8();
+    let mut group = c.benchmark_group("software renderer blending");
+    group.sample_size(10);
+
+    for blend_mode in [BlendMode::Off, BlendMode::Alpha, BlendMode::Additive] {
+        let options = RenderOptions {
+            width: 256,
+            height: 256,
+            mode: RenderMode::Texture,
+            texture: Some(texture.clone()),
+            material: Material {
+                alpha: 0.55,
+                ..Material::default()
+            },
+            render_state: RenderState {
+                blend_mode,
+                depth: renderer::DepthState {
+                    test_enabled: false,
+                    write_enabled: false,
+                },
+                ..RenderState::default()
+            },
+            ..RenderOptions::default()
+        };
+        group.bench_function(blend_mode.as_str(), |b| {
             b.iter(|| {
                 let output = render_model(black_box(&model), black_box(&options));
                 black_box(output.image);
@@ -231,6 +280,8 @@ fn clipping_test_model() -> Model {
                 vn: Some(0),
             },
         ]],
+        materials: Vec::new(),
+        face_materials: vec![None],
     }
 }
 
