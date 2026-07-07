@@ -2,7 +2,10 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion
 use glam::Vec3;
 use image::{ImageBuffer, Rgb, RgbImage};
 use rand::Rng;
-use renderer::{draw_line, render_model, triangle_zbuf, Model, RenderMode, RenderOptions};
+use renderer::{
+    draw_line, render_model, triangle_zbuf, FaceVertex, Model, RenderMode, RenderOptions,
+    ShadowFilter, ShadowOptions, TextureFilter, TextureSampler, TextureWrap,
+};
 
 type Pairs = (i32, i32, i32, i32);
 
@@ -10,6 +13,9 @@ fn criterion_benchmark(c: &mut Criterion) {
     bench_line_drawing(c);
     bench_triangle_rasterization(c);
     bench_full_model_render(c);
+    bench_clipped_model_render(c);
+    bench_texture_filter_variants(c);
+    bench_shadow_filter_variants(c);
 }
 
 fn bench_line_drawing(c: &mut Criterion) {
@@ -71,7 +77,7 @@ fn bench_triangle_rasterization(c: &mut Criterion) {
 
 fn bench_full_model_render(c: &mut Criterion) {
     let model = Model::from_file("resources/teapot.obj");
-    let mut group = c.benchmark_group("software renderer full frame");
+    let mut group = c.benchmark_group("software renderer full frame 128");
     group.sample_size(10);
 
     for mode in [RenderMode::Flat, RenderMode::Gouraud, RenderMode::Shadow] {
@@ -93,6 +99,139 @@ fn bench_full_model_render(c: &mut Criterion) {
     }
 
     group.finish();
+
+    let mut resolution_group = c.benchmark_group("software renderer resolution scaling");
+    resolution_group.sample_size(10);
+    for resolution in [128, 512, 1024] {
+        let options = RenderOptions {
+            width: resolution,
+            height: resolution,
+            mode: RenderMode::Flat,
+            camera_eye: None,
+            light_dir: Vec3::new(1.0, 1.0, -1.0),
+            debug_outputs: false,
+            ..RenderOptions::default()
+        };
+        resolution_group.bench_function(format!("flat/{resolution}x{resolution}"), |b| {
+            b.iter(|| {
+                let output = render_model(black_box(&model), black_box(&options));
+                black_box(output.image);
+            })
+        });
+    }
+    resolution_group.finish();
+}
+
+fn bench_clipped_model_render(c: &mut Criterion) {
+    let model = clipping_test_model();
+    let mut group = c.benchmark_group("software renderer clipping");
+    group.sample_size(10);
+
+    for (name, near_plane) in [("unclipped", 0.01), ("near-plane-clipped", 1.8)] {
+        let options = RenderOptions {
+            width: 256,
+            height: 256,
+            mode: RenderMode::Gouraud,
+            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            light_dir: Vec3::new(0.0, 0.0, -1.0),
+            near_plane,
+            ..RenderOptions::default()
+        };
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let output = render_model(black_box(&model), black_box(&options));
+                black_box(output.image);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_texture_filter_variants(c: &mut Criterion) {
+    let model = Model::from_file("resources/textured-quad.obj");
+    let texture = image::open("resources/checker.ppm").unwrap().to_rgb8();
+    let mut group = c.benchmark_group("software renderer texture filtering");
+    group.sample_size(10);
+
+    for filter in [TextureFilter::Nearest, TextureFilter::Linear] {
+        let options = RenderOptions {
+            width: 256,
+            height: 256,
+            mode: RenderMode::Texture,
+            texture: Some(texture.clone()),
+            texture_sampler: TextureSampler {
+                wrap: TextureWrap::Repeat,
+                filter,
+            },
+            ..RenderOptions::default()
+        };
+        group.bench_function(filter.as_str(), |b| {
+            b.iter(|| {
+                let output = render_model(black_box(&model), black_box(&options));
+                black_box(output.image);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_shadow_filter_variants(c: &mut Criterion) {
+    let model = Model::from_file("resources/teapot.obj");
+    let mut group = c.benchmark_group("software renderer shadow filtering");
+    group.sample_size(10);
+
+    for filter in [ShadowFilter::None, ShadowFilter::Pcf] {
+        let options = RenderOptions {
+            width: 256,
+            height: 256,
+            mode: RenderMode::Shadow,
+            shadow: ShadowOptions {
+                size: 256,
+                bias: 4.0,
+                filter,
+            },
+            ..RenderOptions::default()
+        };
+        group.bench_function(filter.as_str(), |b| {
+            b.iter(|| {
+                let output = render_model(black_box(&model), black_box(&options));
+                black_box(output.image);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn clipping_test_model() -> Model {
+    Model {
+        vertices: vec![
+            Vec3::new(-0.8, -0.8, -0.8),
+            Vec3::new(0.8, -0.8, -0.8),
+            Vec3::new(0.0, 0.8, 1.2),
+        ],
+        texcoords: Vec::new(),
+        normals: vec![Vec3::new(0.0, 0.0, -1.0)],
+        faces: vec![[
+            FaceVertex {
+                v: 0,
+                vt: None,
+                vn: Some(0),
+            },
+            FaceVertex {
+                v: 1,
+                vt: None,
+                vn: Some(0),
+            },
+            FaceVertex {
+                v: 2,
+                vt: None,
+                vn: Some(0),
+            },
+        ]],
+    }
 }
 
 criterion_group!(benches, criterion_benchmark);
