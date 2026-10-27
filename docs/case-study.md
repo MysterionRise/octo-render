@@ -21,6 +21,7 @@ The current renderer supports:
 - culling, front-face winding, depth test/write, fill mode, scissor, clear state, color-write state, and blending
 - repeat/clamp wrapping and nearest/linear/mipmap filtering
 - material controls for base color, ambient, diffuse, specular, shininess, and alpha
+- Blinn-Phong specular driven by the same light vector as diffuse shading and the shadow map
 - configurable shadow-map size, bias, and none/PCF filtering
 
 ## Hardest Technical Issues
@@ -31,11 +32,13 @@ That approach keeps the existing shader trait small while preserving UVs, normal
 
 The second important issue was raster determinism. The top-left fill rule means adjacent triangles share edges without double-filling or leaving cracks, which turns a vague "draw triangle" helper into a more defensible rasterizer.
 
-The third important issue was evidence. The project now has deterministic golden-image tests, debug outputs, gallery renders, and Criterion benchmarks instead of relying on screenshots alone.
+The third issue was lighting consistency, found by auditing the gallery rather than by a failing test. Face normals were computed inward, which Lambert shading hid because the light vector was flipped too. The shadow-map camera used the unflipped vector, so it sat opposite the light that shaded the model, and the shadow render was mostly dark with a stray bright crescent. The same audit found that specular was never evaluated (`--specular`, `--shininess`, and MTL `Ks`/`Ns` were silently ignored), and that unlit fragments were discarded before the depth write, leaving holes behind back-lit surfaces. The fix defines one outward-normal, toward-the-light convention, adds Blinn-Phong specular, and gives the shadow pass its own fixed raster state. Tests now pin each behaviour.
+
+The fourth important issue was evidence. The project now has deterministic golden-image tests, debug outputs, gallery renders, and Criterion benchmarks instead of relying on screenshots alone.
 
 ## Correctness Strategy
 
-The test suite covers parser behavior, MTL loading, rasterization, top-left shared-edge behavior, depth state, culling, front-face winding, texture wrapping/filtering/mipmaps, blending, scissor/color-write state, frustum clipping, debug outputs, SSAO determinism, and golden-image output.
+The test suite covers parser behavior, MTL loading, rasterization, top-left shared-edge behavior, depth state, culling, front-face winding, texture wrapping/filtering/mipmaps, blending, scissor/color-write state, frustum clipping, specular highlights, unlit depth writes, shadow casting and PCF, shadow-pass state isolation, debug outputs, SSAO determinism, and golden-image output.
 
 The renderer intentionally keeps several outputs deterministic so regressions are visible in tests:
 
@@ -59,9 +62,10 @@ The renderer is still intentionally smaller than OpenGL:
 - no stencil buffer, MSAA, cubemaps, instancing, or shader language
 - blending supports alpha/additive modes, not arbitrary blend equations
 - shadow mapping uses fixed bias and simple PCF
+- the bundled meshes have no `vn` normals, so Gouraud shading uses face normals and looks faceted
 - SSAO is deterministic and useful for pipeline demonstration, not physically based
 - CPU performance is educational and measurable, not production real-time
 
 ## Next Work
 
-The highest-value next steps are deeper profiling, one measured optimization pass, richer material assets, and a short recorded demo comparing CPU renders with the `wgpu` viewer.
+The highest-value next steps are one measured optimization pass (band-parallel rasterization behind a `--threads` flag, verified byte-identical to the sequential path), smooth vertex-normal generation for meshes without `vn`, richer material assets, and a headless `wgpu` screenshot path for a side-by-side CPU/GPU comparison.

@@ -3,7 +3,7 @@ use image::Rgb;
 use renderer::{
     build_mipmaps, render_model, BlendMode, CullMode, DepthState, FillMode, FrontFace, Material,
     Model, ObjMaterial, RenderMode, RenderOptions, RenderState, ScissorRect, ShadowFilter,
-    ShadowOptions, TextureFilter, TextureSampler, TextureWrap,
+    ShadowOptions, TextureFilter, TextureSampler, TextureWrap, DEFAULT_LIGHT_DIR,
 };
 use std::env;
 use std::fs;
@@ -61,7 +61,7 @@ impl Default for Cli {
             shader: RenderMode::Shadow,
             output: PathBuf::from("renders/teapot-shadow.png"),
             camera: None,
-            light: Vec3::new(1.0, 1.0, -1.0),
+            light: DEFAULT_LIGHT_DIR,
             debug_dir: None,
             cull_mode: CullMode::Off,
             front_face: FrontFace::Ccw,
@@ -502,7 +502,7 @@ Options:
   --shader <mode>      One of: {}
   --output <path>      Output image path [default: renders/teapot-shadow.png]
   --camera <x,y,z>     Camera eye in normalized scene space [default: 0,0.25,3]
-  --light <x,y,z>      Directional light vector [default: 1,1,-1]
+  --light <x,y,z>      Direction toward the light, scene space [default: 1,1,1]
   --debug-dir <path>   Write depth, shadow-map, normals, and AO debug PNGs
   --cull <mode>        Face culling: off, front, back [default: off]
   --front-face <mode>  Front-face winding: ccw, cw [default: ccw]
@@ -523,7 +523,7 @@ Options:
   --ambient <value>    Ambient material factor [default: 0]
   --diffuse <value>    Diffuse material factor [default: 1]
   --specular <value>   Specular material factor [default: 0]
-  --shininess <value>  Specular exponent control [default: 32]
+  --shininess <value>  Blinn-Phong exponent, like MTL Ns [default: 32]
   --alpha <value>      Material alpha for blend modes [default: 1]
   --shadow-size <px>   Square shadow-map size [default: output dimensions]
   --shadow-bias <z>    Shadow-map depth bias [default: 4]

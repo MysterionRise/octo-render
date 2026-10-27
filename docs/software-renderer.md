@@ -29,10 +29,10 @@ flowchart LR
 - **Clipping:** triangles are clipped against the left, right, bottom, top, near, and far frustum planes before viewport rasterization. Emitted vertices preserve original-face barycentric coordinates for UVs, normals, world position, and perspective-correct varyings.
 - **Rasterization:** triangles are filled using pixel-center sampling, a deterministic top-left edge rule, and barycentric coordinates over a screen-space bounding box, optionally restricted by scissor state.
 - **Depth:** the z-buffer supports clear, test, and write state. This makes depth behavior explicit instead of implicit in the triangle helper.
-- **Fragment shading:** render modes include wireframe, flat, Gouraud, checker/file texture, normal map, normal debug, shadow, and SSAO.
+- **Fragment shading:** render modes include wireframe, flat, Gouraud, checker/file texture, normal map, normal debug, shadow, and SSAO. Lit modes combine a Lambert diffuse term with a Blinn-Phong specular term driven by the material's `specular` and `shininess` (MTL `Ks` and `Ns`).
 - **Blending:** color writes can bypass blending, use source-over alpha, or use additive blending.
 - **Texture sampling:** repeat/clamp wrapping, nearest filtering, bilinear filtering, and a simplified mipmap LOD path are implemented in CPU code.
-- **Shadow mapping:** the renderer builds a light-space depth map, then samples that map during the main pass with configurable bias, resolution, and optional 3x3 PCF.
+- **Shadow mapping:** the renderer builds a light-space depth map with a fixed depth-only raster state, then samples that map during the main pass with configurable bias, resolution, and optional 3x3 PCF.
 - **Debug outputs:** depth, normal, shadow-map, and AO maps can be written alongside the final render.
 
 ## Render State
@@ -56,6 +56,20 @@ The defaults intentionally match the original renderer behavior: no culling, cou
 The first version interpolated all fragment inputs directly in screen-space barycentric coordinates. That is acceptable for early rasterization lessons, but it is not what a perspective pipeline does for varyings such as UVs or normals. The current raster path weights barycentric coordinates by reciprocal clip-space `w`, then renormalizes the result before fragment shading.
 
 This matters most for textured, normal-mapped, and per-fragment shadowed shading because attributes otherwise slide or distort when geometry is under perspective projection.
+
+## Lighting Conventions
+
+One vector, `RenderOptions::light_dir` (`--light`), describes the light: the direction *toward* the light in normalized scene space. `render_model` rotates it into eye space once per frame for shading, and places the shadow-map camera at `light_dir * 3`. Normals point outward: `Model::face_normal` assumes counter-clockwise winding, the OBJ convention.
+
+An earlier version computed face normals with the opposite cross product, so they pointed inward. Lambert's term still produced plausible shading, because the inward normal and the light vector were both flipped. The shadow camera, however, sat on the opposite side of the model from the light that shaded it, so every lit surface was reported as occluded. The shadow render came out mostly dark with a stray bright crescent along the shadow camera's silhouette. Models with explicit outward `vn` normals followed a third convention again. Making face normals outward and defining the light vector once fixed all three cases together.
+
+Specular uses Blinn-Phong: `max(dot(n, h), 0)^shininess` with `h = normalize(l + v)`, evaluated in eye space where the viewer sits at the origin. It is computed per face in flat mode, per vertex in Gouraud, texture, and shadow modes, and per pixel in normal-map mode. Inside shadows the specular term is scaled by light visibility, so occluded points show no highlight.
+
+Lighting never discards a fragment. A surface facing away from the light shades to its ambient colour (black when ambient is 0) and still writes depth, so it occludes geometry behind it instead of leaving a hole that shows the clear colour.
+
+## Shadow Pass State
+
+The light-space depth pass uses a fixed raster state: depth test and write on, no culling, no scissor, colour writes off, blending off. It does not inherit the camera pass's `RenderState`, so flags like `--scissor` or `--depth-write off` cannot crop or empty the shadow map.
 
 ## Attribute-Preserving Frustum Clipping
 
@@ -100,6 +114,7 @@ The `wgpu` viewer exists separately because `wgpu` delegates rasterization to th
 - Blending has alpha and additive modes, but not arbitrary blend factors/equations.
 - No stencil buffer, multisampling, cubemaps, instancing, or uniform-buffer abstraction.
 - Shadow mapping uses configurable fixed bias and simple PCF, not slope-scaled bias or cascades.
+- Lighting is a single directional light with Lambert diffuse and Blinn-Phong specular in 8-bit colour; there is no gamma-correct pipeline, point light, or PBR model.
 - SSAO is deterministic and useful for demonstrating a post-process pass, not physically based.
 
 ## What To Look At In The Code
