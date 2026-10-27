@@ -51,8 +51,9 @@ render "${teapot[@]}" --shader shadow "${key_light[@]}" --shadow-filter pcf \
 render "${teapot[@]}" --shader ssao "${key_light[@]}" \
     --output renders/ssao-teapot.png --debug-dir renders/debug/teapot-ssao
 
-# Clipping: a close camera pushes the teapot across the frustum's side planes.
-render "${teapot[@]}" --shader gouraud --camera 0.9,0.4,1.6 \
+# Clipping: the camera sits beside the spout, so the near plane slices the
+# spout open and its interior shows through the cut.
+render "${teapot[@]}" --shader gouraud --camera 1.3,0.55,0.3 \
     --output renders/frustum-clipped-teapot.png
 
 # Blending, sampling, and MTL-driven materials on the material quad.
