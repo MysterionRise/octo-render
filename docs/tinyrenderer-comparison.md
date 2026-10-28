@@ -17,7 +17,7 @@ References:
 | Lesson 3: hidden-face removal / z-buffer | Implemented and extended | depth clear/test/write state and z-buffer tests |
 | Lesson 4: perspective projection | Implemented | model/view/projection transforms and perspective-correct varyings |
 | Lesson 5: moving camera | Implemented | CLI camera/light vectors and look-at transform |
-| Lesson 6: shader abstraction | Implemented and extended | Rust `Shader` trait with flat, Gouraud, texture, normal debug, shadow modes |
+| Lesson 6: shader abstraction | Implemented and extended | Rust `Shader` trait with flat, Gouraud, texture, normal debug, shadow modes, plus Blinn-Phong specular |
 | Lesson 6bis: tangent-space normal mapping | Implemented subset | normal-map mode with CLI or MTL normal-map texture |
 | Lesson 7: shadow mapping | Implemented and extended | configurable shadow size, bias, no-filter/PCF, debug shadow map |
 | Lesson 8: ambient occlusion | Implemented subset | deterministic SSAO post-process and AO debug map |
@@ -34,6 +34,8 @@ The current repo adds portfolio-grade engineering around the educational rendere
 - deterministic top-left raster fill behavior
 - texture wrap/filter controls including simplified mipmaps
 - alpha and additive blending
+- Blinn-Phong specular from MTL `Ks`/`Ns` or CLI flags
+- one toward-the-light vector shared by shading and the shadow-map camera
 - debug outputs for depth, normals, shadow map, and AO
 - Criterion benchmarks for primitives and full-frame renders
 - golden-image regression tests

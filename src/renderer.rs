@@ -9,6 +9,15 @@ use std::str::FromStr;
 const EPSILON: f32 = 1e-6;
 const DEFAULT_BACKGROUND: Rgb<u8> = Rgb([18, 20, 24]);
 
+/// Default direction toward the key light, in normalized scene (world) space.
+///
+/// Light vectors throughout the renderer point from the surface toward the light,
+/// so Lambert's term is `max(dot(n, l), 0)` with an outward normal `n`.
+pub const DEFAULT_LIGHT_DIR: Vec3 = Vec3::new(1.0, 1.0, 1.0);
+
+/// Fraction of diffuse light kept where the shadow map reports full occlusion.
+const SHADOWED_DIFFUSE: f32 = 0.35;
+
 /// Parsed face vertex: indices into vertex/texcoord/normal arrays (0-based).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaceVertex {
@@ -76,12 +85,14 @@ impl Model {
         Some(ModelBounds { min, max })
     }
 
+    /// Outward geometric normal of a face, assuming counter-clockwise winding
+    /// (the OBJ convention).
     pub fn face_normal(&self, face_idx: usize) -> Vec3 {
         let face = self.faces[face_idx];
         let v0 = self.vertices[face[0].v];
         let v1 = self.vertices[face[1].v];
         let v2 = self.vertices[face[2].v];
-        safe_normal((v2 - v0).cross(v1 - v0), Vec3::Z)
+        safe_normal((v1 - v0).cross(v2 - v0), Vec3::Z)
     }
 
     pub fn vertex_normal(&self, face_idx: usize, vert_idx: usize) -> Vec3 {
@@ -1058,13 +1069,18 @@ fn raster_bounds(
 // --- Built-in shaders ---
 
 /// Gouraud shader: per-vertex lighting interpolated across the triangle.
+///
+/// `light_dir` is the eye-space direction toward the light. `normal_matrix` is
+/// derived from `model_view` in [`GouraudShader::new`].
 pub struct GouraudShader<'a> {
     pub model: &'a Model,
     pub transform: Mat4,
     pub model_view: Mat4,
+    pub normal_matrix: Mat4,
     pub light_dir: Vec3,
     pub material: Material,
     pub varying_intensity: [f32; 3],
+    pub varying_specular: [f32; 3],
 }
 
 impl<'a> GouraudShader<'a> {
@@ -1079,9 +1095,11 @@ impl<'a> GouraudShader<'a> {
             model,
             transform,
             model_view,
-            light_dir: safe_normal(light_dir, Vec3::new(1.0, 1.0, -1.0).normalize()),
+            normal_matrix: normal_matrix(model_view),
+            light_dir: safe_normal(light_dir, DEFAULT_LIGHT_DIR.normalize()),
             material,
             varying_intensity: [0.0; 3],
+            varying_specular: [0.0; 3],
         }
     }
 }
@@ -1092,21 +1110,24 @@ impl Shader for GouraudShader<'_> {
         let v = self.model.vertices[face[vert_idx].v];
         let normal = self.model.vertex_normal(face_idx, vert_idx);
 
-        let normal_matrix = self.model_view.inverse().transpose();
-        let n = safe_normal(transform_vector(&normal_matrix, normal), Vec3::Z);
+        let n = safe_normal(transform_vector(&self.normal_matrix, normal), Vec3::Z);
         self.varying_intensity[vert_idx] = n.dot(self.light_dir).max(0.0);
+        self.varying_specular[vert_idx] = specular_highlight(
+            &self.material,
+            n,
+            self.light_dir,
+            transform_point(&self.model_view, v),
+        );
 
         transform_point(&self.transform, v)
     }
 
     fn fragment(&self, bc: Vec3) -> Option<Fragment> {
-        let intensity = self.varying_intensity[0] * bc.x
-            + self.varying_intensity[1] * bc.y
-            + self.varying_intensity[2] * bc.z;
-        let colour = shade_material(self.material.base_color, self.material, intensity, 0.0);
-        if colour == Rgb([0, 0, 0]) {
-            return None;
-        }
+        let intensity = interpolate_scalar(self.varying_intensity, bc);
+        let specular = interpolate_scalar(self.varying_specular, bc);
+        // Unlit fragments still shade (to ambient or black) so they keep writing
+        // depth and occluding geometry behind them.
+        let colour = shade_material(self.material.base_color, self.material, intensity, specular);
         Some(Fragment::new(colour, self.material.alpha))
     }
 }
@@ -1116,12 +1137,14 @@ pub struct TextureShader<'a> {
     pub model: &'a Model,
     pub transform: Mat4,
     pub model_view: Mat4,
+    pub normal_matrix: Mat4,
     pub light_dir: Vec3,
     pub diffuse: Option<&'a RgbImage>,
     pub diffuse_mipmaps: Option<&'a [RgbImage]>,
     pub sampler: TextureSampler,
     pub material: Material,
     pub varying_intensity: [f32; 3],
+    pub varying_specular: [f32; 3],
     pub varying_uv: [Vec2; 3],
     pub varying_screen_pos: [Vec2; 3],
 }
@@ -1142,12 +1165,14 @@ impl<'a> TextureShader<'a> {
             model,
             transform,
             model_view,
-            light_dir: safe_normal(light_dir, Vec3::new(1.0, 1.0, -1.0).normalize()),
+            normal_matrix: normal_matrix(model_view),
+            light_dir: safe_normal(light_dir, DEFAULT_LIGHT_DIR.normalize()),
             diffuse,
             diffuse_mipmaps,
             sampler,
             material,
             varying_intensity: [0.0; 3],
+            varying_specular: [0.0; 3],
             varying_uv: [Vec2::ZERO; 3],
             varying_screen_pos: [Vec2::ZERO; 3],
         }
@@ -1159,14 +1184,17 @@ impl Shader for TextureShader<'_> {
         let face = &self.model.faces[face_idx];
         let v = self.model.vertices[face[vert_idx].v];
 
-        if let Some(ti) = face[vert_idx].vt {
-            self.varying_uv[vert_idx] = self.model.texcoords[ti];
-        }
+        self.varying_uv[vert_idx] = face_vertex_uv(self.model, face[vert_idx]);
 
         let normal = self.model.vertex_normal(face_idx, vert_idx);
-        let normal_matrix = self.model_view.inverse().transpose();
-        let n = safe_normal(transform_vector(&normal_matrix, normal), Vec3::Z);
+        let n = safe_normal(transform_vector(&self.normal_matrix, normal), Vec3::Z);
         self.varying_intensity[vert_idx] = n.dot(self.light_dir).max(0.0);
+        self.varying_specular[vert_idx] = specular_highlight(
+            &self.material,
+            n,
+            self.light_dir,
+            transform_point(&self.model_view, v),
+        );
 
         let screen = transform_point(&self.transform, v);
         self.varying_screen_pos[vert_idx] = screen.truncate();
@@ -1174,12 +1202,8 @@ impl Shader for TextureShader<'_> {
     }
 
     fn fragment(&self, bc: Vec3) -> Option<Fragment> {
-        let intensity = self.varying_intensity[0] * bc.x
-            + self.varying_intensity[1] * bc.y
-            + self.varying_intensity[2] * bc.z;
-        if intensity <= 0.0 && self.material.ambient <= 0.0 {
-            return None;
-        }
+        let intensity = interpolate_scalar(self.varying_intensity, bc);
+        let specular = interpolate_scalar(self.varying_specular, bc);
 
         let base = if let Some(tex) = self.diffuse {
             let uv =
@@ -1203,7 +1227,7 @@ impl Shader for TextureShader<'_> {
             self.material.base_color
         };
         Some(Fragment::new(
-            shade_material(base, self.material, intensity, 0.0),
+            shade_material(base, self.material, intensity, specular),
             self.material.alpha,
         ))
     }
@@ -1214,6 +1238,7 @@ pub struct NormalMapShader<'a> {
     pub model: &'a Model,
     pub transform: Mat4,
     pub model_view: Mat4,
+    pub normal_matrix: Mat4,
     pub light_dir: Vec3,
     pub diffuse: Option<&'a RgbImage>,
     pub normal_map: &'a RgbImage,
@@ -1244,7 +1269,8 @@ impl<'a> NormalMapShader<'a> {
             model,
             transform,
             model_view,
-            light_dir: safe_normal(light_dir, Vec3::new(1.0, 1.0, -1.0).normalize()),
+            normal_matrix: normal_matrix(model_view),
+            light_dir: safe_normal(light_dir, DEFAULT_LIGHT_DIR.normalize()),
             diffuse,
             normal_map,
             diffuse_mipmaps,
@@ -1263,10 +1289,7 @@ impl Shader for NormalMapShader<'_> {
         let face = &self.model.faces[face_idx];
         let v = self.model.vertices[face[vert_idx].v];
         self.varying_pos[vert_idx] = v;
-
-        if let Some(ti) = face[vert_idx].vt {
-            self.varying_uv[vert_idx] = self.model.texcoords[ti];
-        }
+        self.varying_uv[vert_idx] = face_vertex_uv(self.model, face[vert_idx]);
 
         let screen = transform_point(&self.transform, v);
         self.varying_screen_pos[vert_idx] = screen.truncate();
@@ -1316,12 +1339,16 @@ impl Shader for NormalMapShader<'_> {
             )
         };
 
-        let normal_matrix = self.model_view.inverse().transpose();
-        let n = safe_normal(transform_vector(&normal_matrix, world_normal), Vec3::Z);
+        let n = safe_normal(transform_vector(&self.normal_matrix, world_normal), Vec3::Z);
         let intensity = n.dot(self.light_dir).max(0.0);
-        if intensity <= 0.0 && self.material.ambient <= 0.0 {
-            return None;
-        }
+        let model_pos =
+            self.varying_pos[0] * bc.x + self.varying_pos[1] * bc.y + self.varying_pos[2] * bc.z;
+        let specular = specular_highlight(
+            &self.material,
+            n,
+            self.light_dir,
+            transform_point(&self.model_view, model_pos),
+        );
 
         let base = self
             .diffuse
@@ -1344,7 +1371,7 @@ impl Shader for NormalMapShader<'_> {
             })
             .unwrap_or(self.material.base_color);
         Some(Fragment::new(
-            shade_material(base, self.material, intensity, 0.0),
+            shade_material(base, self.material, intensity, specular),
             self.material.alpha,
         ))
     }
@@ -1355,6 +1382,7 @@ pub struct NormalDebugShader<'a> {
     pub model: &'a Model,
     pub transform: Mat4,
     pub model_view: Mat4,
+    pub normal_matrix: Mat4,
     pub varying_normal: [Vec3; 3],
 }
 
@@ -1364,6 +1392,7 @@ impl<'a> NormalDebugShader<'a> {
             model,
             transform,
             model_view,
+            normal_matrix: normal_matrix(model_view),
             varying_normal: [Vec3::Z; 3],
         }
     }
@@ -1374,9 +1403,8 @@ impl Shader for NormalDebugShader<'_> {
         let face = &self.model.faces[face_idx];
         let v = self.model.vertices[face[vert_idx].v];
         let normal = self.model.vertex_normal(face_idx, vert_idx);
-        let normal_matrix = self.model_view.inverse().transpose();
         self.varying_normal[vert_idx] =
-            safe_normal(transform_vector(&normal_matrix, normal), Vec3::Z);
+            safe_normal(transform_vector(&self.normal_matrix, normal), Vec3::Z);
         transform_point(&self.transform, v)
     }
 
@@ -1419,6 +1447,7 @@ pub struct ShadowShader<'a> {
     pub model: &'a Model,
     pub transform: Mat4,
     pub model_view: Mat4,
+    pub normal_matrix: Mat4,
     pub shadow_transform: Mat4,
     pub light_dir: Vec3,
     pub shadow_buffer: &'a [f32],
@@ -1427,6 +1456,7 @@ pub struct ShadowShader<'a> {
     pub shadow_options: ShadowOptions,
     pub material: Material,
     pub varying_intensity: [f32; 3],
+    pub varying_specular: [f32; 3],
     pub varying_world_pos: [Vec3; 3],
 }
 
@@ -1448,14 +1478,16 @@ impl<'a> ShadowShader<'a> {
             model,
             transform,
             model_view,
+            normal_matrix: normal_matrix(model_view),
             shadow_transform,
-            light_dir: safe_normal(light_dir, Vec3::new(1.0, 1.0, -1.0).normalize()),
+            light_dir: safe_normal(light_dir, DEFAULT_LIGHT_DIR.normalize()),
             shadow_buffer,
             shadow_width,
             shadow_height,
             shadow_options,
             material,
             varying_intensity: [0.0; 3],
+            varying_specular: [0.0; 3],
             varying_world_pos: [Vec3::ZERO; 3],
         }
     }
@@ -1468,46 +1500,50 @@ impl Shader for ShadowShader<'_> {
         self.varying_world_pos[vert_idx] = v;
 
         let normal = self.model.vertex_normal(face_idx, vert_idx);
-        let normal_matrix = self.model_view.inverse().transpose();
-        let n = safe_normal(transform_vector(&normal_matrix, normal), Vec3::Z);
+        let n = safe_normal(transform_vector(&self.normal_matrix, normal), Vec3::Z);
         self.varying_intensity[vert_idx] = n.dot(self.light_dir).max(0.0);
+        self.varying_specular[vert_idx] = specular_highlight(
+            &self.material,
+            n,
+            self.light_dir,
+            transform_point(&self.model_view, v),
+        );
 
         transform_point(&self.transform, v)
     }
 
     fn fragment(&self, bc: Vec3) -> Option<Fragment> {
-        let intensity = self.varying_intensity[0] * bc.x
-            + self.varying_intensity[1] * bc.y
-            + self.varying_intensity[2] * bc.z;
-        if intensity <= 0.0 && self.material.ambient <= 0.0 {
-            return None;
-        }
+        let intensity = interpolate_scalar(self.varying_intensity, bc);
+        let specular = interpolate_scalar(self.varying_specular, bc);
 
         let world_pos = self.varying_world_pos[0] * bc.x
             + self.varying_world_pos[1] * bc.y
             + self.varying_world_pos[2] * bc.z;
         let shadow_coord = transform_point(&self.shadow_transform, world_pos);
 
-        let shadow = sample_shadow(
+        let visibility = sample_shadow(
             self.shadow_buffer,
             self.shadow_width,
             self.shadow_height,
             shadow_coord,
             self.shadow_options,
         );
+        let diffuse_light = SHADOWED_DIFFUSE + (1.0 - SHADOWED_DIFFUSE) * visibility;
 
         Some(Fragment::new(
             shade_material(
                 self.material.base_color,
                 self.material,
-                intensity * shadow,
-                0.0,
+                intensity * diffuse_light,
+                // Occluded points see no highlight from the shadowing light.
+                specular * visibility,
             ),
             self.material.alpha,
         ))
     }
 }
 
+/// Light visibility at `shadow_coord`: 1.0 fully lit, 0.0 fully occluded.
 fn sample_shadow(
     shadow_buffer: &[f32],
     width: u32,
@@ -1564,7 +1600,7 @@ fn sample_shadow_tap(
     }
     let idx = sx as usize + sy as usize * width as usize;
     if shadow_buffer[idx].is_finite() && shadow_buffer[idx] > receiver_z + bias {
-        0.35
+        0.0
     } else {
         1.0
     }
@@ -1795,7 +1831,9 @@ impl FromStr for TextureFilter {
         match value {
             "nearest" => Ok(TextureFilter::Nearest),
             "linear" => Ok(TextureFilter::Linear),
-            "mipmap" | "mip" | "trilinear" => Ok(TextureFilter::Mipmap),
+            // Not "trilinear": the sampler picks one mip level and filters it
+            // bilinearly; it does not blend between levels.
+            "mipmap" | "mip" => Ok(TextureFilter::Mipmap),
             _ => Err(format!(
                 "unknown texture filter '{}'; expected one of: nearest, linear, mipmap",
                 value
@@ -2042,6 +2080,8 @@ pub struct RenderOptions {
     pub height: u32,
     pub mode: RenderMode,
     pub camera_eye: Option<Vec3>,
+    /// Direction toward the light in normalized scene space. Shading and the
+    /// shadow map both derive their light from this one vector.
     pub light_dir: Vec3,
     pub debug_outputs: bool,
     pub render_state: RenderState,
@@ -2063,7 +2103,7 @@ impl Default for RenderOptions {
             height: 1024,
             mode: RenderMode::Shadow,
             camera_eye: None,
-            light_dir: Vec3::new(1.0, 1.0, -1.0).normalize(),
+            light_dir: DEFAULT_LIGHT_DIR.normalize(),
             debug_outputs: false,
             render_state: RenderState::default(),
             texture: None,
@@ -2113,6 +2153,8 @@ struct RenderTransforms {
     light_model_view: Mat4,
     light_view_to_clip: Mat4,
     light_clip_to_screen: Mat4,
+    /// Eye-space direction toward the light, used by every lit shader.
+    light_dir_view: Vec3,
 }
 
 pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
@@ -2131,20 +2173,13 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
     } else {
         match options.mode {
             RenderMode::Wireframe => unreachable!("wireframe mode is handled before solid modes"),
-            RenderMode::Flat => render_flat(
-                model,
-                &transforms,
-                options,
-                options.light_dir,
-                &mut zbuffer,
-                &mut image,
-            ),
+            RenderMode::Flat => render_flat(model, &transforms, options, &mut zbuffer, &mut image),
             RenderMode::Gouraud => {
                 let mut shader = GouraudShader::new(
                     model,
                     transforms.transform,
                     transforms.model_view,
-                    options.light_dir,
+                    transforms.light_dir_view,
                     options.material,
                 );
                 render_shader(
@@ -2154,6 +2189,7 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut zbuffer,
                     &mut image,
                     options,
+                    options.render_state,
                 );
             }
             RenderMode::Texture => {
@@ -2178,7 +2214,7 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     model,
                     transforms.transform,
                     transforms.model_view,
-                    options.light_dir,
+                    transforms.light_dir_view,
                     diffuse,
                     diffuse_mipmaps,
                     options.texture_sampler,
@@ -2191,6 +2227,7 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut zbuffer,
                     &mut image,
                     options,
+                    options.render_state,
                 );
             }
             RenderMode::NormalMap => {
@@ -2227,7 +2264,7 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     model,
                     transforms.transform,
                     transforms.model_view,
-                    options.light_dir,
+                    transforms.light_dir_view,
                     diffuse,
                     normal_map,
                     diffuse_mipmaps,
@@ -2242,6 +2279,7 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut zbuffer,
                     &mut image,
                     options,
+                    options.render_state,
                 );
             }
             RenderMode::NormalDebug => {
@@ -2254,6 +2292,7 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut zbuffer,
                     &mut image,
                     options,
+                    options.render_state,
                 );
             }
             RenderMode::Shadow | RenderMode::Ssao => {
@@ -2272,7 +2311,7 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     transforms.transform,
                     transforms.model_view,
                     transforms.light_transform,
-                    options.light_dir,
+                    transforms.light_dir_view,
                     &shadow_zbuffer,
                     shadow_width,
                     shadow_height,
@@ -2286,6 +2325,7 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut zbuffer,
                     &mut image,
                     options,
+                    options.render_state,
                 );
 
                 if options.mode == RenderMode::Ssao {
@@ -2366,7 +2406,8 @@ fn build_transforms(
     let transform = clip_to_screen * view_to_clip * view * model_matrix;
     let model_view = view * model_matrix;
 
-    let light_dir = safe_normal(options.light_dir, Vec3::new(1.0, 1.0, -1.0).normalize());
+    let light_dir = safe_normal(options.light_dir, DEFAULT_LIGHT_DIR.normalize());
+    let light_dir_view = safe_normal(transform_vector(&view, light_dir), Vec3::Z);
     let light_eye = light_dir * 3.0;
     let light_view = lookat(light_eye, center, up);
     let light_proj = projection(-1.0 / light_eye.distance(center).max(1.0));
@@ -2392,6 +2433,7 @@ fn build_transforms(
         light_model_view,
         light_view_to_clip,
         light_clip_to_screen,
+        light_dir_view,
     }
 }
 
@@ -2436,27 +2478,38 @@ fn render_flat(
     model: &Model,
     transforms: &RenderTransforms,
     options: &RenderOptions,
-    light_dir: Vec3,
     zbuffer: &mut [f32],
     image: &mut RgbImage,
 ) {
-    let normal_matrix = transforms.model_view.inverse().transpose();
-    let light_dir = safe_normal(light_dir, Vec3::new(1.0, 1.0, -1.0).normalize());
+    let normal_matrix = normal_matrix(transforms.model_view);
+    let light_dir = transforms.light_dir_view;
     for face_idx in 0..model.faces.len() {
         let normal = safe_normal(
             transform_vector(&normal_matrix, model.face_normal(face_idx)),
             Vec3::Z,
         );
         let intensity = normal.dot(light_dir).max(0.0);
+        let specular = if options.material.specular > 0.0 {
+            let face = model.faces[face_idx];
+            let centroid =
+                (model.vertices[face[0].v] + model.vertices[face[1].v] + model.vertices[face[2].v])
+                    / 3.0;
+            specular_highlight(
+                &options.material,
+                normal,
+                light_dir,
+                transform_point(&transforms.model_view, centroid),
+            )
+        } else {
+            0.0
+        };
+        // Unlit faces still shade (to ambient or black) and write depth.
         let shaded = shade_material(
             options.material.base_color,
             options.material,
             intensity,
-            0.0,
+            specular,
         );
-        if shaded == Rgb([0, 0, 0]) {
-            continue;
-        }
         for primitive in clipped_primitives_for_face(
             model,
             transforms,
@@ -2491,6 +2544,7 @@ fn render_shader<S: Shader>(
     zbuffer: &mut [f32],
     image: &mut RgbImage,
     options: &RenderOptions,
+    render_state: RenderState,
 ) {
     for face_idx in 0..model.faces.len() {
         let _: [Vec3; 3] = std::array::from_fn(|j| shader.vertex(face_idx, j));
@@ -2504,8 +2558,8 @@ fn render_shader<S: Shader>(
         ) {
             if should_cull_screen_triangle_with_front_face(
                 &primitive.screen_coords,
-                options.render_state.cull_mode,
-                options.render_state.front_face,
+                render_state.cull_mode,
+                render_state.front_face,
             ) {
                 continue;
             }
@@ -2516,7 +2570,7 @@ fn render_shader<S: Shader>(
                 shader,
                 zbuffer,
                 image,
-                options.render_state,
+                render_state,
             );
         }
     }
@@ -2832,8 +2886,9 @@ fn render_shadow_map(
     height: u32,
     options: &RenderOptions,
 ) -> Vec<f32> {
+    let shadow_state = shadow_pass_state();
     let mut shadow_image = ImageBuffer::new(width, height);
-    let mut shadow_zbuffer = vec![options.render_state.clear_depth; (width * height) as usize];
+    let mut shadow_zbuffer = vec![shadow_state.clear_depth; (width * height) as usize];
     let mut depth_shader = DepthShader {
         model,
         transform: transforms.light_transform,
@@ -2847,6 +2902,7 @@ fn render_shadow_map(
         light_model_view: transforms.light_model_view,
         light_view_to_clip: transforms.light_view_to_clip,
         light_clip_to_screen: transforms.light_clip_to_screen,
+        light_dir_view: transforms.light_dir_view,
     };
     render_shader(
         model,
@@ -2855,8 +2911,29 @@ fn render_shadow_map(
         &mut shadow_zbuffer,
         &mut shadow_image,
         options,
+        shadow_state,
     );
     shadow_zbuffer
+}
+
+/// Fixed raster state for the light-space depth pass. The shadow map must not
+/// inherit user state such as scissor, depth writes, culling, or blending, or a
+/// flag meant for the camera view would silently crop or empty the shadow map.
+fn shadow_pass_state() -> RenderState {
+    RenderState {
+        cull_mode: CullMode::Off,
+        front_face: FrontFace::Ccw,
+        depth: DepthState {
+            test_enabled: true,
+            write_enabled: true,
+        },
+        fill_mode: FillMode::Solid,
+        scissor: None,
+        clear_color: Rgb([0, 0, 0]),
+        clear_depth: f32::NEG_INFINITY,
+        color_write: false,
+        blend_mode: BlendMode::Off,
+    }
 }
 
 fn render_normal_debug(
@@ -2876,6 +2953,7 @@ fn render_normal_debug(
         &mut zbuffer,
         &mut image,
         options,
+        options.render_state,
     );
     image
 }
@@ -3018,6 +3096,48 @@ fn lerp_rgb(a: Rgb<u8>, b: Rgb<u8>, t: f32) -> Rgb<u8> {
     ])
 }
 
+/// Inverse-transpose of the model-view matrix, used to move normals to eye space.
+fn normal_matrix(model_view: Mat4) -> Mat4 {
+    model_view.inverse().transpose()
+}
+
+/// Blinn-Phong specular term `max(dot(n, h), 0)^shininess` with half-vector
+/// `h = normalize(l + v)`. All vectors are unit length and in the same space;
+/// `n` is the outward normal, `l` points toward the light, `v` toward the viewer.
+fn blinn_phong(n: Vec3, l: Vec3, v: Vec3, shininess: f32) -> f32 {
+    if n.dot(l) <= 0.0 {
+        return 0.0;
+    }
+    let h = safe_normal(l + v, n);
+    n.dot(h).max(0.0).powf(shininess.max(1.0))
+}
+
+/// Specular highlight for an eye-space normal and position. The eye sits at the
+/// eye-space origin, so the view vector is `-eye_pos`. Skips the work entirely
+/// for non-specular materials.
+fn specular_highlight(material: &Material, n: Vec3, light_dir: Vec3, eye_pos: Vec3) -> f32 {
+    if material.specular <= 0.0 {
+        return 0.0;
+    }
+    blinn_phong(
+        n,
+        light_dir,
+        safe_normal(-eye_pos, Vec3::Z),
+        material.shininess,
+    )
+}
+
+fn interpolate_scalar(values: [f32; 3], bc: Vec3) -> f32 {
+    values[0] * bc.x + values[1] * bc.y + values[2] * bc.z
+}
+
+/// Texture coordinate of a face vertex, or the origin when the vertex has none.
+/// Resetting (rather than keeping the previous face's value) keeps the vertex
+/// stage free of cross-face state.
+fn face_vertex_uv(model: &Model, fv: FaceVertex) -> Vec2 {
+    fv.vt.map_or(Vec2::ZERO, |ti| model.texcoords[ti])
+}
+
 fn tint_rgb(pixel: Rgb<u8>, tint: Rgb<u8>) -> Rgb<u8> {
     Rgb([
         (pixel[0] as u16 * tint[0] as u16 / 255) as u8,
@@ -3026,15 +3146,19 @@ fn tint_rgb(pixel: Rgb<u8>, tint: Rgb<u8>) -> Rgb<u8> {
     ])
 }
 
+/// Combine ambient, diffuse, and specular terms for a material.
+///
+/// `diffuse_intensity` is the Lambert term and `specular_highlight` the
+/// already-exponentiated Blinn-Phong term (see [`specular_highlight`]); the
+/// material's `diffuse`/`specular` factors scale them.
 fn shade_material(
     base: Rgb<u8>,
     material: Material,
     diffuse_intensity: f32,
-    specular: f32,
+    specular_highlight: f32,
 ) -> Rgb<u8> {
     let diffuse = diffuse_intensity.max(0.0) * material.diffuse.max(0.0);
-    let specular =
-        specular.max(0.0).powf(material.shininess.max(1.0) / 32.0) * material.specular.max(0.0);
+    let specular = specular_highlight.max(0.0) * material.specular.max(0.0);
     let factor = (material.ambient.max(0.0) + diffuse).clamp(0.0, 1.0);
     Rgb([
         (base[0] as f32 * factor + 255.0 * specular).clamp(0.0, 255.0) as u8,
@@ -3128,7 +3252,7 @@ mod tests {
                 Vec3::new(0.0, 0.6, 0.0),
             ],
             texcoords: Vec::new(),
-            normals: vec![Vec3::new(0.0, 0.0, -1.0)],
+            normals: vec![Vec3::new(0.0, 0.0, 1.0)],
             faces: vec![[
                 FaceVertex {
                     v: 0,
@@ -3148,6 +3272,34 @@ mod tests {
             ]],
             materials: Vec::new(),
             face_materials: vec![None],
+        }
+    }
+
+    /// A large receiver triangle at z = 0 with a smaller occluder floating in
+    /// front of it at z = 0.4. Both face +Z (counter-clockwise from the camera).
+    fn occluder_model() -> Model {
+        let corner = |v: usize| FaceVertex {
+            v,
+            vt: None,
+            vn: None,
+        };
+        Model {
+            vertices: vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(-0.3, -0.3, 0.4),
+                Vec3::new(0.3, -0.3, 0.4),
+                Vec3::new(0.0, 0.3, 0.4),
+            ],
+            texcoords: Vec::new(),
+            normals: Vec::new(),
+            faces: vec![
+                [corner(0), corner(1), corner(2)],
+                [corner(3), corner(4), corner(5)],
+            ],
+            materials: Vec::new(),
+            face_materials: vec![None, None],
         }
     }
 
@@ -3361,6 +3513,19 @@ map_Bump normal-checker.ppm
         assert_eq!(ao.len(), 9);
         assert!(ao.iter().all(|v| (0.0..=1.0).contains(v)));
         assert!(ao[4] < 1.0);
+        assert_eq!(ao, compute_ssao(&zbuffer, 3, 3, 1, 4));
+
+        let options = RenderOptions {
+            width: 48,
+            height: 48,
+            mode: RenderMode::Ssao,
+            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            light_dir: Vec3::new(1.0, 0.6, 1.0),
+            ..RenderOptions::default()
+        };
+        let first = render_model(&occluder_model(), &options);
+        let second = render_model(&occluder_model(), &options);
+        assert_eq!(first.image.as_raw(), second.image.as_raw());
     }
 
     #[test]
@@ -3581,7 +3746,7 @@ map_Bump normal-checker.ppm
             height: 64,
             mode: RenderMode::Flat,
             camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
-            light_dir: Vec3::new(0.0, 0.0, -1.0),
+            light_dir: Vec3::new(0.0, 0.0, 1.0),
             render_state: RenderState {
                 clear_color: clear,
                 scissor: Some(ScissorRect {
@@ -3612,7 +3777,7 @@ map_Bump normal-checker.ppm
             height: 32,
             mode: RenderMode::Flat,
             camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
-            light_dir: Vec3::new(0.0, 0.0, -1.0),
+            light_dir: Vec3::new(0.0, 0.0, 1.0),
             render_state: RenderState {
                 clear_color: clear,
                 color_write: false,
@@ -3651,7 +3816,7 @@ map_Bump normal-checker.ppm
             height: 64,
             mode: RenderMode::Shadow,
             camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
-            light_dir: Vec3::new(0.0, 0.0, -1.0),
+            light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             shadow: ShadowOptions {
                 size: 32,
@@ -3665,13 +3830,212 @@ map_Bump normal-checker.ppm
     }
 
     #[test]
+    fn occluder_casts_shadow_and_pcf_softens_its_edge() {
+        let render = |filter: ShadowFilter| {
+            let options = RenderOptions {
+                width: 64,
+                height: 64,
+                mode: RenderMode::Shadow,
+                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                light_dir: Vec3::new(1.0, 0.6, 1.0),
+                shadow: ShadowOptions {
+                    size: 64,
+                    filter,
+                    ..ShadowOptions::default()
+                },
+                ..RenderOptions::default()
+            };
+            render_model(&occluder_model(), &options).image
+        };
+        let hard = render(ShadowFilter::None);
+        let soft = render(ShadowFilter::Pcf);
+
+        // Both quads face the camera and the light equally, so without shadows
+        // every covered pixel would have the same colour. A shadow adds a second,
+        // darker shade on the receiver.
+        let lit = hard.pixels().map(|p| p[0]).max().unwrap();
+        assert!(hard
+            .pixels()
+            .any(|p| *p != DEFAULT_BACKGROUND && p[0] > 0 && p[0] < lit));
+        // PCF blends taps along the shadow edge, so it must change the result.
+        assert_ne!(hard.as_raw(), soft.as_raw());
+    }
+
+    #[test]
+    fn shadow_map_ignores_camera_raster_state() {
+        let render = |render_state: RenderState| {
+            let options = RenderOptions {
+                width: 64,
+                height: 64,
+                mode: RenderMode::Shadow,
+                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                light_dir: Vec3::new(1.0, 0.6, 1.0),
+                debug_outputs: true,
+                render_state,
+                shadow: ShadowOptions {
+                    size: 32,
+                    ..ShadowOptions::default()
+                },
+                ..RenderOptions::default()
+            };
+            render_model(&occluder_model(), &options)
+                .debug
+                .shadow
+                .unwrap()
+        };
+        let reference = render(RenderState::default());
+        let restricted = render(RenderState {
+            cull_mode: CullMode::Front,
+            depth: DepthState {
+                test_enabled: true,
+                write_enabled: false,
+            },
+            scissor: Some(ScissorRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+            color_write: false,
+            blend_mode: BlendMode::Additive,
+            ..RenderState::default()
+        });
+        assert!(reference.pixels().any(|p| p[0] > 0));
+        assert_eq!(reference.as_raw(), restricted.as_raw());
+    }
+
+    #[test]
+    fn specular_material_adds_highlight_where_light_and_view_align() {
+        let render = |specular: f32| {
+            let options = RenderOptions {
+                width: 32,
+                height: 32,
+                mode: RenderMode::Gouraud,
+                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                light_dir: Vec3::new(0.0, 0.0, 1.0),
+                material: Material {
+                    base_color: Rgb([100, 100, 100]),
+                    specular,
+                    shininess: 16.0,
+                    ..Material::default()
+                },
+                ..RenderOptions::default()
+            };
+            render_model(&tiny_model(), &options).image
+        };
+        let matte = render(0.0);
+        let shiny = render(1.0);
+        assert_eq!(matte.get_pixel(16, 16), &Rgb([100, 100, 100]));
+        assert!(shiny.get_pixel(16, 16)[0] > 200);
+        assert!(shiny
+            .pixels()
+            .zip(matte.pixels())
+            .all(|(s, m)| s[0] >= m[0]));
+    }
+
+    #[test]
+    fn blinn_phong_peaks_on_the_half_vector_and_ignores_back_lighting() {
+        let n = Vec3::Z;
+        assert!((blinn_phong(n, Vec3::Z, Vec3::Z, 32.0) - 1.0).abs() < EPSILON);
+        let off_axis = Vec3::new(0.6, 0.0, 0.8);
+        let mirrored = Vec3::new(-0.6, 0.0, 0.8);
+        assert!((blinn_phong(n, off_axis, mirrored, 32.0) - 1.0).abs() < 1e-5);
+        assert!(blinn_phong(n, off_axis, Vec3::Z, 32.0) < blinn_phong(n, off_axis, Vec3::Z, 2.0));
+        assert_eq!(blinn_phong(n, -Vec3::Z, Vec3::Z, 32.0), 0.0);
+    }
+
+    #[test]
+    fn unlit_surfaces_still_write_depth_and_occlude() {
+        // The light sits behind the triangle, so its camera-facing side is unlit.
+        // It must still render (black, with no ambient) and fill the z-buffer
+        // instead of leaving a hole that shows the clear colour.
+        for mode in [
+            RenderMode::Flat,
+            RenderMode::Gouraud,
+            RenderMode::Texture,
+            RenderMode::NormalMap,
+            RenderMode::Shadow,
+        ] {
+            let options = RenderOptions {
+                width: 32,
+                height: 32,
+                mode,
+                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                light_dir: Vec3::new(0.0, 0.0, -1.0),
+                ..RenderOptions::default()
+            };
+            let output = render_model(&tiny_model(), &options);
+            assert_eq!(
+                output.image.get_pixel(16, 16),
+                &Rgb([0, 0, 0]),
+                "mode {}",
+                mode.as_str()
+            );
+            let covered = output.zbuffer.iter().filter(|z| z.is_finite()).count();
+            assert!(
+                covered > 100,
+                "mode {} wrote {covered} depths",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn faces_without_texcoords_do_not_inherit_previous_uvs() {
+        let mut model = tiny_model();
+        model.texcoords = vec![Vec2::new(0.25, 0.75)];
+        let untextured = model.faces[0];
+        for fv in &mut model.faces[0] {
+            fv.vt = Some(0);
+        }
+        model.faces.push(untextured);
+        model.face_materials.push(None);
+
+        let mut texture_shader = TextureShader::new(
+            &model,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::Z,
+            None,
+            None,
+            TextureSampler::default(),
+            Material::default(),
+        );
+        let normal_map = neutral_normal_map(2);
+        let mut normal_shader = NormalMapShader::new(
+            &model,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::Z,
+            None,
+            &normal_map,
+            None,
+            None,
+            TextureSampler::default(),
+            Material::default(),
+        );
+        for j in 0..3 {
+            texture_shader.vertex(0, j);
+            normal_shader.vertex(0, j);
+        }
+        assert_eq!(texture_shader.varying_uv, [Vec2::new(0.25, 0.75); 3]);
+        assert_eq!(normal_shader.varying_uv, [Vec2::new(0.25, 0.75); 3]);
+        for j in 0..3 {
+            texture_shader.vertex(1, j);
+            normal_shader.vertex(1, j);
+        }
+        assert_eq!(texture_shader.varying_uv, [Vec2::ZERO; 3]);
+        assert_eq!(normal_shader.varying_uv, [Vec2::ZERO; 3]);
+    }
+
+    #[test]
     fn debug_outputs_include_depth_normals_shadow_and_ao() {
         let options = RenderOptions {
             width: 64,
             height: 64,
             mode: RenderMode::Ssao,
             camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
-            light_dir: Vec3::new(0.0, 0.0, -1.0),
+            light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             ..RenderOptions::default()
         };
@@ -3700,7 +4064,7 @@ map_Bump normal-checker.ppm
             height: 64,
             mode: RenderMode::Flat,
             camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
-            light_dir: Vec3::new(0.0, 0.0, -1.0),
+            light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             ..RenderOptions::default()
         };
@@ -3719,46 +4083,30 @@ map_Bump normal-checker.ppm
             height: 64,
             mode: RenderMode::Flat,
             camera_eye: Some(Vec3::new(0.0, 0.25, 3.0)),
-            light_dir: Vec3::new(1.0, 1.0, -1.0),
+            light_dir: DEFAULT_LIGHT_DIR,
             debug_outputs: false,
             ..RenderOptions::default()
         };
         let output = render_model(&model, &options);
-        let golden = image::load_from_memory(include_bytes!("../tests/golden/flat-teapot-64.png"))
-            .unwrap()
-            .to_rgb8();
-        assert_images_close(&output.image, &golden, 1);
+        assert_matches_golden(&output.image, "flat-teapot-64.png", 1);
     }
 
     #[test]
     fn mtl_textured_quad_matches_golden_image_with_tolerance() {
         let output = render_material_quad(TextureFilter::Nearest, BlendMode::Off, None);
-        let golden =
-            image::load_from_memory(include_bytes!("../tests/golden/material-quad-32.png"))
-                .unwrap()
-                .to_rgb8();
-        assert_images_close(&output, &golden, 1);
+        assert_matches_golden(&output, "material-quad-32.png", 1);
     }
 
     #[test]
     fn alpha_blended_quad_matches_golden_image_with_tolerance() {
         let output = render_material_quad(TextureFilter::Nearest, BlendMode::Alpha, Some(0.45));
-        let golden =
-            image::load_from_memory(include_bytes!("../tests/golden/material-quad-alpha-32.png"))
-                .unwrap()
-                .to_rgb8();
-        assert_images_close(&output, &golden, 1);
+        assert_matches_golden(&output, "material-quad-alpha-32.png", 1);
     }
 
     #[test]
     fn mipmapped_quad_matches_golden_image_with_tolerance() {
         let output = render_material_quad(TextureFilter::Mipmap, BlendMode::Off, None);
-        let golden = image::load_from_memory(include_bytes!(
-            "../tests/golden/material-quad-mipmap-32.png"
-        ))
-        .unwrap()
-        .to_rgb8();
-        assert_images_close(&output, &golden, 1);
+        assert_matches_golden(&output, "material-quad-mipmap-32.png", 1);
     }
 
     fn render_material_quad(
@@ -3813,6 +4161,23 @@ map_Bump normal-checker.ppm
             .pixels()
             .map(|p| p[0] as u64 + p[1] as u64 * 3 + p[2] as u64 * 7)
             .sum()
+    }
+
+    /// Compare `actual` with `tests/golden/<name>`. Run with `UPDATE_GOLDENS=1` to
+    /// rewrite the golden from the current output instead, then inspect the image
+    /// diff before committing it.
+    fn assert_matches_golden(actual: &RgbImage, name: &str, tolerance: u8) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden")
+            .join(name);
+        if std::env::var_os("UPDATE_GOLDENS").is_some() {
+            actual.save(&path).unwrap();
+            return;
+        }
+        let golden = image::open(&path)
+            .unwrap_or_else(|err| panic!("failed to load golden '{}': {err}", path.display()))
+            .to_rgb8();
+        assert_images_close(actual, &golden, tolerance);
     }
 
     fn assert_images_close(actual: &RgbImage, expected: &RgbImage, tolerance: u8) {

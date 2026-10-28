@@ -23,7 +23,9 @@ name = "app"
 path = "src/main.rs"
 
 [dependencies]
-image = "0.25"
+# Only the codecs the renderer reads and writes: PNG output, PPM/TGA/JPEG/PNG
+# textures. Default features would also build AVIF (rav1e), EXR, TIFF, WebP, GIF.
+image = { version = "0.25", default-features = false, features = ["png", "pnm", "tga", "jpeg"] }
 glam = "0.32"
 
 [dev-dependencies]

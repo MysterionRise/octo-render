@@ -87,11 +87,14 @@ That is useful CTO-facing evidence because the implementation is not a black box
 
 ## Measured Improvement Path
 
+The correctness sprint added one measured change. Each shader now computes its normal matrix once in its constructor instead of inverting the model-view matrix per vertex (and per fragment in normal-map mode). That made the clipping benchmarks 11-17% faster and texture/blend benchmarks up to 9% faster. Flat mode got slower because it now rasterizes every face instead of skipping unlit ones. [benchmarks.md](benchmarks.md#correctness-sprint-re-measurement-october-2026) has the before/after table and the culling measurement.
+
 Do not optimize by guessing. The next measured optimization should be one of:
 
 - replace bounding-box barycentric scans with scanline edge walking
 - tile the framebuffer and parallelize independent tiles
 - cache per-triangle edge deltas and reciprocal area more aggressively
+- cull back faces in clip space before the clipper allocates, instead of after clipping in screen space
 - split shadow and texture paths so simple flat/Gouraud shaders do less per-pixel branching
 - SIMD-pack color and depth operations where the code remains understandable
 

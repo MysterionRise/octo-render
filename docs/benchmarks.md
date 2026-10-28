@@ -1,5 +1,7 @@
 # Benchmark Results
 
+The tables in the first half of this page are the July 2026 macOS baseline. The [correctness sprint re-measurement](#correctness-sprint-re-measurement-october-2026) below compares the code before and after the lighting fixes on one Linux machine.
+
 Benchmarks were collected with Criterion using:
 
 ```bash
@@ -20,7 +22,7 @@ cargo bench
 
 | Benchmark | Mean | Notes |
 | --- | ---: | --- |
-| Line drawing batch | 2.6906 ms | 100 random lines on a 10000x10000 image |
+| Line drawing batch | 2.6906 ms | 100 unseeded random lines on a 10000x10000 image (old fixture) |
 | Z-buffered triangle | 1.1791 ms | Single 512px triangle into a 512x512 image |
 | Full frame flat | 3.3940 ms | `resources/teapot.obj`, 128x128 |
 | Full frame Gouraud | 7.6778 ms | `resources/teapot.obj`, 128x128 |
@@ -68,6 +70,47 @@ The frustum-clipping and top-left-rasterization pass initially made the per-pixe
 | Full frame flat, 128x128 | 3.5233 ms | 3.3940 ms | 3.7% faster |
 | Flat, 512x512 | 4.9940 ms | 4.7246 ms | 5.4% faster |
 | Flat, 1024x1024 | 8.8056 ms | 7.9883 ms | 9.3% faster |
+
+## Correctness Sprint Re-measurement (October 2026)
+
+The correctness sprint changed what several benchmarks do, so it was measured as a before/after pair on one machine, back to back. "Before" is commit `8316fbc`; "after" is the sprint.
+
+- Date: 2026-10-27
+- OS: Linux 6.18 (cloud VM)
+- CPU: Intel Xeon @ 2.10 GHz, 4 cores (benchmarks are single-threaded)
+- Rust: `rustc 1.97.0 (2d8144b78 2026-07-07)`, `cargo 1.97.0`
+- Build profile: Criterion bench profile, optimized
+
+| Benchmark | Before | After | Change | Cause |
+| --- | ---: | ---: | ---: | --- |
+| Line drawing batch | 4.8292 ms | 0.5178 ms | not comparable | fixture changed: seeded RNG, 2048x2048 target |
+| Z-buffered triangle, 512px | 1.4894 ms | 1.4157 ms | -4.9% | code path unchanged; run-to-run noise |
+| Full frame flat, 128x128 | 1.5339 ms | 2.7943 ms | +82.2% | every face is now clipped, rasterized, and depth-written |
+| Full frame Gouraud, 128x128 | 3.5980 ms | 3.7267 ms | +3.6% | no lighting discards, offset by the cached normal matrix |
+| Full frame shadow, 128x128 | 6.3349 ms | 6.3679 ms | +0.5% | same as Gouraud |
+| Flat, 512x512 | 3.2304 ms | 5.6611 ms | +75.2% | same as flat 128 |
+| Flat, 1024x1024 | 6.9152 ms | 11.374 ms | +64.5% | same as flat 128 |
+| Clipping, unclipped | 354.3 us | 315.9 us | -10.8% | cached normal matrix |
+| Clipping, near-plane clipped | 396.4 us | 328.5 us | -17.1% | cached normal matrix |
+| Texture nearest | 1.8635 ms | 1.7306 ms | -7.1% | cached normal matrix |
+| Texture linear | 3.0580 ms | 2.7793 ms | -9.1% | cached normal matrix |
+| Texture mipmap | 2.9215 ms | 2.8867 ms | -1.2% | cached normal matrix |
+| Blend off | 1.9038 ms | 1.8198 ms | -4.4% | cached normal matrix |
+| Blend alpha | 2.3343 ms | 2.3085 ms | -1.1% | cached normal matrix |
+| Blend additive | 2.2851 ms | 2.0923 ms | -8.4% | cached normal matrix |
+| Shadow no filter, 256x256 | 8.0527 ms | 8.4207 ms | +4.6% | new default light, and unlit fragments now write depth |
+| Shadow PCF, 256x256 | 8.7763 ms | 9.2559 ms | +5.5% | same as shadow no filter |
+
+The flat regression is the honest cost of rendering every face. The old flat path skipped any face whose shading came out black before clipping it. Under the old inward-normal convention that was roughly half the teapot, and it is exactly what left holes behind back-lit surfaces. Gouraud and shadow modes discarded per fragment instead, after clipping and rasterization, so removing their discard costs little.
+
+Back-face culling is the lever for closed meshes, but it recovers less than the flat regression because culling runs after clipping. Best of 15 CLI runs of the flat teapot:
+
+| Resolution | `--cull off` | `--cull back` | Change |
+| --- | ---: | ---: | ---: |
+| 128x128 | 2.78 ms | 2.26 ms | -19% |
+| 1024x1024 | 14.50 ms | 10.19 ms | -30% |
+
+Culling in clip space, before the clipper allocates, is the next cheap geometry win. The default stays `--cull off` because the teapot is not a closed mesh.
 
 ## Interpreting The Numbers
 

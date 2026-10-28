@@ -1,11 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use glam::Vec3;
 use image::{ImageBuffer, Rgb, RgbImage};
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use renderer::{
     build_mipmaps, draw_line, render_model, triangle_zbuf, BlendMode, FaceVertex, Material, Model,
     RenderMode, RenderOptions, RenderState, ShadowFilter, ShadowOptions, TextureFilter,
-    TextureSampler, TextureWrap,
+    TextureSampler, TextureWrap, DEFAULT_LIGHT_DIR,
 };
 
 type Pairs = (i32, i32, i32, i32);
@@ -21,10 +21,12 @@ fn criterion_benchmark(c: &mut Criterion) {
 }
 
 fn bench_line_drawing(c: &mut Criterion) {
-    let mut rng = rand::thread_rng();
+    // Seeded so every run (and every machine) draws the same 100 lines. The
+    // 2048x2048 target keeps the fixture at ~12 MB instead of ~300 MB.
+    let mut rng = StdRng::seed_from_u64(0x0c70);
     let test_size = 100usize;
     let from: i32 = 0;
-    let to: i32 = 10000;
+    let to: i32 = 2048;
     let test_pairs = (0..test_size)
         .map(|_| {
             (
@@ -88,7 +90,7 @@ fn bench_full_model_render(c: &mut Criterion) {
             height: 128,
             mode,
             camera_eye: None,
-            light_dir: Vec3::new(1.0, 1.0, -1.0),
+            light_dir: DEFAULT_LIGHT_DIR,
             debug_outputs: false,
             ..RenderOptions::default()
         };
@@ -110,7 +112,7 @@ fn bench_full_model_render(c: &mut Criterion) {
             height: resolution,
             mode: RenderMode::Flat,
             camera_eye: None,
-            light_dir: Vec3::new(1.0, 1.0, -1.0),
+            light_dir: DEFAULT_LIGHT_DIR,
             debug_outputs: false,
             ..RenderOptions::default()
         };
@@ -135,7 +137,7 @@ fn bench_clipped_model_render(c: &mut Criterion) {
             height: 256,
             mode: RenderMode::Gouraud,
             camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
-            light_dir: Vec3::new(0.0, 0.0, -1.0),
+            light_dir: Vec3::new(0.0, 0.0, 1.0),
             near_plane,
             ..RenderOptions::default()
         };
@@ -262,7 +264,7 @@ fn clipping_test_model() -> Model {
             Vec3::new(0.0, 0.8, 1.2),
         ],
         texcoords: Vec::new(),
-        normals: vec![Vec3::new(0.0, 0.0, -1.0)],
+        normals: vec![Vec3::new(0.0, 0.0, 1.0)],
         faces: vec![[
             FaceVertex {
                 v: 0,
