@@ -166,6 +166,7 @@ Implemented CPU features:
 - Deterministic top-left triangle fill rule with pixel-center sampling
 - Z-buffer visibility
 - Explicit render state: culling, front-face winding, depth test/write, fill mode, scissor, clear state, color write, and blending
+- Back-face culling before clipping, from the sign of the homogeneous `(x, y, w)` determinant, so culled faces skip clipping and vertex shading
 - Blend modes: off, source-over alpha, additive
 - Texture sampler wrap/filter modes: repeat, clamp, nearest, linear, simplified mipmap LOD
 - Material controls for base color, ambient, diffuse, specular, shininess, alpha, MTL defaults, and CLI overrides
@@ -232,7 +233,8 @@ Current test coverage includes:
 - top-left shared-edge fill behavior
 - z-buffer replacement behavior
 - render-state depth toggles
-- culling classification
+- culling classification, including a seeded property test that the clip-space winding test agrees with screen-space winding, and a floor triangle that crosses behind the eye
+- culled teapot renders pinned bit-for-bit (image and depth) across the culling refactor
 - texture sampler wrap behavior
 - texture sampler linear and mipmap filtering
 - alpha and additive blending

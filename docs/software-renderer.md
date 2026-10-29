@@ -68,6 +68,12 @@ Specular uses Blinn-Phong: `max(dot(n, h), 0)^shininess` with `h = normalize(l +
 
 Lighting never discards a fragment. A surface facing away from the light shades to its ambient colour (black when ambient is 0) and still writes depth, so it occludes geometry behind it instead of leaving a hole that shows the clear colour.
 
+## Culling Before Clipping
+
+Each face is classified before it reaches the clipper. The sign of `det[x y w]` over its three clip-space corners equals the sign of its screen-space area whenever all three corners are in front of the centre of projection, so culled output matches a screen-space test exactly. Unlike a screen-space test, it stays meaningful for a triangle that crosses behind the eye, where projected winding is undefined.
+
+Culled faces skip clipping, lighting, and vertex shading. Faces entirely inside the frustum also skip the clipper: it would return them unchanged, since each fully-inside plane pass only rotates the vertex list and six passes restore it. Faces entirely outside one plane are dropped without clipping. Tests pin culled renders bit for bit, and a seeded property test checks the classifier against the screen-space reference on thousands of random triangles, including ones that cross behind the eye.
+
 ## Shadow Pass State
 
 The light-space depth pass uses a fixed raster state: depth test and write on, no culling, no scissor, colour writes off, blending off. It does not inherit the camera pass's `RenderState`, so flags like `--scissor` or `--depth-write off` cannot crop or empty the shadow map.

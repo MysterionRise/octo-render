@@ -3,9 +3,9 @@ use glam::Vec3;
 use image::{ImageBuffer, Rgb, RgbImage};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use renderer::{
-    build_mipmaps, draw_line, render_model, triangle_zbuf, BlendMode, FaceVertex, Material, Model,
-    RenderMode, RenderOptions, RenderState, ShadowFilter, ShadowOptions, TextureFilter,
-    TextureSampler, TextureWrap, DEFAULT_LIGHT_DIR,
+    build_mipmaps, draw_line, render_model, triangle_zbuf, BlendMode, CullMode, FaceVertex,
+    Material, Model, RenderMode, RenderOptions, RenderState, ShadowFilter, ShadowOptions,
+    TextureFilter, TextureSampler, TextureWrap, DEFAULT_LIGHT_DIR,
 };
 
 type Pairs = (i32, i32, i32, i32);
@@ -15,6 +15,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     bench_triangle_rasterization(c);
     bench_full_model_render(c);
     bench_clipped_model_render(c);
+    bench_culling(c);
     bench_texture_filter_variants(c);
     bench_blend_variants(c);
     bench_shadow_filter_variants(c);
@@ -147,6 +148,37 @@ fn bench_clipped_model_render(c: &mut Criterion) {
                 black_box(output.image);
             })
         });
+    }
+
+    group.finish();
+}
+
+fn bench_culling(c: &mut Criterion) {
+    let model = Model::from_file("resources/teapot.obj");
+    let mut group = c.benchmark_group("software renderer culling");
+    group.sample_size(20);
+
+    for resolution in [128_u32, 1024] {
+        for cull_mode in [CullMode::Off, CullMode::Back] {
+            let options = RenderOptions {
+                width: resolution,
+                height: resolution,
+                mode: RenderMode::Flat,
+                camera_eye: None,
+                light_dir: DEFAULT_LIGHT_DIR,
+                render_state: RenderState {
+                    cull_mode,
+                    ..RenderState::default()
+                },
+                ..RenderOptions::default()
+            };
+            group.bench_function(format!("flat/{resolution}/{}", cull_mode.as_str()), |b| {
+                b.iter(|| {
+                    let output = render_model(black_box(&model), black_box(&options));
+                    black_box(output.image);
+                })
+            });
+        }
     }
 
     group.finish();

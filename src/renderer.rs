@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use image::{imageops::flip_vertical_in_place, ImageBuffer, Rgb, RgbImage};
 use std::collections::HashMap;
 use std::fs::File;
@@ -2573,21 +2573,20 @@ fn render_wireframe(
     image: &mut RgbImage,
 ) {
     let colour = Rgb([235, 238, 245]);
+    let mut primitives = Vec::new();
     for face_idx in 0..model.faces.len() {
-        for primitive in clipped_primitives_for_face(
+        if !prepare_face(
             model,
             transforms,
             face_idx,
             options.near_plane,
             options.far_plane,
+            options.render_state,
+            &mut primitives,
         ) {
-            if should_cull_screen_triangle_with_front_face(
-                &primitive.screen_coords,
-                options.render_state.cull_mode,
-                options.render_state.front_face,
-            ) {
-                continue;
-            }
+            continue;
+        }
+        for primitive in &primitives {
             for edge in [(0, 1), (1, 2), (2, 0)] {
                 draw_line_with_state(
                     primitive.screen_coords[edge.0].x.round() as i32,
@@ -2612,7 +2611,20 @@ fn render_flat(
 ) {
     let normal_matrix = normal_matrix(transforms.model_view);
     let light_dir = transforms.light_dir_view;
+    let mut primitives = Vec::new();
     for face_idx in 0..model.faces.len() {
+        // Cull and clip before lighting, so culled faces cost no shading work.
+        if !prepare_face(
+            model,
+            transforms,
+            face_idx,
+            options.near_plane,
+            options.far_plane,
+            options.render_state,
+            &mut primitives,
+        ) {
+            continue;
+        }
         let normal = safe_normal(
             transform_vector(&normal_matrix, model.face_normal(face_idx)),
             Vec3::Z,
@@ -2639,20 +2651,7 @@ fn render_flat(
             intensity,
             specular,
         );
-        for primitive in clipped_primitives_for_face(
-            model,
-            transforms,
-            face_idx,
-            options.near_plane,
-            options.far_plane,
-        ) {
-            if should_cull_screen_triangle_with_front_face(
-                &primitive.screen_coords,
-                options.render_state.cull_mode,
-                options.render_state.front_face,
-            ) {
-                continue;
-            }
+        for primitive in &primitives {
             triangle_zbuf_with_render_state(
                 primitive.screen_coords[0],
                 primitive.screen_coords[1],
@@ -2675,23 +2674,24 @@ fn render_shader<S: Shader>(
     options: &RenderOptions,
     render_state: RenderState,
 ) {
+    let mut primitives = Vec::new();
     for face_idx in 0..model.faces.len() {
-        let _: [Vec3; 3] = std::array::from_fn(|j| shader.vertex(face_idx, j));
-        let reciprocal_w = reciprocal_w_for_face(model, transforms.transform, face_idx);
-        for primitive in clipped_primitives_for_face(
+        // Cull and clip first: culled or fully clipped faces skip vertex shading.
+        // Shaders keep no state across faces, so skipping one is safe.
+        if !prepare_face(
             model,
             transforms,
             face_idx,
             options.near_plane,
             options.far_plane,
+            render_state,
+            &mut primitives,
         ) {
-            if should_cull_screen_triangle_with_front_face(
-                &primitive.screen_coords,
-                render_state.cull_mode,
-                render_state.front_face,
-            ) {
-                continue;
-            }
+            continue;
+        }
+        let _: [Vec3; 3] = std::array::from_fn(|j| shader.vertex(face_idx, j));
+        let reciprocal_w = reciprocal_w_for_face(model, transforms.transform, face_idx);
+        for primitive in &primitives {
             triangle_shader_perspective_with_render_state(
                 &primitive.screen_coords,
                 primitive.source_barycentric,
@@ -2717,6 +2717,9 @@ fn reciprocal_w_for_face(model: &Model, transform: Mat4, face_idx: usize) -> [f3
     })
 }
 
+/// Screen-space winding test, kept as the reference the clip-space classifier
+/// ([`should_cull_winding`]) is checked against.
+#[cfg(test)]
 fn should_cull_screen_triangle_with_front_face(
     screen_coords: &[Vec3; 3],
     cull_mode: CullMode,
@@ -2755,29 +2758,121 @@ struct ClippedPrimitive {
     source_barycentric: [Vec3; 3],
 }
 
-fn clipped_primitives_for_face(
+/// Cull a face, then clip it against the frustum and project the surviving
+/// pieces into `out` (cleared first). Returns whether anything is left to
+/// rasterize.
+///
+/// Culling runs before clipping, so culled faces never pay for the clipper. The
+/// winding comes from the homogeneous determinant ([`homogeneous_winding`]),
+/// which matches screen-space winding whenever every vertex is in front of the
+/// centre of projection, and stays meaningful for triangles that cross it,
+/// where screen-space winding is undefined.
+fn prepare_face(
     model: &Model,
     transforms: &RenderTransforms,
     face_idx: usize,
     near_plane: f32,
     far_plane: f32,
-) -> Vec<ClippedPrimitive> {
+    render_state: RenderState,
+    out: &mut Vec<ClippedPrimitive>,
+) -> bool {
+    out.clear();
+    let triangle = face_clip_vertices(model, transforms, face_idx);
+    if should_cull_winding(
+        homogeneous_winding(&triangle),
+        render_state.cull_mode,
+        render_state.front_face,
+    ) {
+        return false;
+    }
+    clip_triangle_into(triangle, transforms, near_plane, far_plane, out);
+    !out.is_empty()
+}
+
+fn face_clip_vertices(
+    model: &Model,
+    transforms: &RenderTransforms,
+    face_idx: usize,
+) -> [ClippedVertex; 3] {
     let face = model.faces[face_idx];
-    let triangle = [
+    [
         clipped_vertex_for_source(model.vertices[face[0].v], transforms, Vec3::X),
         clipped_vertex_for_source(model.vertices[face[1].v], transforms, Vec3::Y),
         clipped_vertex_for_source(model.vertices[face[2].v], transforms, Vec3::Z),
-    ];
+    ]
+}
 
-    clip_varying_triangle_against_frustum(triangle, near_plane, far_plane)
-        .into_iter()
-        .map(|tri| ClippedPrimitive {
-            screen_coords: std::array::from_fn(|i| {
-                clip_position_to_screen(tri[i].clip_pos, transforms.clip_to_screen)
-            }),
-            source_barycentric: std::array::from_fn(|i| tri[i].source_bc),
-        })
-        .collect()
+/// Signed orientation of a triangle as seen from the centre of projection:
+/// the determinant of its clip-space `(x, y, w)` corners, which equals
+/// `w0 * w1 * w2` times twice its signed NDC area.
+fn homogeneous_winding(triangle: &[ClippedVertex; 3]) -> f32 {
+    let column = |v: &ClippedVertex| Vec3::new(v.clip_pos.x, v.clip_pos.y, v.clip_pos.w);
+    Mat3::from_cols(
+        column(&triangle[0]),
+        column(&triangle[1]),
+        column(&triangle[2]),
+    )
+    .determinant()
+}
+
+/// A positive winding is counter-clockwise in the final image: the viewport
+/// keeps axis directions, and the vertical flip happens after rasterization.
+/// Zero winding counts as not front-facing, like the screen-space test.
+fn should_cull_winding(winding: f32, cull_mode: CullMode, front_face: FrontFace) -> bool {
+    let front_facing = match front_face {
+        FrontFace::Ccw => winding > 0.0,
+        FrontFace::Cw => winding < 0.0,
+    };
+    match cull_mode {
+        CullMode::Off => false,
+        CullMode::Front => front_facing,
+        CullMode::Back => !front_facing,
+    }
+}
+
+/// Clip a triangle against the frustum and append its projected pieces.
+///
+/// A triangle inside every plane skips the clipper, which would return it
+/// unchanged: each fully-inside pass rotates the vertex list by one, and six
+/// passes restore the original order. A triangle entirely outside one plane is
+/// dropped without clipping.
+fn clip_triangle_into(
+    triangle: [ClippedVertex; 3],
+    transforms: &RenderTransforms,
+    near_plane: f32,
+    far_plane: f32,
+    out: &mut Vec<ClippedPrimitive>,
+) {
+    let mut fully_inside = true;
+    for plane in FrustumPlane::ALL {
+        let inside = triangle
+            .map(|vertex| frustum_plane_distance(vertex, plane, near_plane, far_plane) >= -EPSILON);
+        if inside == [false; 3] {
+            return;
+        }
+        fully_inside &= inside == [true; 3];
+    }
+    if fully_inside {
+        out.push(project_clipped_triangle(&triangle, transforms));
+        return;
+    }
+    out.extend(
+        clip_varying_triangle_against_frustum(triangle, near_plane, far_plane)
+            .iter()
+            .map(|piece| project_clipped_triangle(piece, transforms)),
+    );
+}
+
+fn project_clipped_triangle(
+    triangle: &[ClippedVertex; 3],
+    transforms: &RenderTransforms,
+) -> ClippedPrimitive {
+    ClippedPrimitive {
+        screen_coords: std::array::from_fn(|i| {
+            clip_position_to_screen(triangle[i].clip_pos, transforms.clip_to_screen)
+        }),
+        source_barycentric: std::array::from_fn(|i| triangle[i].source_bc),
+    }
 }
 
 fn clipped_vertex_for_source(
@@ -4395,6 +4490,180 @@ map_Bump normal-checker.ppm
         assert_eq!(image_checksum(&output.image), 2_577_244);
         assert!(output.debug.depth.is_some());
         assert!(output.debug.normals.is_some());
+    }
+
+    #[test]
+    fn clip_space_winding_matches_screen_winding() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        let cube = cube_model(true);
+        let options = RenderOptions {
+            width: 256,
+            height: 256,
+            camera_eye: Some(Vec3::new(0.0, 0.25, 3.0)),
+            ..RenderOptions::default()
+        };
+        let transforms = build_transforms(&cube, &options, 256, 256, 256, 256);
+        let mut rng = StdRng::seed_from_u64(0x5eed);
+        let (mut checked, mut crossing) = (0, 0);
+        for _ in 0..4000 {
+            // Scene points reach well behind the eye, so some triangles have
+            // corners behind the centre of projection (w <= 0).
+            let corners: [Vec3; 3] = std::array::from_fn(|_| {
+                Vec3::new(
+                    rng.gen_range(-4.0..4.0),
+                    rng.gen_range(-4.0..4.0),
+                    rng.gen_range(-4.0..8.0),
+                )
+            });
+            let triangle: [ClippedVertex; 3] = std::array::from_fn(|i| {
+                clipped_vertex_for_source(corners[i], &transforms, [Vec3::X, Vec3::Y, Vec3::Z][i])
+            });
+            let winding = homogeneous_winding(&triangle);
+            let pieces = clip_varying_triangle_against_frustum(
+                triangle,
+                options.near_plane,
+                options.far_plane,
+            );
+            if triangle.iter().any(|v| v.clip_pos.w <= 0.0) && !pieces.is_empty() {
+                crossing += 1;
+            }
+            for piece in &pieces {
+                let screen = project_clipped_triangle(piece, &transforms).screen_coords;
+                let [a, b, c] = screen.map(Vec3::truncate);
+                let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                if area.abs() < 1.0 {
+                    // Slivers: their winding is numerically meaningless.
+                    continue;
+                }
+                checked += 1;
+                for front_face in [FrontFace::Ccw, FrontFace::Cw] {
+                    for cull_mode in [CullMode::Back, CullMode::Front] {
+                        assert_eq!(
+                            should_cull_winding(winding, cull_mode, front_face),
+                            should_cull_screen_triangle_with_front_face(
+                                &screen, cull_mode, front_face
+                            ),
+                            "corners {corners:?}, winding {winding}, piece area {area}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "only {checked} pieces checked");
+        assert!(
+            crossing > 20,
+            "only {crossing} triangles crossed behind the eye"
+        );
+    }
+
+    #[test]
+    fn floor_crossing_behind_the_eye_keeps_its_winding() {
+        let cube = cube_model(true);
+        let options = RenderOptions {
+            width: 128,
+            height: 128,
+            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            ..RenderOptions::default()
+        };
+        let transforms = build_transforms(&cube, &options, 128, 128, 128, 128);
+        // An upward-facing floor below the eye, running from in front of the
+        // camera to far behind it.
+        let corner = |v: usize| FaceVertex {
+            v,
+            vt: None,
+            vn: None,
+        };
+        let mut floor = Model {
+            vertices: vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(0.0, -1.0, 6.0),
+                Vec3::new(1.0, -1.0, 0.0),
+            ],
+            texcoords: Vec::new(),
+            normals: Vec::new(),
+            faces: vec![[corner(0), corner(1), corner(2)]],
+            materials: Vec::new(),
+            face_materials: vec![None],
+        };
+        assert!(floor.face_normal(0).y > 0.0);
+        assert!(face_clip_vertices(&floor, &transforms, 0)
+            .iter()
+            .any(|v| v.clip_pos.w < 0.0));
+
+        let back_culling = RenderState {
+            cull_mode: CullMode::Back,
+            ..RenderState::default()
+        };
+        let mut pieces = Vec::new();
+        assert!(prepare_face(
+            &floor,
+            &transforms,
+            0,
+            options.near_plane,
+            options.far_plane,
+            back_culling,
+            &mut pieces
+        ));
+        for piece in &pieces {
+            let [a, b, c] = piece.screen_coords.map(Vec3::truncate);
+            assert!((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) > 0.0);
+        }
+
+        floor.faces[0].swap(1, 2);
+        assert!(!prepare_face(
+            &floor,
+            &transforms,
+            0,
+            options.near_plane,
+            options.far_plane,
+            back_culling,
+            &mut pieces
+        ));
+    }
+
+    /// Pins culled output so the culling stage can be moved without changing
+    /// a single pixel or depth value.
+    #[test]
+    fn culled_teapot_renders_stay_stable() {
+        let model = Model::load("resources/teapot.obj").unwrap();
+        let mut checksums = Vec::new();
+        for mode in [RenderMode::Flat, RenderMode::Gouraud] {
+            for cull_mode in [CullMode::Back, CullMode::Front] {
+                let options = RenderOptions {
+                    width: 64,
+                    height: 64,
+                    mode,
+                    camera_eye: Some(Vec3::new(0.0, 0.25, 3.0)),
+                    render_state: RenderState {
+                        cull_mode,
+                        ..RenderState::default()
+                    },
+                    ..RenderOptions::default()
+                };
+                let output = render_model(&model, &options);
+                checksums.push((
+                    image_checksum(&output.image),
+                    depth_bits_hash(&output.zbuffer),
+                ));
+            }
+        }
+        assert_eq!(checksums, CULLED_TEAPOT_CHECKSUMS);
+    }
+
+    const CULLED_TEAPOT_CHECKSUMS: [(u64, u64); 4] = [
+        (1_506_840, 9_950_000_386_150_388_727),
+        (937_821, 14_738_515_683_572_321_133),
+        (1_508_325, 9_950_000_386_150_388_727),
+        (939_097, 14_738_515_683_572_321_133),
+    ];
+
+    /// Order-sensitive hash of the exact depth bits.
+    fn depth_bits_hash(zbuffer: &[f32]) -> u64 {
+        zbuffer.iter().fold(0u64, |hash, z| {
+            hash.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(z.to_bits() as u64)
+        })
     }
 
     #[test]
