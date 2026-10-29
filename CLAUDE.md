@@ -24,7 +24,7 @@ A separate `wgpu` viewer under `crates/` is an interactive GPU comparison layer.
 Workspace root package `octo-render`:
 
 - **`src/renderer.rs`** — library crate `renderer`, a single large file:
-  - OBJ/MTL loading: `Model::load` (`v`/`vt`/`vn`, polygon fan triangulation, negative indices, `mtllib`/`usemtl`), `ObjMaterial`, `Material`
+  - OBJ/MTL loading: `Model::load` / `Model::load_with_options` (`v`/`vt`/`vn`, polygon fan triangulation, negative indices, `mtllib`/`usemtl`), `Model::generate_missing_normals` (welded, angle-weighted, crease-limited smooth normals for corners without `vn`), `ObjMaterial`, `Material`
   - Transforms: `viewport`, `projection`, `lookat`, `transform_point`
   - Raster: `draw_line` (Bresenham), `triangle_shader_perspective_with_state` and wrappers (barycentric coverage, top-left rule, perspective-correct varyings), `clip_varying_triangle_against_frustum` (six planes, preserves source barycentrics)
   - Render state: `RenderState`, `CullMode`, `FrontFace`, `DepthState`, `FillMode`, `ScissorRect`, `BlendMode`
@@ -40,7 +40,7 @@ Workspace root package `octo-render`:
 ## Conventions
 
 - **Light direction**: `RenderOptions::light_dir` and `--light` give the direction *toward* the light in normalized scene space (default `DEFAULT_LIGHT_DIR`, 1,1,1). `render_model` rotates it into eye space once for shading, and renders the shadow map from `light_dir * 3`, so diffuse, specular, and shadows always agree. Built-in shaders take the eye-space light.
-- **Normals** point outward. `Model::face_normal` assumes counter-clockwise winding (the OBJ convention).
+- **Normals** point outward. `Model::face_normal` assumes counter-clockwise winding (the OBJ convention) and only falls back to +Z for zero-area faces. `Model::load` generates smooth normals for corners without `vn` (crease angle `DEFAULT_CREASE_ANGLE_DEG`, 60°); flat mode always uses face normals.
 - **Depth**: larger z is closer. The z-buffer clears to `-inf` and the depth test passes when `z > current`.
 - **No lighting discards**: unlit fragments shade to ambient (or black) and still write depth, so they occlude what is behind them.
 - **Scene space**: models are recentred and scaled into a normalized scene before the camera is applied, so `--camera` and `--light` live in that space.

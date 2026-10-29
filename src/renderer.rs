@@ -18,6 +18,27 @@ pub const DEFAULT_LIGHT_DIR: Vec3 = Vec3::new(1.0, 1.0, 1.0);
 /// Fraction of diffuse light kept where the shadow map reports full occlusion.
 const SHADOWED_DIFFUSE: f32 = 0.35;
 
+/// Default crease angle, in degrees, for vertex normals generated when an OBJ
+/// has no `vn`: faces meeting at a sharper angle keep a hard edge.
+pub const DEFAULT_CREASE_ANGLE_DEG: f32 = 60.0;
+
+/// Options for [`Model::load_with_options`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjLoadOptions {
+    /// Generate smooth normals for face corners without `vn`, smoothing across
+    /// edges whose faces differ by at most this many degrees. `None` keeps the
+    /// faceted per-face fallback.
+    pub crease_angle_deg: Option<f32>,
+}
+
+impl Default for ObjLoadOptions {
+    fn default() -> Self {
+        ObjLoadOptions {
+            crease_angle_deg: Some(DEFAULT_CREASE_ANGLE_DEG),
+        }
+    }
+}
+
 /// Parsed face vertex: indices into vertex/texcoord/normal arrays (0-based).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaceVertex {
@@ -63,8 +84,22 @@ impl ModelBounds {
 
 impl Model {
     /// Load an OBJ model with triangulated polygon faces and non-panicking errors.
+    /// Face corners without `vn` get smooth normals (see
+    /// [`Model::generate_missing_normals`]) with the default crease angle.
     pub fn load(filename: impl AsRef<Path>) -> Result<Self, String> {
-        load_obj(filename.as_ref())
+        Self::load_with_options(filename, ObjLoadOptions::default())
+    }
+
+    /// Load an OBJ model with explicit loader options.
+    pub fn load_with_options(
+        filename: impl AsRef<Path>,
+        options: ObjLoadOptions,
+    ) -> Result<Self, String> {
+        let mut model = load_obj(filename.as_ref())?;
+        if let Some(crease_angle_deg) = options.crease_angle_deg {
+            model.generate_missing_normals(crease_angle_deg);
+        }
+        Ok(model)
     }
 
     /// Compatibility wrapper for older examples and benchmarks.
@@ -86,13 +121,14 @@ impl Model {
     }
 
     /// Outward geometric normal of a face, assuming counter-clockwise winding
-    /// (the OBJ convention).
+    /// (the OBJ convention). Only a zero-area face falls back to +Z; small but
+    /// valid faces keep their true orientation.
     pub fn face_normal(&self, face_idx: usize) -> Vec3 {
         let face = self.faces[face_idx];
         let v0 = self.vertices[face[0].v];
         let v1 = self.vertices[face[1].v];
         let v2 = self.vertices[face[2].v];
-        safe_normal((v1 - v0).cross(v2 - v0), Vec3::Z)
+        (v1 - v0).cross(v2 - v0).try_normalize().unwrap_or(Vec3::Z)
     }
 
     pub fn vertex_normal(&self, face_idx: usize, vert_idx: usize) -> Vec3 {
@@ -100,6 +136,99 @@ impl Model {
         fv.vn
             .map(|ni| safe_normal(self.normals[ni], self.face_normal(face_idx)))
             .unwrap_or_else(|| self.face_normal(face_idx))
+    }
+
+    /// Generate smooth vertex normals for face corners that have no `vn`.
+    ///
+    /// Vertices at the same position are welded first, so seams between
+    /// duplicated vertices (common in exported meshes) shade smoothly. Each
+    /// corner's normal is the angle-weighted average of the face normals around
+    /// its vertex, restricted to faces within `crease_angle_deg` of the corner's
+    /// own face; sharper edges stay hard. Angle weighting, unlike area
+    /// weighting, does not depend on how polygons were triangulated.
+    ///
+    /// Corners that already have `vn` are left alone, as are degenerate faces,
+    /// which keep the per-face fallback in [`Model::vertex_normal`].
+    pub fn generate_missing_normals(&mut self, crease_angle_deg: f32) {
+        let needs_normals = self
+            .faces
+            .iter()
+            .any(|face| face.iter().any(|fv| fv.vn.is_none()));
+        let Some(bounds) = self.bounds() else {
+            return;
+        };
+        if !needs_normals {
+            return;
+        }
+
+        // Weld positions on a grid far finer than any real feature.
+        let diagonal = (bounds.max - bounds.min).length();
+        let cell = if diagonal > 0.0 { diagonal * 1e-6 } else { 1.0 };
+        let mut weld_ids: HashMap<(i64, i64, i64), usize> = HashMap::new();
+        let welded: Vec<usize> = self
+            .vertices
+            .iter()
+            .map(|v| {
+                let key = (
+                    (v.x / cell).round() as i64,
+                    (v.y / cell).round() as i64,
+                    (v.z / cell).round() as i64,
+                );
+                let next_id = weld_ids.len();
+                *weld_ids.entry(key).or_insert(next_id)
+            })
+            .collect();
+
+        // Unit normal per non-degenerate face, plus the faces (with their corner
+        // angle) incident to each welded vertex.
+        let mut face_normals: Vec<Option<Vec3>> = Vec::with_capacity(self.faces.len());
+        let mut incident: Vec<Vec<(usize, f32)>> = vec![Vec::new(); weld_ids.len()];
+        for (face_idx, face) in self.faces.iter().enumerate() {
+            let p = face.map(|fv| self.vertices[fv.v]);
+            // Same degeneracy test as `face_normal`, so the two always agree.
+            let Some(normal) = (p[1] - p[0]).cross(p[2] - p[0]).try_normalize() else {
+                face_normals.push(None);
+                continue;
+            };
+            let angles: [f32; 3] = std::array::from_fn(|i| {
+                let a = (p[(i + 1) % 3] - p[i]).normalize_or_zero();
+                let b = (p[(i + 2) % 3] - p[i]).normalize_or_zero();
+                a.dot(b).clamp(-1.0, 1.0).acos()
+            });
+            for (corner, fv) in face.iter().enumerate() {
+                incident[welded[fv.v]].push((face_idx, angles[corner]));
+            }
+            face_normals.push(Some(normal));
+        }
+
+        // Each weld-vertex/normal pair is stored once.
+        let min_dot = crease_angle_deg.clamp(0.0, 180.0).to_radians().cos();
+        let mut generated: HashMap<(usize, [u32; 3]), usize> = HashMap::new();
+        for face_idx in 0..self.faces.len() {
+            let Some(face_normal) = face_normals[face_idx] else {
+                continue;
+            };
+            for corner in 0..3 {
+                if self.faces[face_idx][corner].vn.is_some() {
+                    continue;
+                }
+                let vertex = welded[self.faces[face_idx][corner].v];
+                let sum: Vec3 = incident[vertex]
+                    .iter()
+                    .filter_map(|&(other, angle)| {
+                        let other_normal = face_normals[other]?;
+                        (other_normal.dot(face_normal) >= min_dot).then_some(other_normal * angle)
+                    })
+                    .sum();
+                let normal = safe_normal(sum, face_normal);
+                let key = (vertex, normal.to_array().map(f32::to_bits));
+                let index = *generated.entry(key).or_insert_with(|| {
+                    self.normals.push(normal);
+                    self.normals.len() - 1
+                });
+                self.faces[face_idx][corner].vn = Some(index);
+            }
+        }
     }
 }
 
@@ -1322,7 +1451,7 @@ impl Shader for NormalMapShader<'_> {
         let dp2 = self.varying_pos[2] - self.varying_pos[0];
         let duv1 = self.varying_uv[1] - self.varying_uv[0];
         let duv2 = self.varying_uv[2] - self.varying_uv[0];
-        let face_normal = safe_normal(dp1.cross(dp2), Vec3::Z);
+        let face_normal = dp1.cross(dp2).try_normalize().unwrap_or(Vec3::Z);
         let det = duv1.x * duv2.y - duv1.y * duv2.x;
 
         let world_normal = if det.abs() < 1e-10 {
@@ -3303,6 +3432,95 @@ mod tests {
         }
     }
 
+    /// Axis-aligned cube from -1 to 1 with outward, counter-clockwise faces,
+    /// each quad fan-triangulated. With `shared_corners` the six faces share
+    /// eight vertices; otherwise every face has its own four copies, as many
+    /// exporters write them.
+    fn cube_model(shared_corners: bool) -> Model {
+        let corner = |i: usize| {
+            Vec3::new(
+                if i & 1 == 0 { -1.0 } else { 1.0 },
+                if i & 2 == 0 { -1.0 } else { 1.0 },
+                if i & 4 == 0 { -1.0 } else { 1.0 },
+            )
+        };
+        let quads: [[usize; 4]; 6] = [
+            [4, 5, 7, 6], // +Z
+            [0, 2, 3, 1], // -Z
+            [1, 3, 7, 5], // +X
+            [0, 4, 6, 2], // -X
+            [2, 6, 7, 3], // +Y
+            [0, 1, 5, 4], // -Y
+        ];
+        let mut vertices: Vec<Vec3> = if shared_corners {
+            (0..8).map(corner).collect()
+        } else {
+            Vec::new()
+        };
+        let mut faces = Vec::new();
+        for quad in quads {
+            let ids: [usize; 4] = if shared_corners {
+                quad
+            } else {
+                let base = vertices.len();
+                vertices.extend(quad.iter().map(|&i| corner(i)));
+                [base, base + 1, base + 2, base + 3]
+            };
+            let fv = |v: usize| FaceVertex {
+                v,
+                vt: None,
+                vn: None,
+            };
+            faces.push([fv(ids[0]), fv(ids[1]), fv(ids[2])]);
+            faces.push([fv(ids[0]), fv(ids[2]), fv(ids[3])]);
+        }
+        let face_count = faces.len();
+        Model {
+            vertices,
+            texcoords: Vec::new(),
+            normals: Vec::new(),
+            faces,
+            materials: Vec::new(),
+            face_materials: vec![None; face_count],
+        }
+    }
+
+    /// Flat 4x4-vertex grid in the z = 0 plane, facing +Z.
+    fn grid_model() -> Model {
+        let vertices: Vec<Vec3> = (0..16)
+            .map(|i| Vec3::new((i % 4) as f32, (i / 4) as f32, 0.0))
+            .collect();
+        let fv = |v: usize| FaceVertex {
+            v,
+            vt: None,
+            vn: None,
+        };
+        let mut faces = Vec::new();
+        for y in 0..3 {
+            for x in 0..3 {
+                let i = y * 4 + x;
+                faces.push([fv(i), fv(i + 1), fv(i + 5)]);
+                faces.push([fv(i), fv(i + 5), fv(i + 4)]);
+            }
+        }
+        let face_count = faces.len();
+        Model {
+            vertices,
+            texcoords: Vec::new(),
+            normals: Vec::new(),
+            faces,
+            materials: Vec::new(),
+            face_materials: vec![None; face_count],
+        }
+    }
+
+    fn assert_vec3_close(actual: Vec3, expected: Vec3, context: &str) {
+        assert!(
+            (actual - expected).length() < 1e-5,
+            "{context}: expected {expected:?}, got {actual:?}"
+        );
+    }
+
     fn clip_test_vertex(clip_pos: Vec4, source_bc: Vec3) -> ClippedVertex {
         ClippedVertex {
             view_pos: Vec3::new(clip_pos.x, clip_pos.y, -1.0),
@@ -3978,6 +4196,110 @@ map_Bump normal-checker.ppm
                 mode.as_str()
             );
         }
+    }
+
+    #[test]
+    fn cube_fixture_faces_point_outward() {
+        let cube = cube_model(true);
+        for face_idx in 0..cube.faces.len() {
+            let centroid = cube.faces[face_idx]
+                .iter()
+                .map(|fv| cube.vertices[fv.v])
+                .sum::<Vec3>()
+                / 3.0;
+            assert!(cube.face_normal(face_idx).dot(centroid) > 0.0);
+        }
+    }
+
+    #[test]
+    fn generated_normals_average_every_face_without_a_crease_limit() {
+        for shared_corners in [true, false] {
+            let mut cube = cube_model(shared_corners);
+            cube.generate_missing_normals(180.0);
+            for face_idx in 0..cube.faces.len() {
+                for corner in 0..3 {
+                    let position = cube.vertices[cube.faces[face_idx][corner].v];
+                    assert_vec3_close(
+                        cube.vertex_normal(face_idx, corner),
+                        position.normalize(),
+                        &format!("shared={shared_corners} face {face_idx} corner {corner}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_normals_keep_edges_sharper_than_the_crease_angle_hard() {
+        let mut cube = cube_model(false);
+        cube.generate_missing_normals(DEFAULT_CREASE_ANGLE_DEG);
+        for face_idx in 0..cube.faces.len() {
+            for corner in 0..3 {
+                assert_vec3_close(
+                    cube.vertex_normal(face_idx, corner),
+                    cube.face_normal(face_idx),
+                    &format!("face {face_idx} corner {corner}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_normals_on_a_flat_grid_point_along_its_face() {
+        let mut grid = grid_model();
+        grid.generate_missing_normals(DEFAULT_CREASE_ANGLE_DEG);
+        for face_idx in 0..grid.faces.len() {
+            for corner in 0..3 {
+                assert_vec3_close(grid.vertex_normal(face_idx, corner), Vec3::Z, "grid");
+            }
+        }
+        // Every corner of a vertex shares one stored normal.
+        assert_eq!(grid.normals.len(), grid.vertices.len());
+    }
+
+    #[test]
+    fn generated_normals_leave_authored_normals_alone() {
+        let mut model = tiny_model();
+        let mut untextured = model.faces[0];
+        for fv in &mut untextured {
+            fv.vn = None;
+        }
+        model.faces.push(untextured);
+        model.face_materials.push(None);
+        model.generate_missing_normals(DEFAULT_CREASE_ANGLE_DEG);
+        assert_eq!(model.faces[0].map(|fv| fv.vn), [Some(0); 3]);
+        assert_eq!(model.normals[0], Vec3::new(0.0, 0.0, 1.0));
+        assert!(model.faces[1].iter().all(|fv| fv.vn.is_some()));
+    }
+
+    #[test]
+    fn teapot_loads_with_smooth_unit_normals_facing_out() {
+        let faceted = Model::load_with_options(
+            "resources/teapot.obj",
+            ObjLoadOptions {
+                crease_angle_deg: None,
+            },
+        )
+        .unwrap();
+        assert!(faceted.normals.is_empty());
+
+        let model = Model::load("resources/teapot.obj").unwrap();
+        let mut smoothed_corners = 0;
+        for face_idx in 0..model.faces.len() {
+            for corner in 0..3 {
+                let Some(index) = model.faces[face_idx][corner].vn else {
+                    continue;
+                };
+                smoothed_corners += 1;
+                let normal = model.normals[index];
+                assert!((normal.length() - 1.0).abs() < 1e-4);
+                assert!(normal.dot(model.face_normal(face_idx)) > 0.0);
+            }
+        }
+        // Only degenerate faces (at the lid knob and base poles) keep the
+        // per-face fallback.
+        assert!(smoothed_corners > model.faces.len() * 3 * 9 / 10);
+        assert!(model.normals.len() < smoothed_corners);
     }
 
     #[test]

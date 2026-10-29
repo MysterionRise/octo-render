@@ -23,6 +23,7 @@ flowchart LR
 ## Implemented Stages
 
 - **Asset loading:** the OBJ loader parses positions, UVs, normals, triangle faces, polygon faces, negative OBJ indices, `mtllib`, and `usemtl`. Polygons are triangulated with a fan.
+- **Normal generation:** face corners without `vn` get smooth normals. Duplicated positions are welded first, so exporter seams shade smoothly. Each corner averages the normals of the faces around its vertex, weighted by the face's corner angle (unlike area weights, these do not depend on how a polygon was triangulated). Faces more than the crease angle (default 60°, `--crease-angle`) away from the corner's own face are left out, so sharp edges stay hard.
 - **Material loading:** the MTL loader supports `Ka`, `Kd`, `Ks`, `Ns`, alpha, `map_Kd`, and common normal-map keys. CLI material flags intentionally override MTL values for repeatable demos.
 - **Model normalization:** imported meshes are centered and scaled into a normalized scene so CLI renders frame consistently.
 - **Transforms:** vertices pass through model, view, projection, and viewport transforms before rasterization.
@@ -115,7 +116,7 @@ The `wgpu` viewer exists separately because `wgpu` delegates rasterization to th
 - No stencil buffer, multisampling, cubemaps, instancing, or uniform-buffer abstraction.
 - Shadow mapping uses configurable fixed bias and simple PCF, not slope-scaled bias or cascades.
 - Lighting is a single directional light with Lambert diffuse and Blinn-Phong specular in 8-bit colour; there is no gamma-correct pipeline, point light, or PBR model.
-- SSAO is deterministic and useful for demonstrating a post-process pass, not physically based.
+- SSAO is deterministic and useful for demonstrating a post-process pass, not physically based. It thresholds raw depth differences without normals, so it shades each planar triangle of a curved surface by its slope.
 
 ## What To Look At In The Code
 

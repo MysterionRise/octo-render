@@ -2,8 +2,9 @@ use glam::Vec3;
 use image::Rgb;
 use renderer::{
     build_mipmaps, render_model, BlendMode, CullMode, DepthState, FillMode, FrontFace, Material,
-    Model, ObjMaterial, RenderMode, RenderOptions, RenderState, ScissorRect, ShadowFilter,
-    ShadowOptions, TextureFilter, TextureSampler, TextureWrap, DEFAULT_LIGHT_DIR,
+    Model, ObjLoadOptions, ObjMaterial, RenderMode, RenderOptions, RenderState, ScissorRect,
+    ShadowFilter, ShadowOptions, TextureFilter, TextureSampler, TextureWrap,
+    DEFAULT_CREASE_ANGLE_DEG, DEFAULT_LIGHT_DIR,
 };
 use std::env;
 use std::fs;
@@ -40,6 +41,7 @@ struct Cli {
     material: Material,
     material_overrides: MaterialOverrides,
     shadow: ShadowOptions,
+    crease_angle: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -81,6 +83,7 @@ impl Default for Cli {
             material: Material::default(),
             material_overrides: MaterialOverrides::default(),
             shadow: ShadowOptions::default(),
+            crease_angle: Some(DEFAULT_CREASE_ANGLE_DEG),
         }
     }
 }
@@ -95,7 +98,12 @@ fn main() {
 fn run() -> Result<(), String> {
     let cli = parse_args(env::args().skip(1))?;
 
-    let model = Model::load(&cli.model)?;
+    let model = Model::load_with_options(
+        &cli.model,
+        ObjLoadOptions {
+            crease_angle_deg: cli.crease_angle,
+        },
+    )?;
     let selected_material = select_material(&model, cli.material_name.as_deref())?;
     let material = resolve_material(&cli, selected_material);
     let texture_path = cli
@@ -295,6 +303,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--output" => cli.output = PathBuf::from(value("--output")?),
             "--camera" => cli.camera = Some(parse_vec3(&value("--camera")?, "--camera")?),
             "--light" => cli.light = parse_vec3(&value("--light")?, "--light")?,
+            "--crease-angle" => cli.crease_angle = parse_crease_angle(&value("--crease-angle")?)?,
             "--debug-dir" => cli.debug_dir = Some(PathBuf::from(value("--debug-dir")?)),
             "--cull" => cli.cull_mode = CullMode::from_str(&value("--cull")?)?,
             "--front-face" => cli.front_face = FrontFace::from_str(&value("--front-face")?)?,
@@ -413,6 +422,18 @@ fn parse_positive_u32(value: &str, label: &str) -> Result<u32, String> {
     }
 }
 
+/// `off` (or 0) keeps faceted per-face normals; otherwise an angle in degrees.
+fn parse_crease_angle(value: &str) -> Result<Option<f32>, String> {
+    if value == "off" {
+        return Ok(None);
+    }
+    let degrees = parse_f32_arg(value, "--crease-angle")?;
+    if !(0.0..=180.0).contains(&degrees) {
+        return Err("--crease-angle must be off or between 0 and 180 degrees".to_string());
+    }
+    Ok((degrees > 0.0).then_some(degrees))
+}
+
 fn parse_f32_arg(value: &str, label: &str) -> Result<f32, String> {
     value
         .parse::<f32>()
@@ -503,6 +524,8 @@ Options:
   --output <path>      Output image path [default: renders/teapot-shadow.png]
   --camera <x,y,z>     Camera eye in normalized scene space [default: 0,0.25,3]
   --light <x,y,z>      Direction toward the light, scene space [default: 1,1,1]
+  --crease-angle <deg|off> Smooth normals for meshes without vn; edges sharper
+                       than this stay hard, off keeps facets [default: 60]
   --debug-dir <path>   Write depth, shadow-map, normals, and AO debug PNGs
   --cull <mode>        Face culling: off, front, back [default: off]
   --front-face <mode>  Front-face winding: ccw, cw [default: ccw]
@@ -588,6 +611,8 @@ mod tests {
                 "2",
                 "--shadow-filter",
                 "pcf",
+                "--crease-angle",
+                "30",
             ]
             .into_iter()
             .map(String::from),
@@ -595,6 +620,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.shader, RenderMode::Texture);
+        assert_eq!(cli.crease_angle, Some(30.0));
+        assert_eq!(parse_crease_angle("off"), Ok(None));
+        assert_eq!(parse_crease_angle("0"), Ok(None));
+        assert!(parse_crease_angle("200").is_err());
         assert_eq!(cli.cull_mode, CullMode::Back);
         assert_eq!(cli.front_face, FrontFace::Cw);
         assert!(!cli.depth_test);

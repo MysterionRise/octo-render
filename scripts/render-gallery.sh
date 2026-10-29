@@ -24,8 +24,9 @@ material_quad=(--model resources/material-quad.obj "${size[@]}" --light 0,0,1)
 key_light=(--light=-1,1,1)
 shiny=(--ambient 0.08 --specular 0.5 --shininess 48)
 
-# Hero: shadow map with PCF, SSAO, and Blinn-Phong specular together.
-render --model resources/teapot.obj --width 1024 --height 768 --shader ssao \
+# Hero: smooth normals, shadow map with PCF, and Blinn-Phong specular together.
+# SSAO is shown in its own cell: its depth-only occlusion bands curved surfaces.
+render --model resources/teapot.obj --width 1024 --height 768 --shader shadow \
     "${key_light[@]}" "${shiny[@]}" --shadow-filter pcf \
     --output renders/hero.png --debug-dir renders/debug/hero
 

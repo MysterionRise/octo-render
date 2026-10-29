@@ -156,6 +156,7 @@ Implemented CPU features:
 
 - Bresenham line drawing
 - OBJ parser for `v`, `vt`, `vn`, polygonal `f` faces, `mtllib`, and `usemtl`
+- Smooth vertex normals for meshes without `vn`: positions are welded, face normals are angle-weighted, and edges sharper than a crease angle stay hard (`--crease-angle`, default 60°)
 - MTL parser for `Ka`, `Kd`, `Ks`, `Ns`, alpha, diffuse maps, and normal-map keys
 - Fan triangulation for quads/ngons
 - Negative OBJ index support
@@ -242,6 +243,7 @@ Current test coverage includes:
 - Blinn-Phong specular: highlight peak, back-light rejection, and render-level highlight
 - unlit surfaces still write depth in every lit mode
 - faces without UVs do not inherit the previous face's texture coordinates
+- generated normals: cube corners with and without a crease limit, welding of duplicated vertices, flat grids, authored `vn` left alone, and unit outward normals on the teapot
 - an occluder casts a shadow, and PCF changes the shadow edge
 - the shadow pass ignores camera raster state (scissor, culling, depth writes, blending)
 - shadow-map size/filter options
@@ -265,11 +267,10 @@ The CPU renderer is the OpenGL-style reimplementation. The GPU viewer is intenti
 - Frustum clipping is implemented for this renderer's projection path, but it is not a full OpenGL conformance clipper.
 - Mipmap LOD uses a simplified screen-space triangle estimate, not GLSL derivatives.
 - Normal-map mode consumes either a CLI normal-map texture or an MTL normal-map key; tangent generation remains minimal.
-- The bundled OBJ meshes ship without `vn` normals, so Gouraud and specular shading fall back to per-face normals and look faceted. Smooth vertex-normal generation is not implemented yet.
 - Moving `--camera` closer strengthens perspective but does not enlarge the model. The view matrix puts the eye at the view-space origin, while the projection places its centre of projection one camera-distance further back. Fixing this reframes every render and the clipping tests, so it is tracked as follow-up work.
 - The bundled textures are 4x4 PPMs, so the textured and mipmap gallery images show magnification; demonstrating minification needs a larger texture.
 - Shadow mapping supports configurable bias and simple 3x3 PCF, but not cascades or slope-scaled bias.
-- SSAO is deterministic and useful as a pipeline demonstration, but not physically based.
+- SSAO is deterministic and useful as a pipeline demonstration, but not physically based. It compares raw depth against a fixed threshold without using normals, so curved surfaces pick up faint per-triangle bands.
 - Blending supports alpha and additive modes, but not full `glBlendFunc`/`glBlendEquation` configurability.
 - The CPU renderer is optimized enough for portfolio evidence, not production real-time rendering.
 

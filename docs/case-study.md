@@ -62,10 +62,9 @@ The renderer is still intentionally smaller than OpenGL:
 - no stencil buffer, MSAA, cubemaps, instancing, or shader language
 - blending supports alpha/additive modes, not arbitrary blend equations
 - shadow mapping uses fixed bias and simple PCF
-- the bundled meshes have no `vn` normals, so Gouraud shading uses face normals and looks faceted
-- SSAO is deterministic and useful for pipeline demonstration, not physically based
+- SSAO is deterministic and useful for pipeline demonstration, not physically based; its depth-only test bands curved surfaces
 - CPU performance is educational and measurable, not production real-time
 
 ## Next Work
 
-The highest-value next steps are one measured optimization pass (band-parallel rasterization behind a `--threads` flag, verified byte-identical to the sequential path), smooth vertex-normal generation for meshes without `vn`, richer material assets, and a headless `wgpu` screenshot path for a side-by-side CPU/GPU comparison.
+The highest-value next steps are one measured optimization pass (band-parallel rasterization behind a `--threads` flag, verified byte-identical to the sequential path), richer material assets, and a headless `wgpu` screenshot path for a side-by-side CPU/GPU comparison.
