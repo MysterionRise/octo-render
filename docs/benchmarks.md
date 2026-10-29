@@ -127,6 +127,27 @@ The next change moved culling ahead of clipping (a clip-space winding test) and 
 
 Most of the gain is the trivial-accept path, which is why `--cull off` improves as much as `--cull back`. Small frames gain the most because geometry dominates them; at 1024x1024 pixel work dominates. Flat mode at 128x128 is now faster than before the correctness sprint (1.53 ms on commit `8316fbc`), even though it rasterizes every face. The clipping benchmarks use a one-triangle scene, so they do not move. The default stays `--cull off` because the teapot is not a closed mesh.
 
+## Camera Change (October 2026)
+
+The perspective camera and the orthographic shadow camera change what each frame contains, so these numbers re-baseline the suite rather than measure an optimization. Same machine, back to back on 2026-10-29; "before" is commit `50a04e1` (orthographic shadow camera, old view projection), "after" is `0ffa622` (perspective camera), both with one benchmark file.
+
+| Benchmark | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Full frame flat, 128x128 | 1.4807 ms | 1.3986 ms | -5.5% |
+| Full frame Gouraud, 128x128 | 2.2465 ms | 2.0194 ms | -10.1% |
+| Full frame shadow, 128x128 | 4.0212 ms | 3.7565 ms | -6.6% |
+| Flat, 512x512 | 4.2284 ms | 4.0113 ms | -5.1% |
+| Flat, 1024x1024 | 10.233 ms | 9.2696 ms | -9.4% |
+| Culling: flat 1024, `--cull off` | 11.470 ms | 9.7041 ms | -15.4% |
+| Culling: flat 1024, `--cull back` | 6.4488 ms | 5.6393 ms | -12.6% |
+| Clipping, unclipped | 335.9 us | 302.0 us | -10.1% |
+| Clipping, near-plane clipped | 350.9 us | 308.1 us | -12.2% |
+| Texture nearest / linear / mipmap | 1.8631 / 2.9185 / 2.9052 ms | 1.6898 / 2.5020 / 2.6913 ms | -9.3% / -14.3% / -7.4% |
+| Blend off / alpha / additive | 1.7536 / 2.2301 / 2.0548 ms | 1.5383 / 2.0258 / 1.8454 ms | -12.3% / -9.2% / -10.2% |
+| Shadow no filter / PCF, 256x256 | 6.1222 / 6.4849 ms | 5.7574 / 6.1872 ms | -6.0% / -4.6% |
+
+Most of the change is coverage. At the new 45° default the teapot covers about 9% fewer pixels than at the old projection's effective 43.15°, and the quads are now framed without the 8% margin. The orthographic shadow camera one commit earlier went the other way: it fills the whole shadow map instead of a margined, perspective-shrunk view, so the shadow pass rasterizes more texels. Across this machine's runs, the shadow benchmarks rose roughly 10% with that commit.
+
 ## Interpreting The Numbers
 
 The renderer is pixel-work dominated. A large triangle can cost more than many tiny triangles because the CPU path loops over covered pixels, computes deterministic top-left coverage, performs depth testing, and runs fragment shading directly in Rust.

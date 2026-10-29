@@ -199,13 +199,13 @@ Implemented CPU features:
 
 ## Performance Snapshot
 
-Detailed methodology and Criterion results are in [docs/benchmarks.md](docs/benchmarks.md). Short version, rendering `resources/teapot.obj` at `128x128` under Criterion after culling moved ahead of clipping (Linux, Intel Xeon @ 2.10 GHz, single-threaded):
+Detailed methodology and Criterion results are in [docs/benchmarks.md](docs/benchmarks.md). Short version, rendering `resources/teapot.obj` at `128x128` under Criterion with the current camera (Linux, Intel Xeon @ 2.10 GHz, single-threaded):
 
 | Mode | Triangles | Time | Throughput |
 | --- | ---: | ---: | ---: |
-| flat | 6,320 | 1.4350 ms | 4.40M triangles/sec |
-| Gouraud | 6,320 | 2.0826 ms | 3.03M triangles/sec |
-| shadow | 6,320 | 3.6268 ms | 1.74M triangles/sec |
+| flat | 6,320 | 1.3986 ms | 4.52M triangles/sec |
+| Gouraud | 6,320 | 2.0194 ms | 3.13M triangles/sec |
+| shadow | 6,320 | 3.7565 ms | 1.68M triangles/sec |
 
 These are not comparable with the July macOS numbers in the same doc. The doc's later sections compare before and after on one machine for each change.
 
