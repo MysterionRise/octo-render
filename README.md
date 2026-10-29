@@ -175,7 +175,7 @@ Implemented CPU features:
 - Shader-style vertex/fragment trait
 - Flat, Gouraud, checker/file texture, normal-map, normal-debug, shadow, and SSAO render modes
 - Perspective-correct interpolation for shader varyings
-- Configurable shadow-map size, bias, and PCF filtering
+- Configurable shadow-map size, bias, and PCF filtering, from an orthographic directional shadow camera with its own clip planes
 - Debug outputs for depth, normals, shadow map, and AO
 
 ## OpenGL-Style Coverage
@@ -247,7 +247,8 @@ Current test coverage includes:
 - faces without UVs do not inherit the previous face's texture coordinates
 - generated normals: cube corners with and without a crease limit, welding of duplicated vertices, flat grids, authored `vn` left alone, and unit outward normals on the teapot
 - an occluder casts a shadow, and PCF changes the shadow edge
-- the shadow pass ignores camera raster state (scissor, culling, depth writes, blending)
+- the shadow pass ignores camera raster state (scissor, culling, depth writes, blending) and camera clip planes
+- the shadow map agrees with exact directional ray casts from receiver points toward the light
 - shadow-map size/filter options
 - debug outputs for depth, normals, shadow, and AO
 - viewport transform

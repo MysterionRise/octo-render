@@ -39,7 +39,7 @@ Workspace root package `octo-render`:
 
 ## Conventions
 
-- **Light direction**: `RenderOptions::light_dir` and `--light` give the direction *toward* the light in normalized scene space (default `DEFAULT_LIGHT_DIR`, 1,1,1). `render_model` rotates it into eye space once for shading, and renders the shadow map from `light_dir * 3`, so diffuse, specular, and shadows always agree. Built-in shaders take the eye-space light.
+- **Light direction**: `RenderOptions::light_dir` and `--light` give the direction *toward* the light in normalized scene space (default `DEFAULT_LIGHT_DIR`, 1,1,1). `render_model` rotates it into eye space once for shading, and renders the shadow map with an orthographic camera along it (half-extent 2.05, its own near/far planes, ~32 depth units per scene unit), so diffuse, specular, and shadows always agree. Built-in shaders take the eye-space light.
 - **Normals** point outward. `Model::face_normal` assumes counter-clockwise winding (the OBJ convention) and only falls back to +Z for zero-area faces. `Model::load` generates smooth normals for corners without `vn` (crease angle `DEFAULT_CREASE_ANGLE_DEG`, 60°); flat mode always uses face normals.
 - **Depth**: larger z is closer. The z-buffer clears to `-inf` and the depth test passes when `z > current`.
 - **No lighting discards**: unlit fragments shade to ambient (or black) and still write depth, so they occlude what is behind them.

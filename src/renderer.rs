@@ -18,6 +18,22 @@ pub const DEFAULT_LIGHT_DIR: Vec3 = Vec3::new(1.0, 1.0, 1.0);
 /// Fraction of diffuse light kept where the shadow map reports full occlusion.
 const SHADOWED_DIFFUSE: f32 = 0.35;
 
+/// Radius of the normalized scene: `build_transforms` scales every model so its
+/// bounding box fits inside a sphere of this radius around the origin.
+const SCENE_RADIUS: f32 = 2.0;
+
+/// Orthographic shadow camera: half-width of its view box (a little wider than
+/// the scene), distance of its eye from the scene centre, and clip planes that
+/// keep the whole scene between them.
+const SHADOW_HALF_EXTENT: f32 = SCENE_RADIUS * 1.025;
+const SHADOW_EYE_DISTANCE: f32 = 4.0;
+const SHADOW_NEAR_PLANE: f32 = SHADOW_EYE_DISTANCE - SCENE_RADIUS * 1.25;
+const SHADOW_FAR_PLANE: f32 = SHADOW_EYE_DISTANCE + SCENE_RADIUS * 1.25;
+
+/// Shadow-map depth slope in NDC per scene unit. Through the 255-deep viewport
+/// that is ~32 depth units per scene unit, so the default bias of 4 is 1/8 unit.
+const SHADOW_DEPTH_PER_UNIT: f32 = 0.25;
+
 /// Default crease angle, in degrees, for vertex normals generated when an OBJ
 /// has no `vn`: faces meeting at a sharper angle keep a hard edge.
 pub const DEFAULT_CREASE_ANGLE_DEG: f32 = 60.0;
@@ -2284,6 +2300,10 @@ struct RenderTransforms {
     light_clip_to_screen: Mat4,
     /// Eye-space direction toward the light, used by every lit shader.
     light_dir_view: Vec3,
+    /// Clip planes of the pass these transforms drive, as distances in front
+    /// of its eye. The camera and the shadow camera each have their own.
+    near_plane: f32,
+    far_plane: f32,
 }
 
 pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
@@ -2317,7 +2337,6 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
             }
@@ -2355,7 +2374,6 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
             }
@@ -2407,7 +2425,6 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
             }
@@ -2420,13 +2437,12 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
             }
             RenderMode::Shadow | RenderMode::Ssao => {
                 let shadow_zbuffer =
-                    render_shadow_map(model, &transforms, shadow_width, shadow_height, options);
+                    render_shadow_map(model, &transforms, shadow_width, shadow_height);
                 if options.debug_outputs {
                     debug.shadow = Some(zbuffer_to_image(
                         &shadow_zbuffer,
@@ -2453,7 +2469,6 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
 
@@ -2511,7 +2526,7 @@ fn build_transforms(
         max: Vec3::splat(1.0),
     });
     let model_center = bounds.center();
-    let model_scale = 2.0 / bounds.radius();
+    let model_scale = SCENE_RADIUS / bounds.radius();
     let model_matrix =
         Mat4::from_scale(Vec3::splat(model_scale)) * Mat4::from_translation(-model_center);
 
@@ -2537,18 +2552,12 @@ fn build_transforms(
 
     let light_dir = safe_normal(options.light_dir, DEFAULT_LIGHT_DIR.normalize());
     let light_dir_view = safe_normal(transform_vector(&view, light_dir), Vec3::Z);
-    let light_eye = light_dir * 3.0;
-    let light_view = lookat(light_eye, center, up);
-    let light_proj = projection(-1.0 / light_eye.distance(center).max(1.0));
-    let shadow_margin_x = shadow_width as f32 * 0.08;
-    let shadow_margin_y = shadow_height as f32 * 0.08;
-    let shadow_vp = viewport(
-        shadow_margin_x,
-        shadow_margin_y,
-        shadow_width as f32 - shadow_margin_x * 2.0,
-        shadow_height as f32 - shadow_margin_y * 2.0,
-        255.0,
-    );
+    // A directional light is an orthographic camera looking along -light_dir.
+    // The scene fits inside SCENE_RADIUS, so the shadow box covers it from any
+    // direction and every shadow ray is parallel to the shading light.
+    let light_view = lookat(light_dir * SHADOW_EYE_DISTANCE, center, up);
+    let light_proj = orthographic_light_projection(SHADOW_HALF_EXTENT, SHADOW_EYE_DISTANCE);
+    let shadow_vp = viewport(0.0, 0.0, shadow_width as f32, shadow_height as f32, 255.0);
     let light_view_to_clip = light_proj;
     let light_clip_to_screen = shadow_vp;
     let light_transform = light_clip_to_screen * light_view_to_clip * light_view * model_matrix;
@@ -2563,7 +2572,22 @@ fn build_transforms(
         light_view_to_clip,
         light_clip_to_screen,
         light_dir_view,
+        near_plane: options.near_plane,
+        far_plane: options.far_plane,
     }
+}
+
+/// Orthographic projection for the shadow camera. `w` stays 1, x and y map the
+/// `half_extent` box onto [-1, 1], and depth is linear in view z and centred on
+/// the scene centre at `eye_distance`. Larger depth is closer to the light, as
+/// in the camera pass.
+fn orthographic_light_projection(half_extent: f32, eye_distance: f32) -> Mat4 {
+    Mat4::from_cols(
+        Vec4::new(1.0 / half_extent, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 1.0 / half_extent, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, SHADOW_DEPTH_PER_UNIT, 0.0),
+        Vec4::new(0.0, 0.0, eye_distance * SHADOW_DEPTH_PER_UNIT, 1.0),
+    )
 }
 
 fn render_wireframe(
@@ -2579,8 +2603,8 @@ fn render_wireframe(
             model,
             transforms,
             face_idx,
-            options.near_plane,
-            options.far_plane,
+            transforms.near_plane,
+            transforms.far_plane,
             options.render_state,
             &mut primitives,
         ) {
@@ -2618,8 +2642,8 @@ fn render_flat(
             model,
             transforms,
             face_idx,
-            options.near_plane,
-            options.far_plane,
+            transforms.near_plane,
+            transforms.far_plane,
             options.render_state,
             &mut primitives,
         ) {
@@ -2671,7 +2695,6 @@ fn render_shader<S: Shader>(
     shader: &mut S,
     zbuffer: &mut [f32],
     image: &mut RgbImage,
-    options: &RenderOptions,
     render_state: RenderState,
 ) {
     let mut primitives = Vec::new();
@@ -2682,8 +2705,8 @@ fn render_shader<S: Shader>(
             model,
             transforms,
             face_idx,
-            options.near_plane,
-            options.far_plane,
+            transforms.near_plane,
+            transforms.far_plane,
             render_state,
             &mut primitives,
         ) {
@@ -3108,7 +3131,6 @@ fn render_shadow_map(
     transforms: &RenderTransforms,
     width: u32,
     height: u32,
-    options: &RenderOptions,
 ) -> Vec<f32> {
     let shadow_state = shadow_pass_state();
     let mut shadow_image = ImageBuffer::new(width, height);
@@ -3127,6 +3149,9 @@ fn render_shadow_map(
         light_view_to_clip: transforms.light_view_to_clip,
         light_clip_to_screen: transforms.light_clip_to_screen,
         light_dir_view: transforms.light_dir_view,
+        // The light's own clip planes: the camera's must not cut the shadow map.
+        near_plane: SHADOW_NEAR_PLANE,
+        far_plane: SHADOW_FAR_PLANE,
     };
     render_shader(
         model,
@@ -3134,7 +3159,6 @@ fn render_shadow_map(
         &mut depth_shader,
         &mut shadow_zbuffer,
         &mut shadow_image,
-        options,
         shadow_state,
     );
     shadow_zbuffer
@@ -3176,7 +3200,6 @@ fn render_normal_debug(
         &mut shader,
         &mut zbuffer,
         &mut image,
-        options,
         options.render_state,
     );
     image
@@ -4215,6 +4238,100 @@ map_Bump normal-checker.ppm
         });
         assert!(reference.pixels().any(|p| p[0] > 0));
         assert_eq!(reference.as_raw(), restricted.as_raw());
+    }
+
+    #[test]
+    fn shadow_map_ignores_camera_clip_planes() {
+        let render = |near_plane: f32, far_plane: f32| {
+            let options = RenderOptions {
+                width: 64,
+                height: 64,
+                mode: RenderMode::Shadow,
+                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                light_dir: Vec3::new(1.0, 0.6, 1.0),
+                debug_outputs: true,
+                near_plane,
+                far_plane,
+                ..RenderOptions::default()
+            };
+            render_model(&occluder_model(), &options)
+                .debug
+                .shadow
+                .unwrap()
+        };
+        // Camera planes that cut through the scene must not cut the shadow map.
+        let reference = render(0.01, 1000.0);
+        assert_eq!(reference.as_raw(), render(2.5, 1000.0).as_raw());
+        assert_eq!(reference.as_raw(), render(0.01, 2.5).as_raw());
+    }
+
+    /// Signed distances from `p` to the three edge lines of a counter-clockwise
+    /// triangle in the xy plane; all positive means inside.
+    fn edge_distances(p: Vec3, triangle: [Vec3; 3]) -> [f32; 3] {
+        std::array::from_fn(|i| {
+            let a = triangle[i].truncate();
+            let b = triangle[(i + 1) % 3].truncate();
+            let edge = b - a;
+            edge.perp_dot(p.truncate() - a) / edge.length()
+        })
+    }
+
+    #[test]
+    fn shadow_map_matches_directional_light_ray_casts() {
+        let model = occluder_model();
+        let options = RenderOptions {
+            width: 128,
+            height: 128,
+            mode: RenderMode::Shadow,
+            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            light_dir: Vec3::new(1.0, 0.6, 1.0),
+            shadow: ShadowOptions {
+                size: 512,
+                ..ShadowOptions::default()
+            },
+            ..RenderOptions::default()
+        };
+        let (shadow_width, shadow_height) = shadow_dimensions(&options, 128, 128);
+        let transforms = build_transforms(&model, &options, 128, 128, shadow_width, shadow_height);
+        let shadow_map = render_shadow_map(&model, &transforms, shadow_width, shadow_height);
+
+        let receiver = [model.vertices[0], model.vertices[1], model.vertices[2]];
+        let occluder = [model.vertices[3], model.vertices[4], model.vertices[5]];
+        let light = options.light_dir.normalize();
+        let margin = 0.05;
+        let (mut lit, mut shadowed) = (0, 0);
+        for i in 0..=40 {
+            for j in 0..=40 {
+                let p = Vec3::new(-1.0 + i as f32 / 20.0, -1.0 + j as f32 / 20.0, 0.0);
+                if edge_distances(p, receiver).iter().any(|&d| d < margin) {
+                    continue;
+                }
+                // Follow the ray toward the light up to the occluder's plane.
+                let hit = p + light * (occluder[0].z / light.z);
+                let distances = edge_distances(hit, occluder);
+                let occluded = if distances.iter().all(|&d| d > margin) {
+                    true
+                } else if distances.iter().any(|&d| d < -margin) {
+                    false
+                } else {
+                    continue;
+                };
+                let visibility = sample_shadow(
+                    &shadow_map,
+                    shadow_width,
+                    shadow_height,
+                    transform_point(&transforms.light_transform, p),
+                    options.shadow,
+                );
+                assert_eq!(visibility < 0.5, occluded, "receiver point {p:?}");
+                if occluded {
+                    shadowed += 1;
+                } else {
+                    lit += 1;
+                }
+            }
+        }
+        assert!(shadowed > 20 && lit > 200, "shadowed {shadowed}, lit {lit}");
     }
 
     #[test]

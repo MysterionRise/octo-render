@@ -33,7 +33,7 @@ flowchart LR
 - **Fragment shading:** render modes include wireframe, flat, Gouraud, checker/file texture, normal map, normal debug, shadow, and SSAO. Lit modes combine a Lambert diffuse term with a Blinn-Phong specular term driven by the material's `specular` and `shininess` (MTL `Ks` and `Ns`).
 - **Blending:** color writes can bypass blending, use source-over alpha, or use additive blending.
 - **Texture sampling:** repeat/clamp wrapping, nearest filtering, bilinear filtering, and a simplified mipmap LOD path are implemented in CPU code.
-- **Shadow mapping:** the renderer builds a light-space depth map with a fixed depth-only raster state, then samples that map during the main pass with configurable bias, resolution, and optional 3x3 PCF.
+- **Shadow mapping:** the renderer builds a light-space depth map from an orthographic camera along the light direction, with a fixed depth-only raster state and its own clip planes, then samples that map during the main pass with configurable bias, resolution, and optional 3x3 PCF.
 - **Debug outputs:** depth, normal, shadow-map, and AO maps can be written alongside the final render.
 
 ## Render State
@@ -60,7 +60,7 @@ This matters most for textured, normal-mapped, and per-fragment shadowed shading
 
 ## Lighting Conventions
 
-One vector, `RenderOptions::light_dir` (`--light`), describes the light: the direction *toward* the light in normalized scene space. `render_model` rotates it into eye space once per frame for shading, and places the shadow-map camera at `light_dir * 3`. Normals point outward: `Model::face_normal` assumes counter-clockwise winding, the OBJ convention.
+One vector, `RenderOptions::light_dir` (`--light`), describes the light: the direction *toward* the light in normalized scene space. `render_model` rotates it into eye space once per frame for shading, and points an orthographic shadow camera along it. Normals point outward: `Model::face_normal` assumes counter-clockwise winding, the OBJ convention.
 
 An earlier version computed face normals with the opposite cross product, so they pointed inward. Lambert's term still produced plausible shading, because the inward normal and the light vector were both flipped. The shadow camera, however, sat on the opposite side of the model from the light that shaded it, so every lit surface was reported as occluded. The shadow render came out mostly dark with a stray bright crescent along the shadow camera's silhouette. Models with explicit outward `vn` normals followed a third convention again. Making face normals outward and defining the light vector once fixed all three cases together.
 
@@ -74,9 +74,17 @@ Each face is classified before it reaches the clipper. The sign of `det[x y w]` 
 
 Culled faces skip clipping, lighting, and vertex shading. Faces entirely inside the frustum also skip the clipper: it would return them unchanged, since each fully-inside plane pass only rotates the vertex list and six passes restore it. Faces entirely outside one plane are dropped without clipping. Tests pin culled renders bit for bit, and a seeded property test checks the classifier against the screen-space reference on thousands of random triangles, including ones that cross behind the eye.
 
+## Shadow Camera
+
+The light is directional, so the shadow camera is orthographic: it looks along `-light_dir` from 4 units out, and its view box has a half-width of 2.05. Every model is normalized to fit inside radius 2 of the origin, so the box covers the scene from any direction, and every shadow ray is parallel to the light that shades the surface.
+
+An earlier version used a perspective camera at `light_dir * 3`. That is a point light, so shadow directions drifted up to about 33° from the shading direction away from the scene centre, and its 8% viewport margin wasted part of the shadow map.
+
+Shadow depth is linear: 0.25 NDC per scene unit, about 32 depth units through the 255-deep viewport. The default `--shadow-bias` of 4 therefore means 1/8 of a scene unit everywhere, instead of varying with distance from the light. Tests check the shadow map against exact ray casts from receiver points toward the light.
+
 ## Shadow Pass State
 
-The light-space depth pass uses a fixed raster state: depth test and write on, no culling, no scissor, colour writes off, blending off. It does not inherit the camera pass's `RenderState`, so flags like `--scissor` or `--depth-write off` cannot crop or empty the shadow map.
+The light-space depth pass uses a fixed raster state: depth test and write on, no culling, no scissor, colour writes off, blending off. It also has its own clip planes, so the camera's near and far planes never clip the shadow map. It does not inherit the camera pass's `RenderState`, so flags like `--scissor` or `--depth-write off` cannot crop or empty the shadow map.
 
 ## Attribute-Preserving Frustum Clipping
 
