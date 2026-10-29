@@ -15,6 +15,12 @@ const DEFAULT_BACKGROUND: Rgb<u8> = Rgb([18, 20, 24]);
 /// so Lambert's term is `max(dot(n, l), 0)` with an outward normal `n`.
 pub const DEFAULT_LIGHT_DIR: Vec3 = Vec3::new(1.0, 1.0, 1.0);
 
+/// Default camera eye, in normalized scene space, looking at the origin.
+pub const DEFAULT_CAMERA_EYE: Vec3 = Vec3::new(0.0, 0.5, 6.0);
+
+/// Default vertical field of view of the camera, in degrees.
+pub const DEFAULT_FOV_Y_DEGREES: f32 = 45.0;
+
 /// Fraction of diffuse light kept where the shadow map reports full occlusion.
 const SHADOWED_DIFFUSE: f32 = 0.35;
 
@@ -929,10 +935,32 @@ pub fn viewport(x: f32, y: f32, w: f32, h: f32, depth: f32) -> Mat4 {
     )
 }
 
+/// tinyrenderer's lesson-4 projection: `w = 1 + coeff * z`, with `z` passed
+/// through. It keeps the scale of the `z = 0` plane fixed, so it only puts the
+/// centre of projection at the eye when view space is centred on the scene.
+/// `render_model` uses [`perspective`] instead.
 pub fn projection(coeff: f32) -> Mat4 {
     let mut m = Mat4::IDENTITY;
     *m.col_mut(2) = Vec4::new(0.0, 0.0, 1.0, coeff);
     m
+}
+
+/// OpenGL-style perspective projection with reversed-Z depth and an infinite
+/// far plane: the same matrix as glam's `Mat4::perspective_infinite_reverse_rh`.
+///
+/// The eye sits at the view-space origin looking down -Z, and clip `w` is the
+/// distance in front of it, so the centre of projection is the eye itself.
+/// Depth is `z_ndc = depth_scale / distance`: larger is closer, matching the
+/// z-buffer's `z > current` test, and it is affine in screen space, so linear
+/// interpolation across a triangle stays exact.
+pub fn perspective(fov_y_radians: f32, aspect: f32, depth_scale: f32) -> Mat4 {
+    let f = 1.0 / (0.5 * fov_y_radians).tan();
+    Mat4::from_cols(
+        Vec4::new(f / aspect, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, f, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, 0.0, -1.0),
+        Vec4::new(0.0, 0.0, depth_scale, 0.0),
+    )
 }
 
 pub fn lookat(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
@@ -2224,7 +2252,10 @@ pub struct RenderOptions {
     pub width: u32,
     pub height: u32,
     pub mode: RenderMode,
+    /// Camera eye in normalized scene space; `None` uses [`DEFAULT_CAMERA_EYE`].
     pub camera_eye: Option<Vec3>,
+    /// Vertical field of view of the camera, in degrees.
+    pub fov_y_degrees: f32,
     /// Direction toward the light in normalized scene space. Shading and the
     /// shadow map both derive their light from this one vector.
     pub light_dir: Vec3,
@@ -2248,6 +2279,7 @@ impl Default for RenderOptions {
             height: 1024,
             mode: RenderMode::Shadow,
             camera_eye: None,
+            fov_y_degrees: DEFAULT_FOV_Y_DEGREES,
             light_dir: DEFAULT_LIGHT_DIR.normalize(),
             debug_outputs: false,
             render_state: RenderState::default(),
@@ -2530,21 +2562,20 @@ fn build_transforms(
     let model_matrix =
         Mat4::from_scale(Vec3::splat(model_scale)) * Mat4::from_translation(-model_center);
 
-    let eye = options.camera_eye.unwrap_or(Vec3::new(0.0, 0.25, 3.0));
+    let eye = options.camera_eye.unwrap_or(DEFAULT_CAMERA_EYE);
     let center = Vec3::ZERO;
     let up = Vec3::Y;
     let view = lookat(eye, center, up);
-    let distance = eye.distance(center).max(1.0);
-    let proj = projection(-1.0 / distance);
-    let margin_x = width as f32 * 0.08;
-    let margin_y = height as f32 * 0.08;
-    let vp = viewport(
-        margin_x,
-        margin_y,
-        width as f32 - margin_x * 2.0,
-        height as f32 - margin_y * 2.0,
-        255.0,
+    let distance = eye.distance(center).max(EPSILON);
+    let proj = perspective(
+        options.fov_y_degrees.clamp(1.0, 179.0).to_radians(),
+        width as f32 / height as f32,
+        // ~32 depth units per scene unit at the scene centre for any camera
+        // distance, so depth thresholds such as SSAO's keep their meaning.
+        distance * distance / 4.0,
     );
+    // NDC [-1, 1] maps to the whole frame, so clipping happens at its edges.
+    let vp = viewport(0.0, 0.0, width as f32, height as f32, 255.0);
     let view_to_clip = proj;
     let clip_to_screen = vp;
     let transform = clip_to_screen * view_to_clip * view * model_matrix;
@@ -3466,6 +3497,10 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Straight-on test camera. At the default field of view a model of the
+    /// normalized scene's radius fills most of the frame.
+    const TEST_EYE: Vec3 = Vec3::new(0.0, 0.0, 6.0);
+
     fn temp_obj(contents: &str) -> String {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3855,7 +3890,7 @@ map_Bump normal-checker.ppm
             width: 48,
             height: 48,
             mode: RenderMode::Ssao,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(1.0, 0.6, 1.0),
             ..RenderOptions::default()
         };
@@ -4081,7 +4116,7 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Flat,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             render_state: RenderState {
                 clear_color: clear,
@@ -4112,7 +4147,7 @@ map_Bump normal-checker.ppm
             width: 32,
             height: 32,
             mode: RenderMode::Flat,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             render_state: RenderState {
                 clear_color: clear,
@@ -4132,7 +4167,7 @@ map_Bump normal-checker.ppm
             width: 32,
             height: 32,
             mode: RenderMode::NormalMap,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             normal_map: Some(neutral_normal_map(2)),
             ..RenderOptions::default()
@@ -4151,7 +4186,7 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Shadow,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             shadow: ShadowOptions {
@@ -4172,7 +4207,7 @@ map_Bump normal-checker.ppm
                 width: 64,
                 height: 64,
                 mode: RenderMode::Shadow,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(1.0, 0.6, 1.0),
                 shadow: ShadowOptions {
                     size: 64,
@@ -4204,7 +4239,7 @@ map_Bump normal-checker.ppm
                 width: 64,
                 height: 64,
                 mode: RenderMode::Shadow,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(1.0, 0.6, 1.0),
                 debug_outputs: true,
                 render_state,
@@ -4241,13 +4276,129 @@ map_Bump normal-checker.ppm
     }
 
     #[test]
+    fn perspective_matches_glam_reverse_z_infinite() {
+        let ours = perspective(0.8, 1.5, 2.25);
+        let reference = Mat4::perspective_infinite_reverse_rh(0.8, 1.5, 2.25);
+        assert!(
+            ours.abs_diff_eq(reference, 1e-6),
+            "{ours:?} vs {reference:?}"
+        );
+    }
+
+    fn camera_transforms(eye: Vec3, width: u32, height: u32) -> RenderTransforms {
+        let options = RenderOptions {
+            width,
+            height,
+            camera_eye: Some(eye),
+            ..RenderOptions::default()
+        };
+        build_transforms(&cube_model(true), &options, width, height, width, height)
+    }
+
+    /// The cube fixture's model matrix is a uniform scale about the origin.
+    fn cube_scene_to_model(p: Vec3) -> Vec3 {
+        p * (3.0f32.sqrt() / SCENE_RADIUS)
+    }
+
+    fn project_scene_point(transforms: &RenderTransforms, p: Vec3) -> Vec2 {
+        transform_point(&transforms.transform, cube_scene_to_model(p)).truncate()
+    }
+
+    /// The old camera (tinyrenderer's fixed-scale projection with the eye at
+    /// the view origin and an 8% viewport margin) was a pinhole at twice the
+    /// given eye distance, with `cot(fov / 2) = 0.84 * |eye|`. The perspective
+    /// camera must reproduce the old default image bit for bit at those
+    /// settings. The fixture is a frozen render from the old camera: it is
+    /// compared directly and never re-blessed.
+    #[test]
+    fn perspective_camera_reproduces_the_legacy_projection() {
+        let model = Model::load("resources/teapot.obj").unwrap();
+        let legacy_eye = Vec3::new(0.0, 0.25, 3.0);
+        let options = RenderOptions {
+            width: 64,
+            height: 64,
+            mode: RenderMode::Flat,
+            camera_eye: Some(legacy_eye * 2.0),
+            fov_y_degrees: (2.0 * (1.0 / (0.84 * legacy_eye.length())).atan()).to_degrees(),
+            light_dir: DEFAULT_LIGHT_DIR,
+            ..RenderOptions::default()
+        };
+        let output = render_model(&model, &options);
+        let legacy = image::open(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/legacy-camera-flat-teapot-64.png"),
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_images_close(&output.image, &legacy, 0);
+    }
+
+    #[test]
+    fn moving_the_camera_closer_enlarges_the_model() {
+        let width_at = |distance: f32| {
+            let transforms = camera_transforms(Vec3::new(0.0, 0.0, distance), 256, 256);
+            let left = project_scene_point(&transforms, Vec3::new(-0.5, 0.0, 0.0));
+            let right = project_scene_point(&transforms, Vec3::new(0.5, 0.0, 0.0));
+            (right - left).length()
+        };
+        let ratio = width_at(4.0) / width_at(8.0);
+        assert!((ratio - 2.0).abs() < 1e-3, "ratio {ratio}");
+    }
+
+    #[test]
+    fn centre_of_projection_is_the_camera_eye() {
+        let eye = Vec3::new(1.0, 2.0, 5.0);
+        let transforms = camera_transforms(eye, 256, 256);
+        let ray = (Vec3::new(0.3, -0.2, 0.0) - eye).normalize();
+        let pixels = [1.0, 2.0, 5.0].map(|t| project_scene_point(&transforms, eye + ray * t));
+        for pixel in &pixels[1..] {
+            assert!((*pixel - pixels[0]).length() < 1e-2, "{pixels:?}");
+        }
+    }
+
+    #[test]
+    fn non_square_frames_keep_square_pixels() {
+        let transforms = camera_transforms(TEST_EYE, 200, 100);
+        let width = (project_scene_point(&transforms, Vec3::new(0.5, 0.0, 0.0))
+            - project_scene_point(&transforms, Vec3::new(-0.5, 0.0, 0.0)))
+        .length();
+        let height = (project_scene_point(&transforms, Vec3::new(0.0, 0.5, 0.0))
+            - project_scene_point(&transforms, Vec3::new(0.0, -0.5, 0.0)))
+        .length();
+        assert!((width - height).abs() < 1e-3, "{width} x {height}");
+    }
+
+    #[test]
+    fn rasterization_reaches_the_frame_edges() {
+        // Close to a large triangle, the view is covered edge to edge.
+        let options = RenderOptions {
+            width: 48,
+            height: 32,
+            mode: RenderMode::Flat,
+            camera_eye: Some(Vec3::new(0.0, 0.0, 0.5)),
+            light_dir: Vec3::Z,
+            ..RenderOptions::default()
+        };
+        let output = render_model(&tiny_model(), &options);
+        for y in 0..32 {
+            for x in [0, 47] {
+                assert_ne!(
+                    output.image.get_pixel(x, y),
+                    &DEFAULT_BACKGROUND,
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn shadow_map_ignores_camera_clip_planes() {
         let render = |near_plane: f32, far_plane: f32| {
             let options = RenderOptions {
                 width: 64,
                 height: 64,
                 mode: RenderMode::Shadow,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(1.0, 0.6, 1.0),
                 debug_outputs: true,
                 near_plane,
@@ -4283,7 +4434,7 @@ map_Bump normal-checker.ppm
             width: 128,
             height: 128,
             mode: RenderMode::Shadow,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(1.0, 0.6, 1.0),
             shadow: ShadowOptions {
                 size: 512,
@@ -4341,7 +4492,7 @@ map_Bump normal-checker.ppm
                 width: 32,
                 height: 32,
                 mode: RenderMode::Gouraud,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(0.0, 0.0, 1.0),
                 material: Material {
                     base_color: Rgb([100, 100, 100]),
@@ -4390,7 +4541,7 @@ map_Bump normal-checker.ppm
                 width: 32,
                 height: 32,
                 mode,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(0.0, 0.0, -1.0),
                 ..RenderOptions::default()
             };
@@ -4568,7 +4719,7 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Ssao,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             ..RenderOptions::default()
@@ -4597,14 +4748,14 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Flat,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             ..RenderOptions::default()
         };
         let output = render_model(&tiny_model(), &options);
         assert_eq!(output.image.dimensions(), (64, 64));
-        assert_eq!(image_checksum(&output.image), 2_577_244);
+        assert_eq!(image_checksum(&output.image), 2_416_368);
         assert!(output.debug.depth.is_some());
         assert!(output.debug.normals.is_some());
     }
@@ -4680,7 +4831,7 @@ map_Bump normal-checker.ppm
         let options = RenderOptions {
             width: 128,
             height: 128,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             ..RenderOptions::default()
         };
         let transforms = build_transforms(&cube, &options, 128, 128, 128, 128);
@@ -4751,7 +4902,7 @@ map_Bump normal-checker.ppm
                     width: 64,
                     height: 64,
                     mode,
-                    camera_eye: Some(Vec3::new(0.0, 0.25, 3.0)),
+                    camera_eye: Some(DEFAULT_CAMERA_EYE),
                     render_state: RenderState {
                         cull_mode,
                         ..RenderState::default()
@@ -4769,10 +4920,10 @@ map_Bump normal-checker.ppm
     }
 
     const CULLED_TEAPOT_CHECKSUMS: [(u64, u64); 4] = [
-        (1_506_840, 9_950_000_386_150_388_727),
-        (937_821, 14_738_515_683_572_321_133),
-        (1_508_325, 9_950_000_386_150_388_727),
-        (939_097, 14_738_515_683_572_321_133),
+        (1_476_941, 13_238_127_573_834_299_401),
+        (946_631, 4_147_875_905_691_957_963),
+        (1_475_698, 13_238_127_573_834_299_401),
+        (947_016, 4_147_875_905_691_957_963),
     ];
 
     /// Order-sensitive hash of the exact depth bits.
@@ -4790,7 +4941,7 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Flat,
-            camera_eye: Some(Vec3::new(0.0, 0.25, 3.0)),
+            camera_eye: Some(DEFAULT_CAMERA_EYE),
             light_dir: DEFAULT_LIGHT_DIR,
             debug_outputs: false,
             ..RenderOptions::default()

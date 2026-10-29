@@ -4,7 +4,7 @@ use renderer::{
     build_mipmaps, render_model, BlendMode, CullMode, DepthState, FillMode, FrontFace, Material,
     Model, ObjLoadOptions, ObjMaterial, RenderMode, RenderOptions, RenderState, ScissorRect,
     ShadowFilter, ShadowOptions, TextureFilter, TextureSampler, TextureWrap,
-    DEFAULT_CREASE_ANGLE_DEG, DEFAULT_LIGHT_DIR,
+    DEFAULT_CREASE_ANGLE_DEG, DEFAULT_FOV_Y_DEGREES, DEFAULT_LIGHT_DIR,
 };
 use std::env;
 use std::fs;
@@ -21,6 +21,9 @@ struct Cli {
     shader: RenderMode,
     output: PathBuf,
     camera: Option<Vec3>,
+    fov: f32,
+    near: f32,
+    far: f32,
     light: Vec3,
     debug_dir: Option<PathBuf>,
     cull_mode: CullMode,
@@ -63,6 +66,9 @@ impl Default for Cli {
             shader: RenderMode::Shadow,
             output: PathBuf::from("renders/teapot-shadow.png"),
             camera: None,
+            fov: DEFAULT_FOV_Y_DEGREES,
+            near: 0.01,
+            far: 1000.0,
             light: DEFAULT_LIGHT_DIR,
             debug_dir: None,
             cull_mode: CullMode::Off,
@@ -140,6 +146,7 @@ fn run() -> Result<(), String> {
         height: cli.height,
         mode: cli.shader,
         camera_eye: cli.camera,
+        fov_y_degrees: cli.fov,
         light_dir: cli.light,
         debug_outputs: cli.debug_dir.is_some(),
         render_state: RenderState {
@@ -166,8 +173,8 @@ fn run() -> Result<(), String> {
         },
         material,
         shadow: cli.shadow,
-        near_plane: 0.01,
-        far_plane: 1000.0,
+        near_plane: cli.near,
+        far_plane: cli.far,
     };
 
     let started = Instant::now();
@@ -302,6 +309,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--shader" => cli.shader = RenderMode::from_str(&value("--shader")?)?,
             "--output" => cli.output = PathBuf::from(value("--output")?),
             "--camera" => cli.camera = Some(parse_vec3(&value("--camera")?, "--camera")?),
+            "--fov" => cli.fov = parse_f32_arg(&value("--fov")?, "--fov")?,
+            "--near" => cli.near = parse_f32_arg(&value("--near")?, "--near")?,
+            "--far" => cli.far = parse_f32_arg(&value("--far")?, "--far")?,
             "--light" => cli.light = parse_vec3(&value("--light")?, "--light")?,
             "--crease-angle" => cli.crease_angle = parse_crease_angle(&value("--crease-angle")?)?,
             "--debug-dir" => cli.debug_dir = Some(PathBuf::from(value("--debug-dir")?)),
@@ -381,6 +391,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     }
     if cli.light.length_squared() < 1e-6 {
         return Err("--light must not be the zero vector".to_string());
+    }
+    if !(cli.fov > 0.0 && cli.fov < 180.0) {
+        return Err("--fov must be between 0 and 180 degrees".to_string());
+    }
+    if !(cli.near > 0.0 && cli.far > cli.near) {
+        return Err("--near must be > 0 and --far must be greater than --near".to_string());
     }
     if cli.material.ambient < 0.0
         || cli.material.diffuse < 0.0
@@ -522,7 +538,10 @@ Options:
   --height <px>        Output height [default: 1024]
   --shader <mode>      One of: {}
   --output <path>      Output image path [default: renders/teapot-shadow.png]
-  --camera <x,y,z>     Camera eye in normalized scene space [default: 0,0.25,3]
+  --camera <x,y,z>     Camera eye in normalized scene space [default: 0,0.5,6]
+  --fov <deg>          Vertical field of view [default: 45]
+  --near <z>           Near clip plane, distance from the eye [default: 0.01]
+  --far <z>            Far clip plane, distance from the eye [default: 1000]
   --light <x,y,z>      Direction toward the light, scene space [default: 1,1,1]
   --crease-angle <deg|off> Smooth normals for meshes without vn; edges sharper
                        than this stay hard, off keeps facets [default: 60]
@@ -613,6 +632,12 @@ mod tests {
                 "pcf",
                 "--crease-angle",
                 "30",
+                "--fov",
+                "60",
+                "--near",
+                "0.5",
+                "--far",
+                "20",
             ]
             .into_iter()
             .map(String::from),
@@ -621,6 +646,9 @@ mod tests {
 
         assert_eq!(cli.shader, RenderMode::Texture);
         assert_eq!(cli.crease_angle, Some(30.0));
+        assert_eq!((cli.fov, cli.near, cli.far), (60.0, 0.5, 20.0));
+        let bad_planes = ["--near", "2", "--far", "1"].into_iter().map(String::from);
+        assert!(parse_args(bad_planes).is_err());
         assert_eq!(parse_crease_angle("off"), Ok(None));
         assert_eq!(parse_crease_angle("0"), Ok(None));
         assert!(parse_crease_angle("200").is_err());

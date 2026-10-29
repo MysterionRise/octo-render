@@ -52,6 +52,14 @@ The CPU renderer exposes a small OpenGL-like render state:
 
 The defaults intentionally match the original renderer behavior: no culling, counter-clockwise front faces, depth test/write enabled, solid fill, no scissor, color writes enabled, blending off, repeat wrapping, and nearest filtering.
 
+## Camera And Projection
+
+The camera is an OpenGL-style perspective: `lookat` puts the eye at the view-space origin looking at the scene centre, and `perspective` maps a vertical field of view (default 45°) with the frame's aspect ratio. Clip `w` is the distance in front of the eye, so the eye is the centre of projection and moving `--camera` closer enlarges the model. The viewport maps NDC [-1, 1] onto the whole frame, so clipping happens at the frame edges.
+
+Depth is reversed-Z with an infinite far plane: `z_ndc = depth_scale / distance`, the same matrix as glam's `perspective_infinite_reverse_rh`. Larger values are closer, which matches the z-buffer's `-inf` clear and `z > current` test, and `1 / distance` is affine in screen space, so interpolating depth linearly across a triangle is exact. `depth_scale` is the squared eye-to-centre distance over 4, which keeps about 32 depth units per scene unit at the scene centre for any camera distance, so depth thresholds such as SSAO's keep their meaning. Near and far planes are distances from the eye (`--near`, `--far`), applied by the clipper in view space.
+
+An earlier version used tinyrenderer's lesson-4 matrix, `w = 1 - z / d`, while its look-at put the eye at the origin; tinyrenderer's look-at centres view space on the scene instead. The centre of projection therefore sat one camera-distance behind the eye: perspective was half as strong as requested, and the model's size never changed with distance. That version also ignored the aspect ratio, so non-square renders were stretched, and its 8% viewport margin made clipping happen inside the frame. A test shows the new camera reproduces the old default image exactly with the eye doubled and a 43.15° field of view.
+
 ## Perspective-Correct Interpolation
 
 The first version interpolated all fragment inputs directly in screen-space barycentric coordinates. That is acceptable for early rasterization lessons, but it is not what a perspective pipeline does for varyings such as UVs or normals. The current raster path weights barycentric coordinates by reciprocal clip-space `w`, then renormalizes the result before fragment shading.
@@ -124,7 +132,8 @@ The `wgpu` viewer exists separately because `wgpu` delegates rasterization to th
 ## Differences From Real OpenGL
 
 - No full programmable shader language; shaders are Rust structs implementing a trait.
-- Frustum clipping is implemented in the renderer's projection convention, but this is not a conformance-tested OpenGL clipper.
+- Frustum clipping covers all six planes, but this is not a conformance-tested OpenGL clipper.
+- The far plane is applied by the clipper only; reversed-Z depth itself has no far limit.
 - Mipmap selection uses a simplified screen-space estimate, not shader derivatives.
 - Blending has alpha and additive modes, but not arbitrary blend factors/equations.
 - No stencil buffer, multisampling, cubemaps, instancing, or uniform-buffer abstraction.

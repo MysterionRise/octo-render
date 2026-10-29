@@ -15,8 +15,8 @@ References:
 | Lesson 1: Bresenham line drawing | Implemented | `draw_line` plus line benchmark and tests |
 | Lesson 2: triangle rasterization and culling | Implemented and extended | Barycentric rasterizer, top-left fill rule, cull state, front-face winding |
 | Lesson 3: hidden-face removal / z-buffer | Implemented and extended | depth clear/test/write state and z-buffer tests |
-| Lesson 4: perspective projection | Implemented | model/view/projection transforms and perspective-correct varyings |
-| Lesson 5: moving camera | Implemented | CLI camera/light vectors and look-at transform |
+| Lesson 4: perspective projection | Implemented and changed | OpenGL-style vertical-FOV perspective with reversed-Z depth replaces the lesson's fixed-scale matrix, plus perspective-correct varyings |
+| Lesson 5: moving camera | Implemented and extended | look-at camera with `--camera`, `--fov`, `--near`, `--far`; the eye is the true centre of projection |
 | Lesson 6: shader abstraction | Implemented and extended | Rust `Shader` trait with flat, Gouraud, texture, normal debug, shadow modes, plus Blinn-Phong specular |
 | Lesson 6bis: tangent-space normal mapping | Implemented subset | normal-map mode with CLI or MTL normal-map texture |
 | Lesson 7: shadow mapping | Implemented and extended | configurable shadow size, bias, no-filter/PCF, debug shadow map |

@@ -132,12 +132,14 @@ fn bench_clipped_model_render(c: &mut Criterion) {
     let mut group = c.benchmark_group("software renderer clipping");
     group.sample_size(10);
 
-    for (name, near_plane) in [("unclipped", 0.01), ("near-plane-clipped", 1.8)] {
+    // The near plane at 4.8 from the eye cuts the scene at z = 1.2, through the
+    // fixture's raised corner.
+    for (name, near_plane) in [("unclipped", 0.01), ("near-plane-clipped", 4.8)] {
         let options = RenderOptions {
             width: 256,
             height: 256,
             mode: RenderMode::Gouraud,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(Vec3::new(0.0, 0.0, 6.0)),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             near_plane,
             ..RenderOptions::default()

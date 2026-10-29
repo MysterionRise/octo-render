@@ -71,11 +71,15 @@ wireframe, flat, gouraud, texture, normal-map, normal-debug, shadow, ssao
 Scene options:
 
 ```text
---camera x,y,z        camera eye in normalized scene space [default: 0,0.25,3]
+--camera x,y,z        camera eye in normalized scene space [default: 0,0.5,6]
+--fov deg             vertical field of view [default: 45]
+--near z, --far z     clip planes, distance from the eye [default: 0.01, 1000]
 --light x,y,z         direction toward the light, scene space [default: 1,1,1]
 ```
 
 The single `--light` vector drives diffuse shading, specular highlights, and the shadow-map camera, so shading and shadows always agree.
+
+`--camera` is a true eye position: moving it closer enlarges the model. Before October 2026 the projection's centre of projection sat at twice the given distance, so an older command with `--camera x,y,z` matches `--camera 2x,2y,2z --fov 43.15` today.
 
 OpenGL-style CPU render-state options:
 
@@ -160,7 +164,7 @@ Implemented CPU features:
 - MTL parser for `Ka`, `Kd`, `Ks`, `Ns`, alpha, diffuse maps, and normal-map keys
 - Fan triangulation for quads/ngons
 - Negative OBJ index support
-- Perspective projection and viewport mapping
+- OpenGL-style perspective camera: vertical field of view, aspect-correct, reversed-Z depth with an infinite far plane, and a viewport that clips at the frame edges
 - Attribute-preserving six-plane frustum clipping before viewport transform
 - Barycentric triangle rasterization
 - Deterministic top-left triangle fill rule with pixel-center sampling
@@ -182,7 +186,7 @@ Implemented CPU features:
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Vertex transform | Implemented | Rust matrix path for model/view/projection/viewport |
+| Vertex transform | Implemented | Rust matrix path for model/view/projection/viewport; vertical-FOV reversed-Z perspective |
 | Frustum clipping | Implemented | Six-plane clipping in the renderer's projection convention; emitted vertices preserve varyings |
 | Triangle rasterization | Implemented | Barycentric rasterizer with top-left fill rule and pixel-center sampling |
 | Depth buffer | Implemented | Clear depth, depth test, and depth write state |
@@ -252,6 +256,7 @@ Current test coverage includes:
 - shadow-map size/filter options
 - debug outputs for depth, normals, shadow, and AO
 - viewport transform
+- camera: the projection matches glam's reversed-Z infinite perspective, moving the eye closer enlarges the model, points along one eye ray land on one pixel, non-square frames keep square pixels, and rasterization reaches the frame edges
 - SSAO bounds and run-to-run determinism
 - perspective-correct interpolation
 - deterministic golden checksum and golden-image comparison
@@ -270,7 +275,6 @@ The CPU renderer is the OpenGL-style reimplementation. The GPU viewer is intenti
 - Frustum clipping is implemented for this renderer's projection path, but it is not a full OpenGL conformance clipper.
 - Mipmap LOD uses a simplified screen-space triangle estimate, not GLSL derivatives.
 - Normal-map mode consumes either a CLI normal-map texture or an MTL normal-map key; tangent generation remains minimal.
-- Moving `--camera` closer strengthens perspective but does not enlarge the model. The view matrix puts the eye at the view-space origin, while the projection places its centre of projection one camera-distance further back. Fixing this reframes every render and the clipping tests, so it is tracked as follow-up work.
 - The bundled textures are 4x4 PPMs, so the textured and mipmap gallery images show magnification; demonstrating minification needs a larger texture.
 - Shadow mapping supports configurable bias and simple 3x3 PCF, but not cascades or slope-scaled bias.
 - SSAO is deterministic and useful as a pipeline demonstration, but not physically based. It compares raw depth against a fixed threshold without using normals, so curved surfaces pick up faint per-triangle bands.

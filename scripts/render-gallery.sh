@@ -27,7 +27,7 @@ shiny=(--ambient 0.08 --specular 0.5 --shininess 48)
 # Hero: smooth normals, shadow map with PCF, and Blinn-Phong specular together.
 # SSAO is shown in its own cell: its depth-only occlusion bands curved surfaces.
 render --model resources/teapot.obj --width 1024 --height 768 --shader shadow \
-    "${key_light[@]}" "${shiny[@]}" --shadow-filter pcf \
+    "${key_light[@]}" "${shiny[@]}" --shadow-filter pcf --camera 0,0.4,4.4 \
     --output renders/hero.png --debug-dir renders/debug/hero
 
 # Pipeline stages, all under the default light.
@@ -52,9 +52,9 @@ render "${teapot[@]}" --shader shadow "${key_light[@]}" --shadow-filter pcf \
 render "${teapot[@]}" --shader ssao "${key_light[@]}" \
     --output renders/ssao-teapot.png --debug-dir renders/debug/teapot-ssao
 
-# Clipping: the camera sits beside the spout, so the near plane slices the
-# spout open and its interior shows through the cut.
-render "${teapot[@]}" --shader gouraud --camera 1.3,0.55,0.3 \
+# Clipping: a near plane 1.45 in front of a wide-angle camera beside the spout
+# slices the spout open, and its interior shows through the cut.
+render "${teapot[@]}" --shader gouraud --camera 2.6,1.1,0.6 --fov 79 --near 1.45 \
     --output renders/frustum-clipped-teapot.png
 
 # Blending, sampling, and MTL-driven materials on the material quad.
