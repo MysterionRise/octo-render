@@ -195,15 +195,15 @@ Implemented CPU features:
 
 ## Performance Snapshot
 
-Detailed methodology and Criterion results are in [docs/benchmarks.md](docs/benchmarks.md). Short version, rendering `resources/teapot.obj` at `128x128` under Criterion after the correctness sprint (Linux, Intel Xeon @ 2.10 GHz, single-threaded):
+Detailed methodology and Criterion results are in [docs/benchmarks.md](docs/benchmarks.md). Short version, rendering `resources/teapot.obj` at `128x128` under Criterion after culling moved ahead of clipping (Linux, Intel Xeon @ 2.10 GHz, single-threaded):
 
 | Mode | Triangles | Time | Throughput |
 | --- | ---: | ---: | ---: |
-| flat | 6,320 | 2.7943 ms | 2.26M triangles/sec |
-| Gouraud | 6,320 | 3.7267 ms | 1.70M triangles/sec |
-| shadow | 6,320 | 6.3679 ms | 0.99M triangles/sec |
+| flat | 6,320 | 1.4350 ms | 4.40M triangles/sec |
+| Gouraud | 6,320 | 2.0826 ms | 3.03M triangles/sec |
+| shadow | 6,320 | 3.6268 ms | 1.74M triangles/sec |
 
-These are not comparable with the July macOS numbers in the same doc. The doc's re-measurement section compares before and after on one machine and explains why flat mode got slower.
+These are not comparable with the July macOS numbers in the same doc. The doc's later sections compare before and after on one machine for each change.
 
 For more systematic measurements:
 
@@ -211,7 +211,7 @@ For more systematic measurements:
 cargo bench
 ```
 
-Benchmarks cover line drawing, z-buffered triangle rasterization, full-frame software renders, clipped vs unclipped triangles, texture filters, shadow filters, and resolution scaling.
+Benchmarks cover line drawing, z-buffered triangle rasterization, full-frame software renders, clipped vs unclipped triangles, back-face culling, texture filters, shadow filters, and resolution scaling.
 They also cover blending and mipmap sampling variants.
 
 ## Quality Gates

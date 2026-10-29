@@ -103,14 +103,29 @@ The correctness sprint changed what several benchmarks do, so it was measured as
 
 The flat regression is the honest cost of rendering every face. The old flat path skipped any face whose shading came out black before clipping it. Under the old inward-normal convention that was roughly half the teapot, and it is exactly what left holes behind back-lit surfaces. Gouraud and shadow modes discarded per fragment instead, after clipping and rasterization, so removing their discard costs little.
 
-Back-face culling is the lever for closed meshes, but it recovers less than the flat regression because culling runs after clipping. Best of 15 CLI runs of the flat teapot:
+At this point back-face culling recovered only part of the flat regression (best of 15 CLI runs: -19% at 128x128, -30% at 1024x1024), because culling ran in screen space after every face had been clipped.
 
-| Resolution | `--cull off` | `--cull back` | Change |
+## Culling Before Clipping (October 2026)
+
+The next change moved culling ahead of clipping (a clip-space winding test) and let triangles that lie inside every frustum plane skip the clipper entirely. That is nearly every triangle in a normal view, and the clipper allocated about nine `Vec`s per face. Output is bit-identical. Same machine and toolchain as above, measured back to back on 2026-10-29; "before" is commit `6a3f6be` (smooth normals), both runs use the same benchmark file.
+
+| Benchmark | Before | After | Change |
 | --- | ---: | ---: | ---: |
-| 128x128 | 2.78 ms | 2.26 ms | -19% |
-| 1024x1024 | 14.50 ms | 10.19 ms | -30% |
+| Full frame flat, 128x128 | 2.7455 ms | 1.4350 ms | -47.7% |
+| Full frame Gouraud, 128x128 | 3.6498 ms | 2.0826 ms | -42.9% |
+| Full frame shadow, 128x128 | 6.8944 ms | 3.6268 ms | -47.4% |
+| Flat, 512x512 | 5.5724 ms | 3.9073 ms | -29.9% |
+| Flat, 1024x1024 | 11.611 ms | 10.022 ms | -13.7% |
+| Culling: flat 128, `--cull off` | 2.7880 ms | 1.4010 ms | -49.7% |
+| Culling: flat 128, `--cull back` | 2.2143 ms | 0.6661 ms | -69.9% |
+| Culling: flat 1024, `--cull off` | 11.824 ms | 10.233 ms | -13.5% |
+| Culling: flat 1024, `--cull back` | 7.1685 ms | 5.7522 ms | -19.8% |
+| Clipping, unclipped | 305.7 us | 312.7 us | +2.3% (noise) |
+| Clipping, near-plane clipped | 332.3 us | 330.4 us | -0.6% (noise) |
+| Shadow no filter, 256x256 | 8.5523 ms | 5.5528 ms | -35.1% |
+| Shadow PCF, 256x256 | 8.9442 ms | 5.9898 ms | -33.0% |
 
-Culling in clip space, before the clipper allocates, is the next cheap geometry win. The default stays `--cull off` because the teapot is not a closed mesh.
+Most of the gain is the trivial-accept path, which is why `--cull off` improves as much as `--cull back`. Small frames gain the most because geometry dominates them; at 1024x1024 pixel work dominates. Flat mode at 128x128 is now faster than before the correctness sprint (1.53 ms on commit `8316fbc`), even though it rasterizes every face. The clipping benchmarks use a one-triangle scene, so they do not move. The default stays `--cull off` because the teapot is not a closed mesh.
 
 ## Interpreting The Numbers
 
