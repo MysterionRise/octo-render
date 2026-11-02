@@ -23,6 +23,7 @@ flowchart LR
 ## Implemented Stages
 
 - **Asset loading:** the OBJ loader parses positions, UVs, normals, triangle faces, polygon faces, negative OBJ indices, `mtllib`, and `usemtl`. Polygons are triangulated with a fan.
+- **Normal generation:** face corners without `vn` get smooth normals. Duplicated positions are welded first, so exporter seams shade smoothly. Each corner averages the normals of the faces around its vertex, weighted by the face's corner angle (unlike area weights, these do not depend on how a polygon was triangulated). Faces more than the crease angle (default 60°, `--crease-angle`) away from the corner's own face are left out, so sharp edges stay hard.
 - **Material loading:** the MTL loader supports `Ka`, `Kd`, `Ks`, `Ns`, alpha, `map_Kd`, and common normal-map keys. CLI material flags intentionally override MTL values for repeatable demos.
 - **Model normalization:** imported meshes are centered and scaled into a normalized scene so CLI renders frame consistently.
 - **Transforms:** vertices pass through model, view, projection, and viewport transforms before rasterization.
@@ -32,7 +33,7 @@ flowchart LR
 - **Fragment shading:** render modes include wireframe, flat, Gouraud, checker/file texture, normal map, normal debug, shadow, and SSAO. Lit modes combine a Lambert diffuse term with a Blinn-Phong specular term driven by the material's `specular` and `shininess` (MTL `Ks` and `Ns`).
 - **Blending:** color writes can bypass blending, use source-over alpha, or use additive blending.
 - **Texture sampling:** repeat/clamp wrapping, nearest filtering, bilinear filtering, and a simplified mipmap LOD path are implemented in CPU code.
-- **Shadow mapping:** the renderer builds a light-space depth map with a fixed depth-only raster state, then samples that map during the main pass with configurable bias, resolution, and optional 3x3 PCF.
+- **Shadow mapping:** the renderer builds a light-space depth map from an orthographic camera along the light direction, with a fixed depth-only raster state and its own clip planes, then samples that map during the main pass with configurable bias, resolution, and optional 3x3 PCF.
 - **Debug outputs:** depth, normal, shadow-map, and AO maps can be written alongside the final render.
 
 ## Render State
@@ -51,6 +52,14 @@ The CPU renderer exposes a small OpenGL-like render state:
 
 The defaults intentionally match the original renderer behavior: no culling, counter-clockwise front faces, depth test/write enabled, solid fill, no scissor, color writes enabled, blending off, repeat wrapping, and nearest filtering.
 
+## Camera And Projection
+
+The camera is an OpenGL-style perspective: `lookat` puts the eye at the view-space origin looking at the scene centre, and `perspective` maps a vertical field of view (default 45°) with the frame's aspect ratio. Clip `w` is the distance in front of the eye, so the eye is the centre of projection and moving `--camera` closer enlarges the model. The viewport maps NDC [-1, 1] onto the whole frame, so clipping happens at the frame edges.
+
+Depth is reversed-Z with an infinite far plane: `z_ndc = depth_scale / distance`, the same matrix as glam's `perspective_infinite_reverse_rh`. Larger values are closer, which matches the z-buffer's `-inf` clear and `z > current` test, and `1 / distance` is affine in screen space, so interpolating depth linearly across a triangle is exact. `depth_scale` is the squared eye-to-centre distance over 4, which keeps about 32 depth units per scene unit at the scene centre for any camera distance, so depth thresholds such as SSAO's keep their meaning. Near and far planes are distances from the eye (`--near`, `--far`), applied by the clipper in view space.
+
+An earlier version used tinyrenderer's lesson-4 matrix, `w = 1 - z / d`, while its look-at put the eye at the origin; tinyrenderer's look-at centres view space on the scene instead. The centre of projection therefore sat one camera-distance behind the eye: perspective was half as strong as requested, and the model's size never changed with distance. That version also ignored the aspect ratio, so non-square renders were stretched, and its 8% viewport margin made clipping happen inside the frame. A test shows the new camera reproduces the old default image exactly with the eye doubled and a 43.15° field of view.
+
 ## Perspective-Correct Interpolation
 
 The first version interpolated all fragment inputs directly in screen-space barycentric coordinates. That is acceptable for early rasterization lessons, but it is not what a perspective pipeline does for varyings such as UVs or normals. The current raster path weights barycentric coordinates by reciprocal clip-space `w`, then renormalizes the result before fragment shading.
@@ -59,7 +68,7 @@ This matters most for textured, normal-mapped, and per-fragment shadowed shading
 
 ## Lighting Conventions
 
-One vector, `RenderOptions::light_dir` (`--light`), describes the light: the direction *toward* the light in normalized scene space. `render_model` rotates it into eye space once per frame for shading, and places the shadow-map camera at `light_dir * 3`. Normals point outward: `Model::face_normal` assumes counter-clockwise winding, the OBJ convention.
+One vector, `RenderOptions::light_dir` (`--light`), describes the light: the direction *toward* the light in normalized scene space. `render_model` rotates it into eye space once per frame for shading, and points an orthographic shadow camera along it. Normals point outward: `Model::face_normal` assumes counter-clockwise winding, the OBJ convention.
 
 An earlier version computed face normals with the opposite cross product, so they pointed inward. Lambert's term still produced plausible shading, because the inward normal and the light vector were both flipped. The shadow camera, however, sat on the opposite side of the model from the light that shaded it, so every lit surface was reported as occluded. The shadow render came out mostly dark with a stray bright crescent along the shadow camera's silhouette. Models with explicit outward `vn` normals followed a third convention again. Making face normals outward and defining the light vector once fixed all three cases together.
 
@@ -67,9 +76,23 @@ Specular uses Blinn-Phong: `max(dot(n, h), 0)^shininess` with `h = normalize(l +
 
 Lighting never discards a fragment. A surface facing away from the light shades to its ambient colour (black when ambient is 0) and still writes depth, so it occludes geometry behind it instead of leaving a hole that shows the clear colour.
 
+## Culling Before Clipping
+
+Each face is classified before it reaches the clipper. The sign of `det[x y w]` over its three clip-space corners equals the sign of its screen-space area whenever all three corners are in front of the centre of projection, so culled output matches a screen-space test exactly. Unlike a screen-space test, it stays meaningful for a triangle that crosses behind the eye, where projected winding is undefined.
+
+Culled faces skip clipping, lighting, and vertex shading. Faces entirely inside the frustum also skip the clipper: it would return them unchanged, since each fully-inside plane pass only rotates the vertex list and six passes restore it. Faces entirely outside one plane are dropped without clipping. Tests pin culled renders bit for bit, and a seeded property test checks the classifier against the screen-space reference on thousands of random triangles, including ones that cross behind the eye.
+
+## Shadow Camera
+
+The light is directional, so the shadow camera is orthographic: it looks along `-light_dir` from 4 units out, and its view box has a half-width of 2.05. Every model is normalized to fit inside radius 2 of the origin, so the box covers the scene from any direction, and every shadow ray is parallel to the light that shades the surface.
+
+An earlier version used a perspective camera at `light_dir * 3`. That is a point light, so shadow directions drifted up to about 33° from the shading direction away from the scene centre, and its 8% viewport margin wasted part of the shadow map.
+
+Shadow depth is linear: 0.25 NDC per scene unit, about 32 depth units through the 255-deep viewport. The default `--shadow-bias` of 4 therefore means 1/8 of a scene unit everywhere, instead of varying with distance from the light. Tests check the shadow map against exact ray casts from receiver points toward the light.
+
 ## Shadow Pass State
 
-The light-space depth pass uses a fixed raster state: depth test and write on, no culling, no scissor, colour writes off, blending off. It does not inherit the camera pass's `RenderState`, so flags like `--scissor` or `--depth-write off` cannot crop or empty the shadow map.
+The light-space depth pass uses a fixed raster state: depth test and write on, no culling, no scissor, colour writes off, blending off. It also has its own clip planes, so the camera's near and far planes never clip the shadow map. It does not inherit the camera pass's `RenderState`, so flags like `--scissor` or `--depth-write off` cannot crop or empty the shadow map.
 
 ## Attribute-Preserving Frustum Clipping
 
@@ -109,13 +132,14 @@ The `wgpu` viewer exists separately because `wgpu` delegates rasterization to th
 ## Differences From Real OpenGL
 
 - No full programmable shader language; shaders are Rust structs implementing a trait.
-- Frustum clipping is implemented in the renderer's projection convention, but this is not a conformance-tested OpenGL clipper.
+- Frustum clipping covers all six planes, but this is not a conformance-tested OpenGL clipper.
+- The far plane is applied by the clipper only; reversed-Z depth itself has no far limit.
 - Mipmap selection uses a simplified screen-space estimate, not shader derivatives.
 - Blending has alpha and additive modes, but not arbitrary blend factors/equations.
 - No stencil buffer, multisampling, cubemaps, instancing, or uniform-buffer abstraction.
 - Shadow mapping uses configurable fixed bias and simple PCF, not slope-scaled bias or cascades.
 - Lighting is a single directional light with Lambert diffuse and Blinn-Phong specular in 8-bit colour; there is no gamma-correct pipeline, point light, or PBR model.
-- SSAO is deterministic and useful for demonstrating a post-process pass, not physically based.
+- SSAO is deterministic and useful for demonstrating a post-process pass, not physically based. It thresholds raw depth differences without normals, so it shades each planar triangle of a curved surface by its slope.
 
 ## What To Look At In The Code
 

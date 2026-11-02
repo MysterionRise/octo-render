@@ -103,14 +103,50 @@ The correctness sprint changed what several benchmarks do, so it was measured as
 
 The flat regression is the honest cost of rendering every face. The old flat path skipped any face whose shading came out black before clipping it. Under the old inward-normal convention that was roughly half the teapot, and it is exactly what left holes behind back-lit surfaces. Gouraud and shadow modes discarded per fragment instead, after clipping and rasterization, so removing their discard costs little.
 
-Back-face culling is the lever for closed meshes, but it recovers less than the flat regression because culling runs after clipping. Best of 15 CLI runs of the flat teapot:
+At this point back-face culling recovered only part of the flat regression (best of 15 CLI runs: -19% at 128x128, -30% at 1024x1024), because culling ran in screen space after every face had been clipped.
 
-| Resolution | `--cull off` | `--cull back` | Change |
+## Culling Before Clipping (October 2026)
+
+The next change moved culling ahead of clipping (a clip-space winding test) and let triangles that lie inside every frustum plane skip the clipper entirely. That is nearly every triangle in a normal view, and the clipper allocated about nine `Vec`s per face. Output is bit-identical. Same machine and toolchain as above, measured back to back on 2026-10-29; "before" is commit `6a3f6be` (smooth normals), both runs use the same benchmark file.
+
+| Benchmark | Before | After | Change |
 | --- | ---: | ---: | ---: |
-| 128x128 | 2.78 ms | 2.26 ms | -19% |
-| 1024x1024 | 14.50 ms | 10.19 ms | -30% |
+| Full frame flat, 128x128 | 2.7455 ms | 1.4350 ms | -47.7% |
+| Full frame Gouraud, 128x128 | 3.6498 ms | 2.0826 ms | -42.9% |
+| Full frame shadow, 128x128 | 6.8944 ms | 3.6268 ms | -47.4% |
+| Flat, 512x512 | 5.5724 ms | 3.9073 ms | -29.9% |
+| Flat, 1024x1024 | 11.611 ms | 10.022 ms | -13.7% |
+| Culling: flat 128, `--cull off` | 2.7880 ms | 1.4010 ms | -49.7% |
+| Culling: flat 128, `--cull back` | 2.2143 ms | 0.6661 ms | -69.9% |
+| Culling: flat 1024, `--cull off` | 11.824 ms | 10.233 ms | -13.5% |
+| Culling: flat 1024, `--cull back` | 7.1685 ms | 5.7522 ms | -19.8% |
+| Clipping, unclipped | 305.7 us | 312.7 us | +2.3% (noise) |
+| Clipping, near-plane clipped | 332.3 us | 330.4 us | -0.6% (noise) |
+| Shadow no filter, 256x256 | 8.5523 ms | 5.5528 ms | -35.1% |
+| Shadow PCF, 256x256 | 8.9442 ms | 5.9898 ms | -33.0% |
 
-Culling in clip space, before the clipper allocates, is the next cheap geometry win. The default stays `--cull off` because the teapot is not a closed mesh.
+Most of the gain is the trivial-accept path, which is why `--cull off` improves as much as `--cull back`. Small frames gain the most because geometry dominates them; at 1024x1024 pixel work dominates. Flat mode at 128x128 is now faster than before the correctness sprint (1.53 ms on commit `8316fbc`), even though it rasterizes every face. The clipping benchmarks use a one-triangle scene, so they do not move. The default stays `--cull off` because the teapot is not a closed mesh.
+
+## Camera Change (October 2026)
+
+The perspective camera and the orthographic shadow camera change what each frame contains, so these numbers re-baseline the suite rather than measure an optimization. Same machine, back to back on 2026-10-29; "before" is commit `50a04e1` (orthographic shadow camera, old view projection), "after" is `0ffa622` (perspective camera), both with one benchmark file.
+
+| Benchmark | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Full frame flat, 128x128 | 1.4807 ms | 1.3986 ms | -5.5% |
+| Full frame Gouraud, 128x128 | 2.2465 ms | 2.0194 ms | -10.1% |
+| Full frame shadow, 128x128 | 4.0212 ms | 3.7565 ms | -6.6% |
+| Flat, 512x512 | 4.2284 ms | 4.0113 ms | -5.1% |
+| Flat, 1024x1024 | 10.233 ms | 9.2696 ms | -9.4% |
+| Culling: flat 1024, `--cull off` | 11.470 ms | 9.7041 ms | -15.4% |
+| Culling: flat 1024, `--cull back` | 6.4488 ms | 5.6393 ms | -12.6% |
+| Clipping, unclipped | 335.9 us | 302.0 us | -10.1% |
+| Clipping, near-plane clipped | 350.9 us | 308.1 us | -12.2% |
+| Texture nearest / linear / mipmap | 1.8631 / 2.9185 / 2.9052 ms | 1.6898 / 2.5020 / 2.6913 ms | -9.3% / -14.3% / -7.4% |
+| Blend off / alpha / additive | 1.7536 / 2.2301 / 2.0548 ms | 1.5383 / 2.0258 / 1.8454 ms | -12.3% / -9.2% / -10.2% |
+| Shadow no filter / PCF, 256x256 | 6.1222 / 6.4849 ms | 5.7574 / 6.1872 ms | -6.0% / -4.6% |
+
+Most of the change is coverage. At the new 45° default the teapot covers about 9% fewer pixels than at the old projection's effective 43.15°, and the quads are now framed without the 8% margin. The orthographic shadow camera one commit earlier went the other way: it fills the whole shadow map instead of a margined, perspective-shrunk view, so the shadow pass rasterizes more texels. Across this machine's runs, the shadow benchmarks rose roughly 10% with that commit.
 
 ## Interpreting The Numbers
 

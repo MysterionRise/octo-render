@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use image::{imageops::flip_vertical_in_place, ImageBuffer, Rgb, RgbImage};
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,8 +15,51 @@ const DEFAULT_BACKGROUND: Rgb<u8> = Rgb([18, 20, 24]);
 /// so Lambert's term is `max(dot(n, l), 0)` with an outward normal `n`.
 pub const DEFAULT_LIGHT_DIR: Vec3 = Vec3::new(1.0, 1.0, 1.0);
 
+/// Default camera eye, in normalized scene space, looking at the origin.
+pub const DEFAULT_CAMERA_EYE: Vec3 = Vec3::new(0.0, 0.5, 6.0);
+
+/// Default vertical field of view of the camera, in degrees.
+pub const DEFAULT_FOV_Y_DEGREES: f32 = 45.0;
+
 /// Fraction of diffuse light kept where the shadow map reports full occlusion.
 const SHADOWED_DIFFUSE: f32 = 0.35;
+
+/// Radius of the normalized scene: `build_transforms` scales every model so its
+/// bounding box fits inside a sphere of this radius around the origin.
+const SCENE_RADIUS: f32 = 2.0;
+
+/// Orthographic shadow camera: half-width of its view box (a little wider than
+/// the scene), distance of its eye from the scene centre, and clip planes that
+/// keep the whole scene between them.
+const SHADOW_HALF_EXTENT: f32 = SCENE_RADIUS * 1.025;
+const SHADOW_EYE_DISTANCE: f32 = 4.0;
+const SHADOW_NEAR_PLANE: f32 = SHADOW_EYE_DISTANCE - SCENE_RADIUS * 1.25;
+const SHADOW_FAR_PLANE: f32 = SHADOW_EYE_DISTANCE + SCENE_RADIUS * 1.25;
+
+/// Shadow-map depth slope in NDC per scene unit. Through the 255-deep viewport
+/// that is ~32 depth units per scene unit, so the default bias of 4 is 1/8 unit.
+const SHADOW_DEPTH_PER_UNIT: f32 = 0.25;
+
+/// Default crease angle, in degrees, for vertex normals generated when an OBJ
+/// has no `vn`: faces meeting at a sharper angle keep a hard edge.
+pub const DEFAULT_CREASE_ANGLE_DEG: f32 = 60.0;
+
+/// Options for [`Model::load_with_options`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjLoadOptions {
+    /// Generate smooth normals for face corners without `vn`, smoothing across
+    /// edges whose faces differ by at most this many degrees. `None` keeps the
+    /// faceted per-face fallback.
+    pub crease_angle_deg: Option<f32>,
+}
+
+impl Default for ObjLoadOptions {
+    fn default() -> Self {
+        ObjLoadOptions {
+            crease_angle_deg: Some(DEFAULT_CREASE_ANGLE_DEG),
+        }
+    }
+}
 
 /// Parsed face vertex: indices into vertex/texcoord/normal arrays (0-based).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,8 +106,22 @@ impl ModelBounds {
 
 impl Model {
     /// Load an OBJ model with triangulated polygon faces and non-panicking errors.
+    /// Face corners without `vn` get smooth normals (see
+    /// [`Model::generate_missing_normals`]) with the default crease angle.
     pub fn load(filename: impl AsRef<Path>) -> Result<Self, String> {
-        load_obj(filename.as_ref())
+        Self::load_with_options(filename, ObjLoadOptions::default())
+    }
+
+    /// Load an OBJ model with explicit loader options.
+    pub fn load_with_options(
+        filename: impl AsRef<Path>,
+        options: ObjLoadOptions,
+    ) -> Result<Self, String> {
+        let mut model = load_obj(filename.as_ref())?;
+        if let Some(crease_angle_deg) = options.crease_angle_deg {
+            model.generate_missing_normals(crease_angle_deg);
+        }
+        Ok(model)
     }
 
     /// Compatibility wrapper for older examples and benchmarks.
@@ -86,13 +143,14 @@ impl Model {
     }
 
     /// Outward geometric normal of a face, assuming counter-clockwise winding
-    /// (the OBJ convention).
+    /// (the OBJ convention). Only a zero-area face falls back to +Z; small but
+    /// valid faces keep their true orientation.
     pub fn face_normal(&self, face_idx: usize) -> Vec3 {
         let face = self.faces[face_idx];
         let v0 = self.vertices[face[0].v];
         let v1 = self.vertices[face[1].v];
         let v2 = self.vertices[face[2].v];
-        safe_normal((v1 - v0).cross(v2 - v0), Vec3::Z)
+        (v1 - v0).cross(v2 - v0).try_normalize().unwrap_or(Vec3::Z)
     }
 
     pub fn vertex_normal(&self, face_idx: usize, vert_idx: usize) -> Vec3 {
@@ -100,6 +158,99 @@ impl Model {
         fv.vn
             .map(|ni| safe_normal(self.normals[ni], self.face_normal(face_idx)))
             .unwrap_or_else(|| self.face_normal(face_idx))
+    }
+
+    /// Generate smooth vertex normals for face corners that have no `vn`.
+    ///
+    /// Vertices at the same position are welded first, so seams between
+    /// duplicated vertices (common in exported meshes) shade smoothly. Each
+    /// corner's normal is the angle-weighted average of the face normals around
+    /// its vertex, restricted to faces within `crease_angle_deg` of the corner's
+    /// own face; sharper edges stay hard. Angle weighting, unlike area
+    /// weighting, does not depend on how polygons were triangulated.
+    ///
+    /// Corners that already have `vn` are left alone, as are degenerate faces,
+    /// which keep the per-face fallback in [`Model::vertex_normal`].
+    pub fn generate_missing_normals(&mut self, crease_angle_deg: f32) {
+        let needs_normals = self
+            .faces
+            .iter()
+            .any(|face| face.iter().any(|fv| fv.vn.is_none()));
+        let Some(bounds) = self.bounds() else {
+            return;
+        };
+        if !needs_normals {
+            return;
+        }
+
+        // Weld positions on a grid far finer than any real feature.
+        let diagonal = (bounds.max - bounds.min).length();
+        let cell = if diagonal > 0.0 { diagonal * 1e-6 } else { 1.0 };
+        let mut weld_ids: HashMap<(i64, i64, i64), usize> = HashMap::new();
+        let welded: Vec<usize> = self
+            .vertices
+            .iter()
+            .map(|v| {
+                let key = (
+                    (v.x / cell).round() as i64,
+                    (v.y / cell).round() as i64,
+                    (v.z / cell).round() as i64,
+                );
+                let next_id = weld_ids.len();
+                *weld_ids.entry(key).or_insert(next_id)
+            })
+            .collect();
+
+        // Unit normal per non-degenerate face, plus the faces (with their corner
+        // angle) incident to each welded vertex.
+        let mut face_normals: Vec<Option<Vec3>> = Vec::with_capacity(self.faces.len());
+        let mut incident: Vec<Vec<(usize, f32)>> = vec![Vec::new(); weld_ids.len()];
+        for (face_idx, face) in self.faces.iter().enumerate() {
+            let p = face.map(|fv| self.vertices[fv.v]);
+            // Same degeneracy test as `face_normal`, so the two always agree.
+            let Some(normal) = (p[1] - p[0]).cross(p[2] - p[0]).try_normalize() else {
+                face_normals.push(None);
+                continue;
+            };
+            let angles: [f32; 3] = std::array::from_fn(|i| {
+                let a = (p[(i + 1) % 3] - p[i]).normalize_or_zero();
+                let b = (p[(i + 2) % 3] - p[i]).normalize_or_zero();
+                a.dot(b).clamp(-1.0, 1.0).acos()
+            });
+            for (corner, fv) in face.iter().enumerate() {
+                incident[welded[fv.v]].push((face_idx, angles[corner]));
+            }
+            face_normals.push(Some(normal));
+        }
+
+        // Each weld-vertex/normal pair is stored once.
+        let min_dot = crease_angle_deg.clamp(0.0, 180.0).to_radians().cos();
+        let mut generated: HashMap<(usize, [u32; 3]), usize> = HashMap::new();
+        for face_idx in 0..self.faces.len() {
+            let Some(face_normal) = face_normals[face_idx] else {
+                continue;
+            };
+            for corner in 0..3 {
+                if self.faces[face_idx][corner].vn.is_some() {
+                    continue;
+                }
+                let vertex = welded[self.faces[face_idx][corner].v];
+                let sum: Vec3 = incident[vertex]
+                    .iter()
+                    .filter_map(|&(other, angle)| {
+                        let other_normal = face_normals[other]?;
+                        (other_normal.dot(face_normal) >= min_dot).then_some(other_normal * angle)
+                    })
+                    .sum();
+                let normal = safe_normal(sum, face_normal);
+                let key = (vertex, normal.to_array().map(f32::to_bits));
+                let index = *generated.entry(key).or_insert_with(|| {
+                    self.normals.push(normal);
+                    self.normals.len() - 1
+                });
+                self.faces[face_idx][corner].vn = Some(index);
+            }
+        }
     }
 }
 
@@ -784,10 +935,32 @@ pub fn viewport(x: f32, y: f32, w: f32, h: f32, depth: f32) -> Mat4 {
     )
 }
 
+/// tinyrenderer's lesson-4 projection: `w = 1 + coeff * z`, with `z` passed
+/// through. It keeps the scale of the `z = 0` plane fixed, so it only puts the
+/// centre of projection at the eye when view space is centred on the scene.
+/// `render_model` uses [`perspective`] instead.
 pub fn projection(coeff: f32) -> Mat4 {
     let mut m = Mat4::IDENTITY;
     *m.col_mut(2) = Vec4::new(0.0, 0.0, 1.0, coeff);
     m
+}
+
+/// OpenGL-style perspective projection with reversed-Z depth and an infinite
+/// far plane: the same matrix as glam's `Mat4::perspective_infinite_reverse_rh`.
+///
+/// The eye sits at the view-space origin looking down -Z, and clip `w` is the
+/// distance in front of it, so the centre of projection is the eye itself.
+/// Depth is `z_ndc = depth_scale / distance`: larger is closer, matching the
+/// z-buffer's `z > current` test, and it is affine in screen space, so linear
+/// interpolation across a triangle stays exact.
+pub fn perspective(fov_y_radians: f32, aspect: f32, depth_scale: f32) -> Mat4 {
+    let f = 1.0 / (0.5 * fov_y_radians).tan();
+    Mat4::from_cols(
+        Vec4::new(f / aspect, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, f, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, 0.0, -1.0),
+        Vec4::new(0.0, 0.0, depth_scale, 0.0),
+    )
 }
 
 pub fn lookat(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
@@ -1322,7 +1495,7 @@ impl Shader for NormalMapShader<'_> {
         let dp2 = self.varying_pos[2] - self.varying_pos[0];
         let duv1 = self.varying_uv[1] - self.varying_uv[0];
         let duv2 = self.varying_uv[2] - self.varying_uv[0];
-        let face_normal = safe_normal(dp1.cross(dp2), Vec3::Z);
+        let face_normal = dp1.cross(dp2).try_normalize().unwrap_or(Vec3::Z);
         let det = duv1.x * duv2.y - duv1.y * duv2.x;
 
         let world_normal = if det.abs() < 1e-10 {
@@ -2079,7 +2252,10 @@ pub struct RenderOptions {
     pub width: u32,
     pub height: u32,
     pub mode: RenderMode,
+    /// Camera eye in normalized scene space; `None` uses [`DEFAULT_CAMERA_EYE`].
     pub camera_eye: Option<Vec3>,
+    /// Vertical field of view of the camera, in degrees.
+    pub fov_y_degrees: f32,
     /// Direction toward the light in normalized scene space. Shading and the
     /// shadow map both derive their light from this one vector.
     pub light_dir: Vec3,
@@ -2103,6 +2279,7 @@ impl Default for RenderOptions {
             height: 1024,
             mode: RenderMode::Shadow,
             camera_eye: None,
+            fov_y_degrees: DEFAULT_FOV_Y_DEGREES,
             light_dir: DEFAULT_LIGHT_DIR.normalize(),
             debug_outputs: false,
             render_state: RenderState::default(),
@@ -2155,6 +2332,10 @@ struct RenderTransforms {
     light_clip_to_screen: Mat4,
     /// Eye-space direction toward the light, used by every lit shader.
     light_dir_view: Vec3,
+    /// Clip planes of the pass these transforms drive, as distances in front
+    /// of its eye. The camera and the shadow camera each have their own.
+    near_plane: f32,
+    far_plane: f32,
 }
 
 pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
@@ -2188,7 +2369,6 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
             }
@@ -2226,7 +2406,6 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
             }
@@ -2278,7 +2457,6 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
             }
@@ -2291,13 +2469,12 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
             }
             RenderMode::Shadow | RenderMode::Ssao => {
                 let shadow_zbuffer =
-                    render_shadow_map(model, &transforms, shadow_width, shadow_height, options);
+                    render_shadow_map(model, &transforms, shadow_width, shadow_height);
                 if options.debug_outputs {
                     debug.shadow = Some(zbuffer_to_image(
                         &shadow_zbuffer,
@@ -2324,7 +2501,6 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     &mut shader,
                     &mut zbuffer,
                     &mut image,
-                    options,
                     options.render_state,
                 );
 
@@ -2382,25 +2558,24 @@ fn build_transforms(
         max: Vec3::splat(1.0),
     });
     let model_center = bounds.center();
-    let model_scale = 2.0 / bounds.radius();
+    let model_scale = SCENE_RADIUS / bounds.radius();
     let model_matrix =
         Mat4::from_scale(Vec3::splat(model_scale)) * Mat4::from_translation(-model_center);
 
-    let eye = options.camera_eye.unwrap_or(Vec3::new(0.0, 0.25, 3.0));
+    let eye = options.camera_eye.unwrap_or(DEFAULT_CAMERA_EYE);
     let center = Vec3::ZERO;
     let up = Vec3::Y;
     let view = lookat(eye, center, up);
-    let distance = eye.distance(center).max(1.0);
-    let proj = projection(-1.0 / distance);
-    let margin_x = width as f32 * 0.08;
-    let margin_y = height as f32 * 0.08;
-    let vp = viewport(
-        margin_x,
-        margin_y,
-        width as f32 - margin_x * 2.0,
-        height as f32 - margin_y * 2.0,
-        255.0,
+    let distance = eye.distance(center).max(EPSILON);
+    let proj = perspective(
+        options.fov_y_degrees.clamp(1.0, 179.0).to_radians(),
+        width as f32 / height as f32,
+        // ~32 depth units per scene unit at the scene centre for any camera
+        // distance, so depth thresholds such as SSAO's keep their meaning.
+        distance * distance / 4.0,
     );
+    // NDC [-1, 1] maps to the whole frame, so clipping happens at its edges.
+    let vp = viewport(0.0, 0.0, width as f32, height as f32, 255.0);
     let view_to_clip = proj;
     let clip_to_screen = vp;
     let transform = clip_to_screen * view_to_clip * view * model_matrix;
@@ -2408,18 +2583,12 @@ fn build_transforms(
 
     let light_dir = safe_normal(options.light_dir, DEFAULT_LIGHT_DIR.normalize());
     let light_dir_view = safe_normal(transform_vector(&view, light_dir), Vec3::Z);
-    let light_eye = light_dir * 3.0;
-    let light_view = lookat(light_eye, center, up);
-    let light_proj = projection(-1.0 / light_eye.distance(center).max(1.0));
-    let shadow_margin_x = shadow_width as f32 * 0.08;
-    let shadow_margin_y = shadow_height as f32 * 0.08;
-    let shadow_vp = viewport(
-        shadow_margin_x,
-        shadow_margin_y,
-        shadow_width as f32 - shadow_margin_x * 2.0,
-        shadow_height as f32 - shadow_margin_y * 2.0,
-        255.0,
-    );
+    // A directional light is an orthographic camera looking along -light_dir.
+    // The scene fits inside SCENE_RADIUS, so the shadow box covers it from any
+    // direction and every shadow ray is parallel to the shading light.
+    let light_view = lookat(light_dir * SHADOW_EYE_DISTANCE, center, up);
+    let light_proj = orthographic_light_projection(SHADOW_HALF_EXTENT, SHADOW_EYE_DISTANCE);
+    let shadow_vp = viewport(0.0, 0.0, shadow_width as f32, shadow_height as f32, 255.0);
     let light_view_to_clip = light_proj;
     let light_clip_to_screen = shadow_vp;
     let light_transform = light_clip_to_screen * light_view_to_clip * light_view * model_matrix;
@@ -2434,7 +2603,22 @@ fn build_transforms(
         light_view_to_clip,
         light_clip_to_screen,
         light_dir_view,
+        near_plane: options.near_plane,
+        far_plane: options.far_plane,
     }
+}
+
+/// Orthographic projection for the shadow camera. `w` stays 1, x and y map the
+/// `half_extent` box onto [-1, 1], and depth is linear in view z and centred on
+/// the scene centre at `eye_distance`. Larger depth is closer to the light, as
+/// in the camera pass.
+fn orthographic_light_projection(half_extent: f32, eye_distance: f32) -> Mat4 {
+    Mat4::from_cols(
+        Vec4::new(1.0 / half_extent, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 1.0 / half_extent, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, SHADOW_DEPTH_PER_UNIT, 0.0),
+        Vec4::new(0.0, 0.0, eye_distance * SHADOW_DEPTH_PER_UNIT, 1.0),
+    )
 }
 
 fn render_wireframe(
@@ -2444,21 +2628,20 @@ fn render_wireframe(
     image: &mut RgbImage,
 ) {
     let colour = Rgb([235, 238, 245]);
+    let mut primitives = Vec::new();
     for face_idx in 0..model.faces.len() {
-        for primitive in clipped_primitives_for_face(
+        if !prepare_face(
             model,
             transforms,
             face_idx,
-            options.near_plane,
-            options.far_plane,
+            transforms.near_plane,
+            transforms.far_plane,
+            options.render_state,
+            &mut primitives,
         ) {
-            if should_cull_screen_triangle_with_front_face(
-                &primitive.screen_coords,
-                options.render_state.cull_mode,
-                options.render_state.front_face,
-            ) {
-                continue;
-            }
+            continue;
+        }
+        for primitive in &primitives {
             for edge in [(0, 1), (1, 2), (2, 0)] {
                 draw_line_with_state(
                     primitive.screen_coords[edge.0].x.round() as i32,
@@ -2483,7 +2666,20 @@ fn render_flat(
 ) {
     let normal_matrix = normal_matrix(transforms.model_view);
     let light_dir = transforms.light_dir_view;
+    let mut primitives = Vec::new();
     for face_idx in 0..model.faces.len() {
+        // Cull and clip before lighting, so culled faces cost no shading work.
+        if !prepare_face(
+            model,
+            transforms,
+            face_idx,
+            transforms.near_plane,
+            transforms.far_plane,
+            options.render_state,
+            &mut primitives,
+        ) {
+            continue;
+        }
         let normal = safe_normal(
             transform_vector(&normal_matrix, model.face_normal(face_idx)),
             Vec3::Z,
@@ -2510,20 +2706,7 @@ fn render_flat(
             intensity,
             specular,
         );
-        for primitive in clipped_primitives_for_face(
-            model,
-            transforms,
-            face_idx,
-            options.near_plane,
-            options.far_plane,
-        ) {
-            if should_cull_screen_triangle_with_front_face(
-                &primitive.screen_coords,
-                options.render_state.cull_mode,
-                options.render_state.front_face,
-            ) {
-                continue;
-            }
+        for primitive in &primitives {
             triangle_zbuf_with_render_state(
                 primitive.screen_coords[0],
                 primitive.screen_coords[1],
@@ -2543,26 +2726,26 @@ fn render_shader<S: Shader>(
     shader: &mut S,
     zbuffer: &mut [f32],
     image: &mut RgbImage,
-    options: &RenderOptions,
     render_state: RenderState,
 ) {
+    let mut primitives = Vec::new();
     for face_idx in 0..model.faces.len() {
-        let _: [Vec3; 3] = std::array::from_fn(|j| shader.vertex(face_idx, j));
-        let reciprocal_w = reciprocal_w_for_face(model, transforms.transform, face_idx);
-        for primitive in clipped_primitives_for_face(
+        // Cull and clip first: culled or fully clipped faces skip vertex shading.
+        // Shaders keep no state across faces, so skipping one is safe.
+        if !prepare_face(
             model,
             transforms,
             face_idx,
-            options.near_plane,
-            options.far_plane,
+            transforms.near_plane,
+            transforms.far_plane,
+            render_state,
+            &mut primitives,
         ) {
-            if should_cull_screen_triangle_with_front_face(
-                &primitive.screen_coords,
-                render_state.cull_mode,
-                render_state.front_face,
-            ) {
-                continue;
-            }
+            continue;
+        }
+        let _: [Vec3; 3] = std::array::from_fn(|j| shader.vertex(face_idx, j));
+        let reciprocal_w = reciprocal_w_for_face(model, transforms.transform, face_idx);
+        for primitive in &primitives {
             triangle_shader_perspective_with_render_state(
                 &primitive.screen_coords,
                 primitive.source_barycentric,
@@ -2588,6 +2771,9 @@ fn reciprocal_w_for_face(model: &Model, transform: Mat4, face_idx: usize) -> [f3
     })
 }
 
+/// Screen-space winding test, kept as the reference the clip-space classifier
+/// ([`should_cull_winding`]) is checked against.
+#[cfg(test)]
 fn should_cull_screen_triangle_with_front_face(
     screen_coords: &[Vec3; 3],
     cull_mode: CullMode,
@@ -2626,29 +2812,121 @@ struct ClippedPrimitive {
     source_barycentric: [Vec3; 3],
 }
 
-fn clipped_primitives_for_face(
+/// Cull a face, then clip it against the frustum and project the surviving
+/// pieces into `out` (cleared first). Returns whether anything is left to
+/// rasterize.
+///
+/// Culling runs before clipping, so culled faces never pay for the clipper. The
+/// winding comes from the homogeneous determinant ([`homogeneous_winding`]),
+/// which matches screen-space winding whenever every vertex is in front of the
+/// centre of projection, and stays meaningful for triangles that cross it,
+/// where screen-space winding is undefined.
+fn prepare_face(
     model: &Model,
     transforms: &RenderTransforms,
     face_idx: usize,
     near_plane: f32,
     far_plane: f32,
-) -> Vec<ClippedPrimitive> {
+    render_state: RenderState,
+    out: &mut Vec<ClippedPrimitive>,
+) -> bool {
+    out.clear();
+    let triangle = face_clip_vertices(model, transforms, face_idx);
+    if should_cull_winding(
+        homogeneous_winding(&triangle),
+        render_state.cull_mode,
+        render_state.front_face,
+    ) {
+        return false;
+    }
+    clip_triangle_into(triangle, transforms, near_plane, far_plane, out);
+    !out.is_empty()
+}
+
+fn face_clip_vertices(
+    model: &Model,
+    transforms: &RenderTransforms,
+    face_idx: usize,
+) -> [ClippedVertex; 3] {
     let face = model.faces[face_idx];
-    let triangle = [
+    [
         clipped_vertex_for_source(model.vertices[face[0].v], transforms, Vec3::X),
         clipped_vertex_for_source(model.vertices[face[1].v], transforms, Vec3::Y),
         clipped_vertex_for_source(model.vertices[face[2].v], transforms, Vec3::Z),
-    ];
+    ]
+}
 
-    clip_varying_triangle_against_frustum(triangle, near_plane, far_plane)
-        .into_iter()
-        .map(|tri| ClippedPrimitive {
-            screen_coords: std::array::from_fn(|i| {
-                clip_position_to_screen(tri[i].clip_pos, transforms.clip_to_screen)
-            }),
-            source_barycentric: std::array::from_fn(|i| tri[i].source_bc),
-        })
-        .collect()
+/// Signed orientation of a triangle as seen from the centre of projection:
+/// the determinant of its clip-space `(x, y, w)` corners, which equals
+/// `w0 * w1 * w2` times twice its signed NDC area.
+fn homogeneous_winding(triangle: &[ClippedVertex; 3]) -> f32 {
+    let column = |v: &ClippedVertex| Vec3::new(v.clip_pos.x, v.clip_pos.y, v.clip_pos.w);
+    Mat3::from_cols(
+        column(&triangle[0]),
+        column(&triangle[1]),
+        column(&triangle[2]),
+    )
+    .determinant()
+}
+
+/// A positive winding is counter-clockwise in the final image: the viewport
+/// keeps axis directions, and the vertical flip happens after rasterization.
+/// Zero winding counts as not front-facing, like the screen-space test.
+fn should_cull_winding(winding: f32, cull_mode: CullMode, front_face: FrontFace) -> bool {
+    let front_facing = match front_face {
+        FrontFace::Ccw => winding > 0.0,
+        FrontFace::Cw => winding < 0.0,
+    };
+    match cull_mode {
+        CullMode::Off => false,
+        CullMode::Front => front_facing,
+        CullMode::Back => !front_facing,
+    }
+}
+
+/// Clip a triangle against the frustum and append its projected pieces.
+///
+/// A triangle inside every plane skips the clipper, which would return it
+/// unchanged: each fully-inside pass rotates the vertex list by one, and six
+/// passes restore the original order. A triangle entirely outside one plane is
+/// dropped without clipping.
+fn clip_triangle_into(
+    triangle: [ClippedVertex; 3],
+    transforms: &RenderTransforms,
+    near_plane: f32,
+    far_plane: f32,
+    out: &mut Vec<ClippedPrimitive>,
+) {
+    let mut fully_inside = true;
+    for plane in FrustumPlane::ALL {
+        let inside = triangle
+            .map(|vertex| frustum_plane_distance(vertex, plane, near_plane, far_plane) >= -EPSILON);
+        if inside == [false; 3] {
+            return;
+        }
+        fully_inside &= inside == [true; 3];
+    }
+    if fully_inside {
+        out.push(project_clipped_triangle(&triangle, transforms));
+        return;
+    }
+    out.extend(
+        clip_varying_triangle_against_frustum(triangle, near_plane, far_plane)
+            .iter()
+            .map(|piece| project_clipped_triangle(piece, transforms)),
+    );
+}
+
+fn project_clipped_triangle(
+    triangle: &[ClippedVertex; 3],
+    transforms: &RenderTransforms,
+) -> ClippedPrimitive {
+    ClippedPrimitive {
+        screen_coords: std::array::from_fn(|i| {
+            clip_position_to_screen(triangle[i].clip_pos, transforms.clip_to_screen)
+        }),
+        source_barycentric: std::array::from_fn(|i| triangle[i].source_bc),
+    }
 }
 
 fn clipped_vertex_for_source(
@@ -2884,7 +3162,6 @@ fn render_shadow_map(
     transforms: &RenderTransforms,
     width: u32,
     height: u32,
-    options: &RenderOptions,
 ) -> Vec<f32> {
     let shadow_state = shadow_pass_state();
     let mut shadow_image = ImageBuffer::new(width, height);
@@ -2903,6 +3180,9 @@ fn render_shadow_map(
         light_view_to_clip: transforms.light_view_to_clip,
         light_clip_to_screen: transforms.light_clip_to_screen,
         light_dir_view: transforms.light_dir_view,
+        // The light's own clip planes: the camera's must not cut the shadow map.
+        near_plane: SHADOW_NEAR_PLANE,
+        far_plane: SHADOW_FAR_PLANE,
     };
     render_shader(
         model,
@@ -2910,7 +3190,6 @@ fn render_shadow_map(
         &mut depth_shader,
         &mut shadow_zbuffer,
         &mut shadow_image,
-        options,
         shadow_state,
     );
     shadow_zbuffer
@@ -2952,7 +3231,6 @@ fn render_normal_debug(
         &mut shader,
         &mut zbuffer,
         &mut image,
-        options,
         options.render_state,
     );
     image
@@ -3219,6 +3497,10 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Straight-on test camera. At the default field of view a model of the
+    /// normalized scene's radius fills most of the frame.
+    const TEST_EYE: Vec3 = Vec3::new(0.0, 0.0, 6.0);
+
     fn temp_obj(contents: &str) -> String {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3301,6 +3583,95 @@ mod tests {
             materials: Vec::new(),
             face_materials: vec![None, None],
         }
+    }
+
+    /// Axis-aligned cube from -1 to 1 with outward, counter-clockwise faces,
+    /// each quad fan-triangulated. With `shared_corners` the six faces share
+    /// eight vertices; otherwise every face has its own four copies, as many
+    /// exporters write them.
+    fn cube_model(shared_corners: bool) -> Model {
+        let corner = |i: usize| {
+            Vec3::new(
+                if i & 1 == 0 { -1.0 } else { 1.0 },
+                if i & 2 == 0 { -1.0 } else { 1.0 },
+                if i & 4 == 0 { -1.0 } else { 1.0 },
+            )
+        };
+        let quads: [[usize; 4]; 6] = [
+            [4, 5, 7, 6], // +Z
+            [0, 2, 3, 1], // -Z
+            [1, 3, 7, 5], // +X
+            [0, 4, 6, 2], // -X
+            [2, 6, 7, 3], // +Y
+            [0, 1, 5, 4], // -Y
+        ];
+        let mut vertices: Vec<Vec3> = if shared_corners {
+            (0..8).map(corner).collect()
+        } else {
+            Vec::new()
+        };
+        let mut faces = Vec::new();
+        for quad in quads {
+            let ids: [usize; 4] = if shared_corners {
+                quad
+            } else {
+                let base = vertices.len();
+                vertices.extend(quad.iter().map(|&i| corner(i)));
+                [base, base + 1, base + 2, base + 3]
+            };
+            let fv = |v: usize| FaceVertex {
+                v,
+                vt: None,
+                vn: None,
+            };
+            faces.push([fv(ids[0]), fv(ids[1]), fv(ids[2])]);
+            faces.push([fv(ids[0]), fv(ids[2]), fv(ids[3])]);
+        }
+        let face_count = faces.len();
+        Model {
+            vertices,
+            texcoords: Vec::new(),
+            normals: Vec::new(),
+            faces,
+            materials: Vec::new(),
+            face_materials: vec![None; face_count],
+        }
+    }
+
+    /// Flat 4x4-vertex grid in the z = 0 plane, facing +Z.
+    fn grid_model() -> Model {
+        let vertices: Vec<Vec3> = (0..16)
+            .map(|i| Vec3::new((i % 4) as f32, (i / 4) as f32, 0.0))
+            .collect();
+        let fv = |v: usize| FaceVertex {
+            v,
+            vt: None,
+            vn: None,
+        };
+        let mut faces = Vec::new();
+        for y in 0..3 {
+            for x in 0..3 {
+                let i = y * 4 + x;
+                faces.push([fv(i), fv(i + 1), fv(i + 5)]);
+                faces.push([fv(i), fv(i + 5), fv(i + 4)]);
+            }
+        }
+        let face_count = faces.len();
+        Model {
+            vertices,
+            texcoords: Vec::new(),
+            normals: Vec::new(),
+            faces,
+            materials: Vec::new(),
+            face_materials: vec![None; face_count],
+        }
+    }
+
+    fn assert_vec3_close(actual: Vec3, expected: Vec3, context: &str) {
+        assert!(
+            (actual - expected).length() < 1e-5,
+            "{context}: expected {expected:?}, got {actual:?}"
+        );
     }
 
     fn clip_test_vertex(clip_pos: Vec4, source_bc: Vec3) -> ClippedVertex {
@@ -3519,7 +3890,7 @@ map_Bump normal-checker.ppm
             width: 48,
             height: 48,
             mode: RenderMode::Ssao,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(1.0, 0.6, 1.0),
             ..RenderOptions::default()
         };
@@ -3745,7 +4116,7 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Flat,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             render_state: RenderState {
                 clear_color: clear,
@@ -3776,7 +4147,7 @@ map_Bump normal-checker.ppm
             width: 32,
             height: 32,
             mode: RenderMode::Flat,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             render_state: RenderState {
                 clear_color: clear,
@@ -3796,7 +4167,7 @@ map_Bump normal-checker.ppm
             width: 32,
             height: 32,
             mode: RenderMode::NormalMap,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             normal_map: Some(neutral_normal_map(2)),
             ..RenderOptions::default()
@@ -3815,7 +4186,7 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Shadow,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             shadow: ShadowOptions {
@@ -3836,7 +4207,7 @@ map_Bump normal-checker.ppm
                 width: 64,
                 height: 64,
                 mode: RenderMode::Shadow,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(1.0, 0.6, 1.0),
                 shadow: ShadowOptions {
                     size: 64,
@@ -3868,7 +4239,7 @@ map_Bump normal-checker.ppm
                 width: 64,
                 height: 64,
                 mode: RenderMode::Shadow,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(1.0, 0.6, 1.0),
                 debug_outputs: true,
                 render_state,
@@ -3905,13 +4276,223 @@ map_Bump normal-checker.ppm
     }
 
     #[test]
+    fn perspective_matches_glam_reverse_z_infinite() {
+        let ours = perspective(0.8, 1.5, 2.25);
+        let reference = Mat4::perspective_infinite_reverse_rh(0.8, 1.5, 2.25);
+        assert!(
+            ours.abs_diff_eq(reference, 1e-6),
+            "{ours:?} vs {reference:?}"
+        );
+    }
+
+    fn camera_transforms(eye: Vec3, width: u32, height: u32) -> RenderTransforms {
+        let options = RenderOptions {
+            width,
+            height,
+            camera_eye: Some(eye),
+            ..RenderOptions::default()
+        };
+        build_transforms(&cube_model(true), &options, width, height, width, height)
+    }
+
+    /// The cube fixture's model matrix is a uniform scale about the origin.
+    fn cube_scene_to_model(p: Vec3) -> Vec3 {
+        p * (3.0f32.sqrt() / SCENE_RADIUS)
+    }
+
+    fn project_scene_point(transforms: &RenderTransforms, p: Vec3) -> Vec2 {
+        transform_point(&transforms.transform, cube_scene_to_model(p)).truncate()
+    }
+
+    /// The old camera (tinyrenderer's fixed-scale projection with the eye at
+    /// the view origin and an 8% viewport margin) was a pinhole at twice the
+    /// given eye distance, with `cot(fov / 2) = 0.84 * |eye|`. The perspective
+    /// camera must reproduce the old default image bit for bit at those
+    /// settings. The fixture is a frozen render from the old camera: it is
+    /// compared directly and never re-blessed.
+    #[test]
+    fn perspective_camera_reproduces_the_legacy_projection() {
+        let model = Model::load("resources/teapot.obj").unwrap();
+        let legacy_eye = Vec3::new(0.0, 0.25, 3.0);
+        let options = RenderOptions {
+            width: 64,
+            height: 64,
+            mode: RenderMode::Flat,
+            camera_eye: Some(legacy_eye * 2.0),
+            fov_y_degrees: (2.0 * (1.0 / (0.84 * legacy_eye.length())).atan()).to_degrees(),
+            light_dir: DEFAULT_LIGHT_DIR,
+            ..RenderOptions::default()
+        };
+        let output = render_model(&model, &options);
+        let legacy = image::open(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/legacy-camera-flat-teapot-64.png"),
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_images_close(&output.image, &legacy, 0);
+    }
+
+    #[test]
+    fn moving_the_camera_closer_enlarges_the_model() {
+        let width_at = |distance: f32| {
+            let transforms = camera_transforms(Vec3::new(0.0, 0.0, distance), 256, 256);
+            let left = project_scene_point(&transforms, Vec3::new(-0.5, 0.0, 0.0));
+            let right = project_scene_point(&transforms, Vec3::new(0.5, 0.0, 0.0));
+            (right - left).length()
+        };
+        let ratio = width_at(4.0) / width_at(8.0);
+        assert!((ratio - 2.0).abs() < 1e-3, "ratio {ratio}");
+    }
+
+    #[test]
+    fn centre_of_projection_is_the_camera_eye() {
+        let eye = Vec3::new(1.0, 2.0, 5.0);
+        let transforms = camera_transforms(eye, 256, 256);
+        let ray = (Vec3::new(0.3, -0.2, 0.0) - eye).normalize();
+        let pixels = [1.0, 2.0, 5.0].map(|t| project_scene_point(&transforms, eye + ray * t));
+        for pixel in &pixels[1..] {
+            assert!((*pixel - pixels[0]).length() < 1e-2, "{pixels:?}");
+        }
+    }
+
+    #[test]
+    fn non_square_frames_keep_square_pixels() {
+        let transforms = camera_transforms(TEST_EYE, 200, 100);
+        let width = (project_scene_point(&transforms, Vec3::new(0.5, 0.0, 0.0))
+            - project_scene_point(&transforms, Vec3::new(-0.5, 0.0, 0.0)))
+        .length();
+        let height = (project_scene_point(&transforms, Vec3::new(0.0, 0.5, 0.0))
+            - project_scene_point(&transforms, Vec3::new(0.0, -0.5, 0.0)))
+        .length();
+        assert!((width - height).abs() < 1e-3, "{width} x {height}");
+    }
+
+    #[test]
+    fn rasterization_reaches_the_frame_edges() {
+        // Close to a large triangle, the view is covered edge to edge.
+        let options = RenderOptions {
+            width: 48,
+            height: 32,
+            mode: RenderMode::Flat,
+            camera_eye: Some(Vec3::new(0.0, 0.0, 0.5)),
+            light_dir: Vec3::Z,
+            ..RenderOptions::default()
+        };
+        let output = render_model(&tiny_model(), &options);
+        for y in 0..32 {
+            for x in [0, 47] {
+                assert_ne!(
+                    output.image.get_pixel(x, y),
+                    &DEFAULT_BACKGROUND,
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_map_ignores_camera_clip_planes() {
+        let render = |near_plane: f32, far_plane: f32| {
+            let options = RenderOptions {
+                width: 64,
+                height: 64,
+                mode: RenderMode::Shadow,
+                camera_eye: Some(TEST_EYE),
+                light_dir: Vec3::new(1.0, 0.6, 1.0),
+                debug_outputs: true,
+                near_plane,
+                far_plane,
+                ..RenderOptions::default()
+            };
+            render_model(&occluder_model(), &options)
+                .debug
+                .shadow
+                .unwrap()
+        };
+        // Camera planes that cut through the scene must not cut the shadow map.
+        let reference = render(0.01, 1000.0);
+        assert_eq!(reference.as_raw(), render(2.5, 1000.0).as_raw());
+        assert_eq!(reference.as_raw(), render(0.01, 2.5).as_raw());
+    }
+
+    /// Signed distances from `p` to the three edge lines of a counter-clockwise
+    /// triangle in the xy plane; all positive means inside.
+    fn edge_distances(p: Vec3, triangle: [Vec3; 3]) -> [f32; 3] {
+        std::array::from_fn(|i| {
+            let a = triangle[i].truncate();
+            let b = triangle[(i + 1) % 3].truncate();
+            let edge = b - a;
+            edge.perp_dot(p.truncate() - a) / edge.length()
+        })
+    }
+
+    #[test]
+    fn shadow_map_matches_directional_light_ray_casts() {
+        let model = occluder_model();
+        let options = RenderOptions {
+            width: 128,
+            height: 128,
+            mode: RenderMode::Shadow,
+            camera_eye: Some(TEST_EYE),
+            light_dir: Vec3::new(1.0, 0.6, 1.0),
+            shadow: ShadowOptions {
+                size: 512,
+                ..ShadowOptions::default()
+            },
+            ..RenderOptions::default()
+        };
+        let (shadow_width, shadow_height) = shadow_dimensions(&options, 128, 128);
+        let transforms = build_transforms(&model, &options, 128, 128, shadow_width, shadow_height);
+        let shadow_map = render_shadow_map(&model, &transforms, shadow_width, shadow_height);
+
+        let receiver = [model.vertices[0], model.vertices[1], model.vertices[2]];
+        let occluder = [model.vertices[3], model.vertices[4], model.vertices[5]];
+        let light = options.light_dir.normalize();
+        let margin = 0.05;
+        let (mut lit, mut shadowed) = (0, 0);
+        for i in 0..=40 {
+            for j in 0..=40 {
+                let p = Vec3::new(-1.0 + i as f32 / 20.0, -1.0 + j as f32 / 20.0, 0.0);
+                if edge_distances(p, receiver).iter().any(|&d| d < margin) {
+                    continue;
+                }
+                // Follow the ray toward the light up to the occluder's plane.
+                let hit = p + light * (occluder[0].z / light.z);
+                let distances = edge_distances(hit, occluder);
+                let occluded = if distances.iter().all(|&d| d > margin) {
+                    true
+                } else if distances.iter().any(|&d| d < -margin) {
+                    false
+                } else {
+                    continue;
+                };
+                let visibility = sample_shadow(
+                    &shadow_map,
+                    shadow_width,
+                    shadow_height,
+                    transform_point(&transforms.light_transform, p),
+                    options.shadow,
+                );
+                assert_eq!(visibility < 0.5, occluded, "receiver point {p:?}");
+                if occluded {
+                    shadowed += 1;
+                } else {
+                    lit += 1;
+                }
+            }
+        }
+        assert!(shadowed > 20 && lit > 200, "shadowed {shadowed}, lit {lit}");
+    }
+
+    #[test]
     fn specular_material_adds_highlight_where_light_and_view_align() {
         let render = |specular: f32| {
             let options = RenderOptions {
                 width: 32,
                 height: 32,
                 mode: RenderMode::Gouraud,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(0.0, 0.0, 1.0),
                 material: Material {
                     base_color: Rgb([100, 100, 100]),
@@ -3960,7 +4541,7 @@ map_Bump normal-checker.ppm
                 width: 32,
                 height: 32,
                 mode,
-                camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+                camera_eye: Some(TEST_EYE),
                 light_dir: Vec3::new(0.0, 0.0, -1.0),
                 ..RenderOptions::default()
             };
@@ -3978,6 +4559,110 @@ map_Bump normal-checker.ppm
                 mode.as_str()
             );
         }
+    }
+
+    #[test]
+    fn cube_fixture_faces_point_outward() {
+        let cube = cube_model(true);
+        for face_idx in 0..cube.faces.len() {
+            let centroid = cube.faces[face_idx]
+                .iter()
+                .map(|fv| cube.vertices[fv.v])
+                .sum::<Vec3>()
+                / 3.0;
+            assert!(cube.face_normal(face_idx).dot(centroid) > 0.0);
+        }
+    }
+
+    #[test]
+    fn generated_normals_average_every_face_without_a_crease_limit() {
+        for shared_corners in [true, false] {
+            let mut cube = cube_model(shared_corners);
+            cube.generate_missing_normals(180.0);
+            for face_idx in 0..cube.faces.len() {
+                for corner in 0..3 {
+                    let position = cube.vertices[cube.faces[face_idx][corner].v];
+                    assert_vec3_close(
+                        cube.vertex_normal(face_idx, corner),
+                        position.normalize(),
+                        &format!("shared={shared_corners} face {face_idx} corner {corner}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_normals_keep_edges_sharper_than_the_crease_angle_hard() {
+        let mut cube = cube_model(false);
+        cube.generate_missing_normals(DEFAULT_CREASE_ANGLE_DEG);
+        for face_idx in 0..cube.faces.len() {
+            for corner in 0..3 {
+                assert_vec3_close(
+                    cube.vertex_normal(face_idx, corner),
+                    cube.face_normal(face_idx),
+                    &format!("face {face_idx} corner {corner}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_normals_on_a_flat_grid_point_along_its_face() {
+        let mut grid = grid_model();
+        grid.generate_missing_normals(DEFAULT_CREASE_ANGLE_DEG);
+        for face_idx in 0..grid.faces.len() {
+            for corner in 0..3 {
+                assert_vec3_close(grid.vertex_normal(face_idx, corner), Vec3::Z, "grid");
+            }
+        }
+        // Every corner of a vertex shares one stored normal.
+        assert_eq!(grid.normals.len(), grid.vertices.len());
+    }
+
+    #[test]
+    fn generated_normals_leave_authored_normals_alone() {
+        let mut model = tiny_model();
+        let mut untextured = model.faces[0];
+        for fv in &mut untextured {
+            fv.vn = None;
+        }
+        model.faces.push(untextured);
+        model.face_materials.push(None);
+        model.generate_missing_normals(DEFAULT_CREASE_ANGLE_DEG);
+        assert_eq!(model.faces[0].map(|fv| fv.vn), [Some(0); 3]);
+        assert_eq!(model.normals[0], Vec3::new(0.0, 0.0, 1.0));
+        assert!(model.faces[1].iter().all(|fv| fv.vn.is_some()));
+    }
+
+    #[test]
+    fn teapot_loads_with_smooth_unit_normals_facing_out() {
+        let faceted = Model::load_with_options(
+            "resources/teapot.obj",
+            ObjLoadOptions {
+                crease_angle_deg: None,
+            },
+        )
+        .unwrap();
+        assert!(faceted.normals.is_empty());
+
+        let model = Model::load("resources/teapot.obj").unwrap();
+        let mut smoothed_corners = 0;
+        for face_idx in 0..model.faces.len() {
+            for corner in 0..3 {
+                let Some(index) = model.faces[face_idx][corner].vn else {
+                    continue;
+                };
+                smoothed_corners += 1;
+                let normal = model.normals[index];
+                assert!((normal.length() - 1.0).abs() < 1e-4);
+                assert!(normal.dot(model.face_normal(face_idx)) > 0.0);
+            }
+        }
+        // Only degenerate faces (at the lid knob and base poles) keep the
+        // per-face fallback.
+        assert!(smoothed_corners > model.faces.len() * 3 * 9 / 10);
+        assert!(model.normals.len() < smoothed_corners);
     }
 
     #[test]
@@ -4034,7 +4719,7 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Ssao,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             ..RenderOptions::default()
@@ -4063,16 +4748,190 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Flat,
-            camera_eye: Some(Vec3::new(0.0, 0.0, 3.0)),
+            camera_eye: Some(TEST_EYE),
             light_dir: Vec3::new(0.0, 0.0, 1.0),
             debug_outputs: true,
             ..RenderOptions::default()
         };
         let output = render_model(&tiny_model(), &options);
         assert_eq!(output.image.dimensions(), (64, 64));
-        assert_eq!(image_checksum(&output.image), 2_577_244);
+        assert_eq!(image_checksum(&output.image), 2_416_368);
         assert!(output.debug.depth.is_some());
         assert!(output.debug.normals.is_some());
+    }
+
+    #[test]
+    fn clip_space_winding_matches_screen_winding() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        let cube = cube_model(true);
+        let options = RenderOptions {
+            width: 256,
+            height: 256,
+            camera_eye: Some(Vec3::new(0.0, 0.25, 3.0)),
+            ..RenderOptions::default()
+        };
+        let transforms = build_transforms(&cube, &options, 256, 256, 256, 256);
+        let mut rng = StdRng::seed_from_u64(0x5eed);
+        let (mut checked, mut crossing) = (0, 0);
+        for _ in 0..4000 {
+            // Scene points reach well behind the eye, so some triangles have
+            // corners behind the centre of projection (w <= 0).
+            let corners: [Vec3; 3] = std::array::from_fn(|_| {
+                Vec3::new(
+                    rng.gen_range(-4.0..4.0),
+                    rng.gen_range(-4.0..4.0),
+                    rng.gen_range(-4.0..8.0),
+                )
+            });
+            let triangle: [ClippedVertex; 3] = std::array::from_fn(|i| {
+                clipped_vertex_for_source(corners[i], &transforms, [Vec3::X, Vec3::Y, Vec3::Z][i])
+            });
+            let winding = homogeneous_winding(&triangle);
+            let pieces = clip_varying_triangle_against_frustum(
+                triangle,
+                options.near_plane,
+                options.far_plane,
+            );
+            if triangle.iter().any(|v| v.clip_pos.w <= 0.0) && !pieces.is_empty() {
+                crossing += 1;
+            }
+            for piece in &pieces {
+                let screen = project_clipped_triangle(piece, &transforms).screen_coords;
+                let [a, b, c] = screen.map(Vec3::truncate);
+                let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                if area.abs() < 1.0 {
+                    // Slivers: their winding is numerically meaningless.
+                    continue;
+                }
+                checked += 1;
+                for front_face in [FrontFace::Ccw, FrontFace::Cw] {
+                    for cull_mode in [CullMode::Back, CullMode::Front] {
+                        assert_eq!(
+                            should_cull_winding(winding, cull_mode, front_face),
+                            should_cull_screen_triangle_with_front_face(
+                                &screen, cull_mode, front_face
+                            ),
+                            "corners {corners:?}, winding {winding}, piece area {area}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "only {checked} pieces checked");
+        assert!(
+            crossing > 20,
+            "only {crossing} triangles crossed behind the eye"
+        );
+    }
+
+    #[test]
+    fn floor_crossing_behind_the_eye_keeps_its_winding() {
+        let cube = cube_model(true);
+        let options = RenderOptions {
+            width: 128,
+            height: 128,
+            camera_eye: Some(TEST_EYE),
+            ..RenderOptions::default()
+        };
+        let transforms = build_transforms(&cube, &options, 128, 128, 128, 128);
+        // An upward-facing floor below the eye, running from in front of the
+        // camera to far behind it.
+        let corner = |v: usize| FaceVertex {
+            v,
+            vt: None,
+            vn: None,
+        };
+        let mut floor = Model {
+            vertices: vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(0.0, -1.0, 6.0),
+                Vec3::new(1.0, -1.0, 0.0),
+            ],
+            texcoords: Vec::new(),
+            normals: Vec::new(),
+            faces: vec![[corner(0), corner(1), corner(2)]],
+            materials: Vec::new(),
+            face_materials: vec![None],
+        };
+        assert!(floor.face_normal(0).y > 0.0);
+        assert!(face_clip_vertices(&floor, &transforms, 0)
+            .iter()
+            .any(|v| v.clip_pos.w < 0.0));
+
+        let back_culling = RenderState {
+            cull_mode: CullMode::Back,
+            ..RenderState::default()
+        };
+        let mut pieces = Vec::new();
+        assert!(prepare_face(
+            &floor,
+            &transforms,
+            0,
+            options.near_plane,
+            options.far_plane,
+            back_culling,
+            &mut pieces
+        ));
+        for piece in &pieces {
+            let [a, b, c] = piece.screen_coords.map(Vec3::truncate);
+            assert!((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) > 0.0);
+        }
+
+        floor.faces[0].swap(1, 2);
+        assert!(!prepare_face(
+            &floor,
+            &transforms,
+            0,
+            options.near_plane,
+            options.far_plane,
+            back_culling,
+            &mut pieces
+        ));
+    }
+
+    /// Pins culled output so the culling stage can be moved without changing
+    /// a single pixel or depth value.
+    #[test]
+    fn culled_teapot_renders_stay_stable() {
+        let model = Model::load("resources/teapot.obj").unwrap();
+        let mut checksums = Vec::new();
+        for mode in [RenderMode::Flat, RenderMode::Gouraud] {
+            for cull_mode in [CullMode::Back, CullMode::Front] {
+                let options = RenderOptions {
+                    width: 64,
+                    height: 64,
+                    mode,
+                    camera_eye: Some(DEFAULT_CAMERA_EYE),
+                    render_state: RenderState {
+                        cull_mode,
+                        ..RenderState::default()
+                    },
+                    ..RenderOptions::default()
+                };
+                let output = render_model(&model, &options);
+                checksums.push((
+                    image_checksum(&output.image),
+                    depth_bits_hash(&output.zbuffer),
+                ));
+            }
+        }
+        assert_eq!(checksums, CULLED_TEAPOT_CHECKSUMS);
+    }
+
+    const CULLED_TEAPOT_CHECKSUMS: [(u64, u64); 4] = [
+        (1_476_941, 13_238_127_573_834_299_401),
+        (946_631, 4_147_875_905_691_957_963),
+        (1_475_698, 13_238_127_573_834_299_401),
+        (947_016, 4_147_875_905_691_957_963),
+    ];
+
+    /// Order-sensitive hash of the exact depth bits.
+    fn depth_bits_hash(zbuffer: &[f32]) -> u64 {
+        zbuffer.iter().fold(0u64, |hash, z| {
+            hash.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(z.to_bits() as u64)
+        })
     }
 
     #[test]
@@ -4082,7 +4941,7 @@ map_Bump normal-checker.ppm
             width: 64,
             height: 64,
             mode: RenderMode::Flat,
-            camera_eye: Some(Vec3::new(0.0, 0.25, 3.0)),
+            camera_eye: Some(DEFAULT_CAMERA_EYE),
             light_dir: DEFAULT_LIGHT_DIR,
             debug_outputs: false,
             ..RenderOptions::default()

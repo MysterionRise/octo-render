@@ -34,6 +34,8 @@ The second important issue was raster determinism. The top-left fill rule means 
 
 The third issue was lighting consistency, found by auditing the gallery rather than by a failing test. Face normals were computed inward, which Lambert shading hid because the light vector was flipped too. The shadow-map camera used the unflipped vector, so it sat opposite the light that shaded the model, and the shadow render was mostly dark with a stray bright crescent. The same audit found that specular was never evaluated (`--specular`, `--shininess`, and MTL `Ks`/`Ns` were silently ignored), and that unlit fragments were discarded before the depth write, leaving holes behind back-lit surfaces. The fix defines one outward-normal, toward-the-light convention, adds Blinn-Phong specular, and gives the shadow pass its own fixed raster state. Tests now pin each behaviour.
 
+A follow-up audit found the camera itself was off. The look-at put the eye at the view-space origin while the projection assumed a scene-centred view, so the centre of projection sat one camera-distance behind the eye and perspective was half as strong as requested. Non-square images were stretched, and an 8% viewport margin moved clipping inside the frame. The camera is now an OpenGL-style vertical-FOV perspective with reversed-Z depth. Before switching, a test showed it reproduces the old default image bit for bit with the eye doubled and a 43.15° field of view, which confirmed the diagnosis.
+
 The fourth important issue was evidence. The project now has deterministic golden-image tests, debug outputs, gallery renders, and Criterion benchmarks instead of relying on screenshots alone.
 
 ## Correctness Strategy
@@ -62,10 +64,9 @@ The renderer is still intentionally smaller than OpenGL:
 - no stencil buffer, MSAA, cubemaps, instancing, or shader language
 - blending supports alpha/additive modes, not arbitrary blend equations
 - shadow mapping uses fixed bias and simple PCF
-- the bundled meshes have no `vn` normals, so Gouraud shading uses face normals and looks faceted
-- SSAO is deterministic and useful for pipeline demonstration, not physically based
+- SSAO is deterministic and useful for pipeline demonstration, not physically based; its depth-only test bands curved surfaces
 - CPU performance is educational and measurable, not production real-time
 
 ## Next Work
 
-The highest-value next steps are one measured optimization pass (band-parallel rasterization behind a `--threads` flag, verified byte-identical to the sequential path), smooth vertex-normal generation for meshes without `vn`, richer material assets, and a headless `wgpu` screenshot path for a side-by-side CPU/GPU comparison.
+The highest-value next steps are one measured optimization pass (band-parallel rasterization behind a `--threads` flag, verified byte-identical to the sequential path), richer material assets, and a headless `wgpu` screenshot path for a side-by-side CPU/GPU comparison.

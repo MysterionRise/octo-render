@@ -71,11 +71,15 @@ wireframe, flat, gouraud, texture, normal-map, normal-debug, shadow, ssao
 Scene options:
 
 ```text
---camera x,y,z        camera eye in normalized scene space [default: 0,0.25,3]
+--camera x,y,z        camera eye in normalized scene space [default: 0,0.5,6]
+--fov deg             vertical field of view [default: 45]
+--near z, --far z     clip planes, distance from the eye [default: 0.01, 1000]
 --light x,y,z         direction toward the light, scene space [default: 1,1,1]
 ```
 
 The single `--light` vector drives diffuse shading, specular highlights, and the shadow-map camera, so shading and shadows always agree.
+
+`--camera` is a true eye position: moving it closer enlarges the model. Before October 2026 the projection's centre of projection sat at twice the given distance, so an older command with `--camera x,y,z` matches `--camera 2x,2y,2z --fov 43.15` today.
 
 OpenGL-style CPU render-state options:
 
@@ -156,15 +160,17 @@ Implemented CPU features:
 
 - Bresenham line drawing
 - OBJ parser for `v`, `vt`, `vn`, polygonal `f` faces, `mtllib`, and `usemtl`
+- Smooth vertex normals for meshes without `vn`: positions are welded, face normals are angle-weighted, and edges sharper than a crease angle stay hard (`--crease-angle`, default 60°)
 - MTL parser for `Ka`, `Kd`, `Ks`, `Ns`, alpha, diffuse maps, and normal-map keys
 - Fan triangulation for quads/ngons
 - Negative OBJ index support
-- Perspective projection and viewport mapping
+- OpenGL-style perspective camera: vertical field of view, aspect-correct, reversed-Z depth with an infinite far plane, and a viewport that clips at the frame edges
 - Attribute-preserving six-plane frustum clipping before viewport transform
 - Barycentric triangle rasterization
 - Deterministic top-left triangle fill rule with pixel-center sampling
 - Z-buffer visibility
 - Explicit render state: culling, front-face winding, depth test/write, fill mode, scissor, clear state, color write, and blending
+- Back-face culling before clipping, from the sign of the homogeneous `(x, y, w)` determinant, so culled faces skip clipping and vertex shading
 - Blend modes: off, source-over alpha, additive
 - Texture sampler wrap/filter modes: repeat, clamp, nearest, linear, simplified mipmap LOD
 - Material controls for base color, ambient, diffuse, specular, shininess, alpha, MTL defaults, and CLI overrides
@@ -173,14 +179,14 @@ Implemented CPU features:
 - Shader-style vertex/fragment trait
 - Flat, Gouraud, checker/file texture, normal-map, normal-debug, shadow, and SSAO render modes
 - Perspective-correct interpolation for shader varyings
-- Configurable shadow-map size, bias, and PCF filtering
+- Configurable shadow-map size, bias, and PCF filtering, from an orthographic directional shadow camera with its own clip planes
 - Debug outputs for depth, normals, shadow map, and AO
 
 ## OpenGL-Style Coverage
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Vertex transform | Implemented | Rust matrix path for model/view/projection/viewport |
+| Vertex transform | Implemented | Rust matrix path for model/view/projection/viewport; vertical-FOV reversed-Z perspective |
 | Frustum clipping | Implemented | Six-plane clipping in the renderer's projection convention; emitted vertices preserve varyings |
 | Triangle rasterization | Implemented | Barycentric rasterizer with top-left fill rule and pixel-center sampling |
 | Depth buffer | Implemented | Clear depth, depth test, and depth write state |
@@ -193,15 +199,15 @@ Implemented CPU features:
 
 ## Performance Snapshot
 
-Detailed methodology and Criterion results are in [docs/benchmarks.md](docs/benchmarks.md). Short version, rendering `resources/teapot.obj` at `128x128` under Criterion after the correctness sprint (Linux, Intel Xeon @ 2.10 GHz, single-threaded):
+Detailed methodology and Criterion results are in [docs/benchmarks.md](docs/benchmarks.md). Short version, rendering `resources/teapot.obj` at `128x128` under Criterion with the current camera (Linux, Intel Xeon @ 2.10 GHz, single-threaded):
 
 | Mode | Triangles | Time | Throughput |
 | --- | ---: | ---: | ---: |
-| flat | 6,320 | 2.7943 ms | 2.26M triangles/sec |
-| Gouraud | 6,320 | 3.7267 ms | 1.70M triangles/sec |
-| shadow | 6,320 | 6.3679 ms | 0.99M triangles/sec |
+| flat | 6,320 | 1.3986 ms | 4.52M triangles/sec |
+| Gouraud | 6,320 | 2.0194 ms | 3.13M triangles/sec |
+| shadow | 6,320 | 3.7565 ms | 1.68M triangles/sec |
 
-These are not comparable with the July macOS numbers in the same doc. The doc's re-measurement section compares before and after on one machine and explains why flat mode got slower.
+These are not comparable with the July macOS numbers in the same doc. The doc's later sections compare before and after on one machine for each change.
 
 For more systematic measurements:
 
@@ -209,7 +215,7 @@ For more systematic measurements:
 cargo bench
 ```
 
-Benchmarks cover line drawing, z-buffered triangle rasterization, full-frame software renders, clipped vs unclipped triangles, texture filters, shadow filters, and resolution scaling.
+Benchmarks cover line drawing, z-buffered triangle rasterization, full-frame software renders, clipped vs unclipped triangles, back-face culling, texture filters, shadow filters, and resolution scaling.
 They also cover blending and mipmap sampling variants.
 
 ## Quality Gates
@@ -231,7 +237,8 @@ Current test coverage includes:
 - top-left shared-edge fill behavior
 - z-buffer replacement behavior
 - render-state depth toggles
-- culling classification
+- culling classification, including a seeded property test that the clip-space winding test agrees with screen-space winding, and a floor triangle that crosses behind the eye
+- culled teapot renders pinned bit-for-bit (image and depth) across the culling refactor
 - texture sampler wrap behavior
 - texture sampler linear and mipmap filtering
 - alpha and additive blending
@@ -242,11 +249,14 @@ Current test coverage includes:
 - Blinn-Phong specular: highlight peak, back-light rejection, and render-level highlight
 - unlit surfaces still write depth in every lit mode
 - faces without UVs do not inherit the previous face's texture coordinates
+- generated normals: cube corners with and without a crease limit, welding of duplicated vertices, flat grids, authored `vn` left alone, and unit outward normals on the teapot
 - an occluder casts a shadow, and PCF changes the shadow edge
-- the shadow pass ignores camera raster state (scissor, culling, depth writes, blending)
+- the shadow pass ignores camera raster state (scissor, culling, depth writes, blending) and camera clip planes
+- the shadow map agrees with exact directional ray casts from receiver points toward the light
 - shadow-map size/filter options
 - debug outputs for depth, normals, shadow, and AO
 - viewport transform
+- camera: the projection matches glam's reversed-Z infinite perspective, moving the eye closer enlarges the model, points along one eye ray land on one pixel, non-square frames keep square pixels, and rasterization reaches the frame edges
 - SSAO bounds and run-to-run determinism
 - perspective-correct interpolation
 - deterministic golden checksum and golden-image comparison
@@ -265,11 +275,9 @@ The CPU renderer is the OpenGL-style reimplementation. The GPU viewer is intenti
 - Frustum clipping is implemented for this renderer's projection path, but it is not a full OpenGL conformance clipper.
 - Mipmap LOD uses a simplified screen-space triangle estimate, not GLSL derivatives.
 - Normal-map mode consumes either a CLI normal-map texture or an MTL normal-map key; tangent generation remains minimal.
-- The bundled OBJ meshes ship without `vn` normals, so Gouraud and specular shading fall back to per-face normals and look faceted. Smooth vertex-normal generation is not implemented yet.
-- Moving `--camera` closer strengthens perspective but does not enlarge the model. The view matrix puts the eye at the view-space origin, while the projection places its centre of projection one camera-distance further back. Fixing this reframes every render and the clipping tests, so it is tracked as follow-up work.
 - The bundled textures are 4x4 PPMs, so the textured and mipmap gallery images show magnification; demonstrating minification needs a larger texture.
 - Shadow mapping supports configurable bias and simple 3x3 PCF, but not cascades or slope-scaled bias.
-- SSAO is deterministic and useful as a pipeline demonstration, but not physically based.
+- SSAO is deterministic and useful as a pipeline demonstration, but not physically based. It compares raw depth against a fixed threshold without using normals, so curved surfaces pick up faint per-triangle bands.
 - Blending supports alpha and additive modes, but not full `glBlendFunc`/`glBlendEquation` configurability.
 - The CPU renderer is optimized enough for portfolio evidence, not production real-time rendering.
 
