@@ -17,6 +17,7 @@ A separate `wgpu` viewer under `crates/` is an interactive GPU comparison layer.
 - **Tests**: `cargo test --workspace`. CPU renderer tests live in the `#[cfg(test)] mod tests` at the bottom of `src/renderer.rs`; the CLI parser test is in `src/main.rs`. The `crates/*` GPU stack has no tests.
 - **Benchmarks**: `cargo bench` (Criterion, `benches/line_benchmark.rs`: lines, triangles, full frames, clipping, texture filters, blending, shadow filters, resolution scaling)
 - **Gallery**: `scripts/render-gallery.sh` regenerates every image in `renders/` with the exact commands used for the README.
+- **Demo reel**: `scripts/make-demo.sh` renders `examples/demo.rs` (a 21 s, 9:16 storyboard of `render_scene` frames with 2×2 supersampling) and uses ffmpeg (libx264 + drawtext) to add captions, a progress bar, and an end card, writing `renders/demo/octo-render-demo.mp4` and a GIF under 8 MB. `--preview` renders 270×480 into `target/demo-preview/` in seconds. Frames go to `target/demo/`.
 - **Golden images**: `UPDATE_GOLDENS=1 cargo test -p octo-render golden` rewrites `tests/golden/*.png` from the current output. Only do this for an intentional pixel change, and inspect the image diff before committing. `tests/golden/legacy-camera-flat-teapot-64.png` is a frozen render from the pre-October-2026 camera; it is compared directly and never re-blessed.
 
 ## Architecture
@@ -35,6 +36,7 @@ Workspace root package `octo-render`:
 - **`src/main.rs`** — `app` CLI: hand-rolled flag parser, material and texture resolution, writes the image plus optional debug PNGs
 - **`benches/line_benchmark.rs`** — Criterion suite
 - **`scripts/render-gallery.sh`** — reproducible gallery renders
+- **`examples/demo.rs`** + **`scripts/make-demo.sh`** — the demo reel: storyboard segments (view, cast, eased camera orbit, light sweep), per-frame procedural meshes, parallel frame rendering, caption timeline, ffmpeg assembly
 
 `crates/` (GPU viewer): `core` (mesh types), `asset` (its own OBJ loader), `gpu` (wgpu context, buffers, textures), `renderer` (shadow, forward, post-process passes), `app` (the `octo-app` binary, winit + egui), and `shaders/*.wgsl`.
 
