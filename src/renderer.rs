@@ -6,6 +6,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+pub mod procedural;
+
 const EPSILON: f32 = 1e-6;
 const DEFAULT_BACKGROUND: Rgb<u8> = Rgb([18, 20, 24]);
 

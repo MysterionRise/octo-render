@@ -160,6 +160,7 @@ Implemented CPU features:
 
 - Bresenham line drawing
 - Multi-object scenes (`render_scene`): several models with their own transforms and materials sharing one z-buffer and one shadow map
+- Procedural meshes (`renderer::procedural`): floor grid and disk, sphere, torus, torus knot, superformula supershapes, and a rippled twisted torus, with analytic normals and watertight seams
 - OBJ parser for `v`, `vt`, `vn`, polygonal `f` faces, `mtllib`, and `usemtl`
 - Smooth vertex normals for meshes without `vn`: positions are welded, face normals are angle-weighted, and edges sharper than a crease angle stay hard (`--crease-angle`, default 60°)
 - MTL parser for `Ka`, `Kd`, `Ks`, `Ns`, alpha, diffuse maps, and normal-map keys
@@ -259,6 +260,7 @@ Current test coverage includes:
 - viewport transform
 - scenes: objects occlude by depth regardless of list order, a floating panel shadows the floor, scaling a scene and its radius together keeps the shadow map bit for bit, and an empty scene renders cleanly
 - every render mode pinned bit for bit (image, depth, and debug maps)
+- procedural meshes: watertight and outward-wound after exact welding, unit normals agreeing with faces, expected counts, volumes within 2% of the analytic shapes, and back-face culling invisible on closed shapes
 - camera: the projection matches glam's reversed-Z infinite perspective, moving the eye closer enlarges the model, points along one eye ray land on one pixel, non-square frames keep square pixels, and rasterization reaches the frame edges
 - SSAO bounds and run-to-run determinism
 - perspective-correct interpolation

@@ -31,6 +31,7 @@ Workspace root package `octo-render`:
   - `Shader` trait and built-ins: `GouraudShader`, `TextureShader`, `NormalMapShader`, `NormalDebugShader`, `DepthShader`, `ShadowShader`
   - Textures: `TextureSampler`, `sample_texture_with_mipmaps`, `build_mipmaps`
   - `render_scene(&[SceneObject], &RenderOptions, scene_radius) -> RenderOutput` orchestrates a frame: shadow-map depth pass over every object (fixed depth-only state) → main pass per object (each `SceneObject` has its own model-to-scene transform and material, sharing one z-buffer) → SSAO post-process → debug maps → vertical flip. `render_model(&Model, &RenderOptions)` is a scene of one object recentred and scaled to `SCENE_RADIUS` (`SceneObject::normalized`, `normalized_transform`).
+- **`src/procedural.rs`** — `renderer::procedural`: meshes generated from math with analytic (or central-difference) unit normals, outward CCW winding, and bit-exact seams and poles: `grid_surface` (shared parametric builder), `ground_grid`, `ground_disk`, `uv_sphere`, `torus`, `torus_knot` (parallel-transport frame), `parametric`, `supershape` (`Superformula`), `twisted_torus` (`TwistedTorus`). Tests weld by exact position and check watertightness, winding, volumes, and normals.
 - **`src/main.rs`** — `app` CLI: hand-rolled flag parser, material and texture resolution, writes the image plus optional debug PNGs
 - **`benches/line_benchmark.rs`** — Criterion suite
 - **`scripts/render-gallery.sh`** — reproducible gallery renders
