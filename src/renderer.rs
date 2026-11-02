@@ -24,21 +24,40 @@ pub const DEFAULT_FOV_Y_DEGREES: f32 = 45.0;
 /// Fraction of diffuse light kept where the shadow map reports full occlusion.
 const SHADOWED_DIFFUSE: f32 = 0.35;
 
-/// Radius of the normalized scene: `build_transforms` scales every model so its
+/// Radius of the normalized scene: `render_model` scales every model so its
 /// bounding box fits inside a sphere of this radius around the origin.
-const SCENE_RADIUS: f32 = 2.0;
+pub const SCENE_RADIUS: f32 = 2.0;
 
-/// Orthographic shadow camera: half-width of its view box (a little wider than
-/// the scene), distance of its eye from the scene centre, and clip planes that
-/// keep the whole scene between them.
-const SHADOW_HALF_EXTENT: f32 = SCENE_RADIUS * 1.025;
-const SHADOW_EYE_DISTANCE: f32 = 4.0;
-const SHADOW_NEAR_PLANE: f32 = SHADOW_EYE_DISTANCE - SCENE_RADIUS * 1.25;
-const SHADOW_FAR_PLANE: f32 = SHADOW_EYE_DISTANCE + SCENE_RADIUS * 1.25;
+/// Orthographic shadow camera for a scene of a given radius around the origin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShadowCamera {
+    /// Half-width of the view box, a little wider than the scene.
+    half_extent: f32,
+    /// Distance of the camera's eye from the scene centre.
+    eye_distance: f32,
+    /// Clip planes that keep the whole scene between them.
+    near_plane: f32,
+    far_plane: f32,
+    /// Shadow-map depth slope in NDC per scene unit.
+    depth_per_unit: f32,
+}
 
-/// Shadow-map depth slope in NDC per scene unit. Through the 255-deep viewport
-/// that is ~32 depth units per scene unit, so the default bias of 4 is 1/8 unit.
-const SHADOW_DEPTH_PER_UNIT: f32 = 0.25;
+/// The shadow camera scales with the scene: it is the radius-2 camera scaled by
+/// `radius / 2`. At [`SCENE_RADIUS`] it has a half-extent of 2.05, an eye 4
+/// units out, planes at 1.5 and 6.5, and 0.25 NDC (~32 depth units) per scene
+/// unit, so the default `--shadow-bias` of 4 depth units is 1/8 scene unit.
+/// Bias is in depth units, so in a scene of radius `r` one unit is `r / 63.75`
+/// scene units.
+fn shadow_camera(radius: f32) -> ShadowCamera {
+    let eye_distance = 2.0 * radius;
+    ShadowCamera {
+        half_extent: radius * 1.025,
+        eye_distance,
+        near_plane: eye_distance - radius * 1.25,
+        far_plane: eye_distance + radius * 1.25,
+        depth_per_unit: 0.5 / radius,
+    }
+}
 
 /// Default crease angle, in degrees, for vertex normals generated when an OBJ
 /// has no `vn`: faces meeting at a sharper angle keep a hard edge.
@@ -2254,6 +2273,8 @@ pub struct RenderOptions {
     pub mode: RenderMode,
     /// Camera eye in normalized scene space; `None` uses [`DEFAULT_CAMERA_EYE`].
     pub camera_eye: Option<Vec3>,
+    /// Point the camera looks at; `None` is the scene centre (the origin).
+    pub camera_target: Option<Vec3>,
     /// Vertical field of view of the camera, in degrees.
     pub fov_y_degrees: f32,
     /// Direction toward the light in normalized scene space. Shading and the
@@ -2279,6 +2300,7 @@ impl Default for RenderOptions {
             height: 1024,
             mode: RenderMode::Shadow,
             camera_eye: None,
+            camera_target: None,
             fov_y_degrees: DEFAULT_FOV_Y_DEGREES,
             light_dir: DEFAULT_LIGHT_DIR.normalize(),
             debug_outputs: false,
@@ -2333,81 +2355,179 @@ struct RenderTransforms {
     /// Eye-space direction toward the light, used by every lit shader.
     light_dir_view: Vec3,
     /// Clip planes of the pass these transforms drive, as distances in front
-    /// of its eye. The camera and the shadow camera each have their own.
+    /// of its eye.
     near_plane: f32,
     far_plane: f32,
+    /// The shadow camera's own clip planes: the camera's must not cut the
+    /// shadow map.
+    shadow_near_plane: f32,
+    shadow_far_plane: f32,
 }
 
+/// One object in a scene: a mesh, its model-to-scene transform, and its
+/// material.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneObject<'a> {
+    pub model: &'a Model,
+    pub transform: Mat4,
+    pub material: Material,
+}
+
+impl<'a> SceneObject<'a> {
+    /// The model recentred and scaled to fit [`SCENE_RADIUS`], as
+    /// [`render_model`] draws it.
+    pub fn normalized(model: &'a Model, material: Material) -> Self {
+        SceneObject {
+            model,
+            transform: normalized_transform(model, SCENE_RADIUS),
+            material,
+        }
+    }
+}
+
+/// Transform that recentres a model on the origin and scales its bounding box
+/// to fit inside a sphere of `radius`.
+pub fn normalized_transform(model: &Model, radius: f32) -> Mat4 {
+    let bounds = model.bounds().unwrap_or(ModelBounds {
+        min: Vec3::splat(-1.0),
+        max: Vec3::splat(1.0),
+    });
+    let model_center = bounds.center();
+    let model_scale = radius / bounds.radius();
+    Mat4::from_scale(Vec3::splat(model_scale)) * Mat4::from_translation(-model_center)
+}
+
+/// Render one model, recentred and scaled into the normalized scene, with
+/// `options.material`.
 pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
+    render_scene(
+        &[SceneObject::normalized(model, options.material)],
+        options,
+        SCENE_RADIUS,
+    )
+}
+
+/// Render several objects into one frame: they share the z-buffer and the
+/// shadow map, and each uses its own transform and material
+/// (`options.material` is ignored). `scene_radius` is the radius around the
+/// origin that holds every object; the shadow camera is sized to it.
+/// Textures, render state, camera, and light come from `options`.
+pub fn render_scene(
+    objects: &[SceneObject],
+    options: &RenderOptions,
+    scene_radius: f32,
+) -> RenderOutput {
     let width = options.width.max(1);
     let height = options.height.max(1);
     let (shadow_width, shadow_height) = shadow_dimensions(options, width, height);
-    let transforms = build_transforms(model, options, width, height, shadow_width, shadow_height);
+    let frame = frame_transforms(
+        options,
+        width,
+        height,
+        shadow_width,
+        shadow_height,
+        scene_radius,
+    );
+    let per_object: Vec<RenderTransforms> = objects
+        .iter()
+        .map(|object| object_transforms(&frame, object.transform))
+        .collect();
     let mut image = ImageBuffer::from_pixel(width, height, options.render_state.clear_color);
     let mut zbuffer = vec![options.render_state.clear_depth; (width * height) as usize];
     let mut debug = DebugImages::default();
 
+    let scene = objects.iter().zip(&per_object);
     if options.mode == RenderMode::Wireframe
         || options.render_state.fill_mode == FillMode::Wireframe
     {
-        render_wireframe(model, &transforms, options, &mut image);
+        for (object, transforms) in scene {
+            render_wireframe(object.model, transforms, options.render_state, &mut image);
+        }
     } else {
         match options.mode {
             RenderMode::Wireframe => unreachable!("wireframe mode is handled before solid modes"),
-            RenderMode::Flat => render_flat(model, &transforms, options, &mut zbuffer, &mut image),
+            RenderMode::Flat => {
+                for (object, transforms) in scene {
+                    render_flat(
+                        object.model,
+                        transforms,
+                        &object.material,
+                        options.render_state,
+                        &mut zbuffer,
+                        &mut image,
+                    );
+                }
+            }
             RenderMode::Gouraud => {
-                let mut shader = GouraudShader::new(
-                    model,
-                    transforms.transform,
-                    transforms.model_view,
-                    transforms.light_dir_view,
-                    options.material,
-                );
-                render_shader(
-                    model,
-                    &transforms,
-                    &mut shader,
-                    &mut zbuffer,
-                    &mut image,
-                    options.render_state,
-                );
+                for (object, transforms) in scene {
+                    let mut shader = GouraudShader::new(
+                        object.model,
+                        transforms.transform,
+                        transforms.model_view,
+                        transforms.light_dir_view,
+                        object.material,
+                    );
+                    render_shader(
+                        object.model,
+                        transforms,
+                        &mut shader,
+                        &mut zbuffer,
+                        &mut image,
+                        options.render_state,
+                    );
+                }
             }
             RenderMode::Texture => {
+                // Objects without UVs get no texture; with UVs and no texture
+                // given, they get the checker.
                 let checker = checker_texture(128);
-                let diffuse = options
-                    .texture
-                    .as_ref()
-                    .or_else(|| (!model.texcoords.is_empty()).then_some(&checker));
-                let generated_mipmaps = if options.texture_sampler.filter == TextureFilter::Mipmap
-                    && options.texture_mipmaps.is_empty()
-                {
-                    diffuse.map(build_mipmaps)
+                let wants_mipmaps = options.texture_sampler.filter == TextureFilter::Mipmap
+                    && options.texture_mipmaps.is_empty();
+                let texture_mipmaps = if wants_mipmaps {
+                    options.texture.as_ref().map(build_mipmaps)
                 } else {
                     None
                 };
-                let diffuse_mipmaps = if !options.texture_mipmaps.is_empty() {
-                    Some(options.texture_mipmaps.as_slice())
-                } else {
-                    generated_mipmaps.as_deref()
-                };
-                let mut shader = TextureShader::new(
-                    model,
-                    transforms.transform,
-                    transforms.model_view,
-                    transforms.light_dir_view,
-                    diffuse,
-                    diffuse_mipmaps,
-                    options.texture_sampler,
-                    options.material,
-                );
-                render_shader(
-                    model,
-                    &transforms,
-                    &mut shader,
-                    &mut zbuffer,
-                    &mut image,
-                    options.render_state,
-                );
+                let checker_mipmaps = (wants_mipmaps
+                    && options.texture.is_none()
+                    && objects
+                        .iter()
+                        .any(|object| !object.model.texcoords.is_empty()))
+                .then(|| build_mipmaps(&checker));
+                for (object, transforms) in scene {
+                    let model = object.model;
+                    let diffuse = options
+                        .texture
+                        .as_ref()
+                        .or_else(|| (!model.texcoords.is_empty()).then_some(&checker));
+                    let diffuse_mipmaps = if !options.texture_mipmaps.is_empty() {
+                        Some(options.texture_mipmaps.as_slice())
+                    } else if options.texture.is_some() {
+                        texture_mipmaps.as_deref()
+                    } else if diffuse.is_some() {
+                        checker_mipmaps.as_deref()
+                    } else {
+                        None
+                    };
+                    let mut shader = TextureShader::new(
+                        model,
+                        transforms.transform,
+                        transforms.model_view,
+                        transforms.light_dir_view,
+                        diffuse,
+                        diffuse_mipmaps,
+                        options.texture_sampler,
+                        object.material,
+                    );
+                    render_shader(
+                        model,
+                        transforms,
+                        &mut shader,
+                        &mut zbuffer,
+                        &mut image,
+                        options.render_state,
+                    );
+                }
             }
             RenderMode::NormalMap => {
                 let neutral_normal_map = neutral_normal_map(2);
@@ -2439,42 +2559,49 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                 } else {
                     generated_normal_mipmaps.as_deref()
                 };
-                let mut shader = NormalMapShader::new(
-                    model,
-                    transforms.transform,
-                    transforms.model_view,
-                    transforms.light_dir_view,
-                    diffuse,
-                    normal_map,
-                    diffuse_mipmaps,
-                    normal_mipmaps,
-                    options.texture_sampler,
-                    options.material,
-                );
-                render_shader(
-                    model,
-                    &transforms,
-                    &mut shader,
-                    &mut zbuffer,
-                    &mut image,
-                    options.render_state,
-                );
+                for (object, transforms) in scene {
+                    let mut shader = NormalMapShader::new(
+                        object.model,
+                        transforms.transform,
+                        transforms.model_view,
+                        transforms.light_dir_view,
+                        diffuse,
+                        normal_map,
+                        diffuse_mipmaps,
+                        normal_mipmaps,
+                        options.texture_sampler,
+                        object.material,
+                    );
+                    render_shader(
+                        object.model,
+                        transforms,
+                        &mut shader,
+                        &mut zbuffer,
+                        &mut image,
+                        options.render_state,
+                    );
+                }
             }
             RenderMode::NormalDebug => {
-                let mut shader =
-                    NormalDebugShader::new(model, transforms.transform, transforms.model_view);
-                render_shader(
-                    model,
-                    &transforms,
-                    &mut shader,
-                    &mut zbuffer,
-                    &mut image,
-                    options.render_state,
-                );
+                for (object, transforms) in scene {
+                    let mut shader = NormalDebugShader::new(
+                        object.model,
+                        transforms.transform,
+                        transforms.model_view,
+                    );
+                    render_shader(
+                        object.model,
+                        transforms,
+                        &mut shader,
+                        &mut zbuffer,
+                        &mut image,
+                        options.render_state,
+                    );
+                }
             }
             RenderMode::Shadow | RenderMode::Ssao => {
                 let shadow_zbuffer =
-                    render_shadow_map(model, &transforms, shadow_width, shadow_height);
+                    render_shadow_map(objects, &per_object, shadow_width, shadow_height);
                 if options.debug_outputs {
                     debug.shadow = Some(zbuffer_to_image(
                         &shadow_zbuffer,
@@ -2483,26 +2610,28 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
                     ));
                 }
 
-                let mut shader = ShadowShader::new(
-                    model,
-                    transforms.transform,
-                    transforms.model_view,
-                    transforms.light_transform,
-                    transforms.light_dir_view,
-                    &shadow_zbuffer,
-                    shadow_width,
-                    shadow_height,
-                    options.shadow,
-                    options.material,
-                );
-                render_shader(
-                    model,
-                    &transforms,
-                    &mut shader,
-                    &mut zbuffer,
-                    &mut image,
-                    options.render_state,
-                );
+                for (object, transforms) in scene {
+                    let mut shader = ShadowShader::new(
+                        object.model,
+                        transforms.transform,
+                        transforms.model_view,
+                        transforms.light_transform,
+                        transforms.light_dir_view,
+                        &shadow_zbuffer,
+                        shadow_width,
+                        shadow_height,
+                        options.shadow,
+                        object.material,
+                    );
+                    render_shader(
+                        object.model,
+                        transforms,
+                        &mut shader,
+                        &mut zbuffer,
+                        &mut image,
+                        options.render_state,
+                    );
+                }
 
                 if options.mode == RenderMode::Ssao {
                     let ao = compute_ssao(&zbuffer, width, height, 5, 8);
@@ -2517,8 +2646,8 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
 
     if options.debug_outputs && debug.normals.is_none() {
         debug.normals = Some(render_normal_debug(
-            model,
-            &transforms,
+            objects,
+            &per_object,
             width,
             height,
             options,
@@ -2538,13 +2667,56 @@ pub fn render_model(model: &Model, options: &RenderOptions) -> RenderOutput {
         stats: RenderStats {
             width,
             height,
-            vertices: model.vertices.len(),
-            triangles: model.faces.len(),
+            vertices: objects.iter().map(|o| o.model.vertices.len()).sum(),
+            triangles: objects.iter().map(|o| o.model.faces.len()).sum(),
             mode: options.mode,
         },
     }
 }
 
+/// Camera and light transforms shared by every object in a frame.
+struct FrameTransforms {
+    view: Mat4,
+    /// `clip_to_screen * view_to_clip * view`. Multiplying an object's matrix
+    /// onto this keeps the left-to-right grouping of the original single-model
+    /// path, so every product rounds identically.
+    view_projection: Mat4,
+    view_to_clip: Mat4,
+    clip_to_screen: Mat4,
+    light_view: Mat4,
+    /// `light_clip_to_screen * light_view_to_clip * light_view`.
+    light_view_projection: Mat4,
+    light_view_to_clip: Mat4,
+    light_clip_to_screen: Mat4,
+    light_dir_view: Vec3,
+    near_plane: f32,
+    far_plane: f32,
+    shadow_near_plane: f32,
+    shadow_far_plane: f32,
+}
+
+/// Per-object transforms: the frame's camera and light, times the object's
+/// model-to-scene matrix.
+fn object_transforms(frame: &FrameTransforms, model_matrix: Mat4) -> RenderTransforms {
+    RenderTransforms {
+        transform: frame.view_projection * model_matrix,
+        model_view: frame.view * model_matrix,
+        view_to_clip: frame.view_to_clip,
+        clip_to_screen: frame.clip_to_screen,
+        light_transform: frame.light_view_projection * model_matrix,
+        light_model_view: frame.light_view * model_matrix,
+        light_view_to_clip: frame.light_view_to_clip,
+        light_clip_to_screen: frame.light_clip_to_screen,
+        light_dir_view: frame.light_dir_view,
+        near_plane: frame.near_plane,
+        far_plane: frame.far_plane,
+        shadow_near_plane: frame.shadow_near_plane,
+        shadow_far_plane: frame.shadow_far_plane,
+    }
+}
+
+/// Transforms for a single model drawn the way `render_model` draws it.
+#[cfg(test)]
 fn build_transforms(
     model: &Model,
     options: &RenderOptions,
@@ -2553,20 +2725,31 @@ fn build_transforms(
     shadow_width: u32,
     shadow_height: u32,
 ) -> RenderTransforms {
-    let bounds = model.bounds().unwrap_or(ModelBounds {
-        min: Vec3::splat(-1.0),
-        max: Vec3::splat(1.0),
-    });
-    let model_center = bounds.center();
-    let model_scale = SCENE_RADIUS / bounds.radius();
-    let model_matrix =
-        Mat4::from_scale(Vec3::splat(model_scale)) * Mat4::from_translation(-model_center);
+    let frame = frame_transforms(
+        options,
+        width,
+        height,
+        shadow_width,
+        shadow_height,
+        SCENE_RADIUS,
+    );
+    object_transforms(&frame, normalized_transform(model, SCENE_RADIUS))
+}
 
+fn frame_transforms(
+    options: &RenderOptions,
+    width: u32,
+    height: u32,
+    shadow_width: u32,
+    shadow_height: u32,
+    scene_radius: f32,
+) -> FrameTransforms {
     let eye = options.camera_eye.unwrap_or(DEFAULT_CAMERA_EYE);
+    let target = options.camera_target.unwrap_or(Vec3::ZERO);
     let center = Vec3::ZERO;
     let up = Vec3::Y;
-    let view = lookat(eye, center, up);
-    let distance = eye.distance(center).max(EPSILON);
+    let view = lookat(eye, target, up);
+    let distance = eye.distance(target).max(EPSILON);
     let proj = perspective(
         options.fov_y_degrees.clamp(1.0, 179.0).to_radians(),
         width as f32 / height as f32,
@@ -2578,53 +2761,58 @@ fn build_transforms(
     let vp = viewport(0.0, 0.0, width as f32, height as f32, 255.0);
     let view_to_clip = proj;
     let clip_to_screen = vp;
-    let transform = clip_to_screen * view_to_clip * view * model_matrix;
-    let model_view = view * model_matrix;
+    let view_projection = clip_to_screen * view_to_clip * view;
 
     let light_dir = safe_normal(options.light_dir, DEFAULT_LIGHT_DIR.normalize());
     let light_dir_view = safe_normal(transform_vector(&view, light_dir), Vec3::Z);
     // A directional light is an orthographic camera looking along -light_dir.
-    // The scene fits inside SCENE_RADIUS, so the shadow box covers it from any
+    // The scene fits inside scene_radius, so the shadow box covers it from any
     // direction and every shadow ray is parallel to the shading light.
-    let light_view = lookat(light_dir * SHADOW_EYE_DISTANCE, center, up);
-    let light_proj = orthographic_light_projection(SHADOW_HALF_EXTENT, SHADOW_EYE_DISTANCE);
+    let shadow = shadow_camera(scene_radius);
+    let light_view = lookat(light_dir * shadow.eye_distance, center, up);
+    let light_proj = orthographic_light_projection(
+        shadow.half_extent,
+        shadow.eye_distance,
+        shadow.depth_per_unit,
+    );
     let shadow_vp = viewport(0.0, 0.0, shadow_width as f32, shadow_height as f32, 255.0);
     let light_view_to_clip = light_proj;
     let light_clip_to_screen = shadow_vp;
-    let light_transform = light_clip_to_screen * light_view_to_clip * light_view * model_matrix;
-    let light_model_view = light_view * model_matrix;
-    RenderTransforms {
-        transform,
-        model_view,
+    let light_view_projection = light_clip_to_screen * light_view_to_clip * light_view;
+    FrameTransforms {
+        view,
+        view_projection,
         view_to_clip,
         clip_to_screen,
-        light_transform,
-        light_model_view,
+        light_view,
+        light_view_projection,
         light_view_to_clip,
         light_clip_to_screen,
         light_dir_view,
         near_plane: options.near_plane,
         far_plane: options.far_plane,
+        shadow_near_plane: shadow.near_plane,
+        shadow_far_plane: shadow.far_plane,
     }
 }
 
 /// Orthographic projection for the shadow camera. `w` stays 1, x and y map the
-/// `half_extent` box onto [-1, 1], and depth is linear in view z and centred on
-/// the scene centre at `eye_distance`. Larger depth is closer to the light, as
-/// in the camera pass.
-fn orthographic_light_projection(half_extent: f32, eye_distance: f32) -> Mat4 {
+/// `half_extent` box onto [-1, 1], and depth is linear in view z, centred on
+/// the scene centre at `eye_distance`, with `depth_per_unit` NDC per scene
+/// unit. Larger depth is closer to the light, as in the camera pass.
+fn orthographic_light_projection(half_extent: f32, eye_distance: f32, depth_per_unit: f32) -> Mat4 {
     Mat4::from_cols(
         Vec4::new(1.0 / half_extent, 0.0, 0.0, 0.0),
         Vec4::new(0.0, 1.0 / half_extent, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, SHADOW_DEPTH_PER_UNIT, 0.0),
-        Vec4::new(0.0, 0.0, eye_distance * SHADOW_DEPTH_PER_UNIT, 1.0),
+        Vec4::new(0.0, 0.0, depth_per_unit, 0.0),
+        Vec4::new(0.0, 0.0, eye_distance * depth_per_unit, 1.0),
     )
 }
 
 fn render_wireframe(
     model: &Model,
     transforms: &RenderTransforms,
-    options: &RenderOptions,
+    render_state: RenderState,
     image: &mut RgbImage,
 ) {
     let colour = Rgb([235, 238, 245]);
@@ -2636,7 +2824,7 @@ fn render_wireframe(
             face_idx,
             transforms.near_plane,
             transforms.far_plane,
-            options.render_state,
+            render_state,
             &mut primitives,
         ) {
             continue;
@@ -2650,7 +2838,7 @@ fn render_wireframe(
                     primitive.screen_coords[edge.1].y.round() as i32,
                     image,
                     colour,
-                    options.render_state,
+                    render_state,
                 );
             }
         }
@@ -2660,7 +2848,8 @@ fn render_wireframe(
 fn render_flat(
     model: &Model,
     transforms: &RenderTransforms,
-    options: &RenderOptions,
+    material: &Material,
+    render_state: RenderState,
     zbuffer: &mut [f32],
     image: &mut RgbImage,
 ) {
@@ -2675,7 +2864,7 @@ fn render_flat(
             face_idx,
             transforms.near_plane,
             transforms.far_plane,
-            options.render_state,
+            render_state,
             &mut primitives,
         ) {
             continue;
@@ -2685,13 +2874,13 @@ fn render_flat(
             Vec3::Z,
         );
         let intensity = normal.dot(light_dir).max(0.0);
-        let specular = if options.material.specular > 0.0 {
+        let specular = if material.specular > 0.0 {
             let face = model.faces[face_idx];
             let centroid =
                 (model.vertices[face[0].v] + model.vertices[face[1].v] + model.vertices[face[2].v])
                     / 3.0;
             specular_highlight(
-                &options.material,
+                material,
                 normal,
                 light_dir,
                 transform_point(&transforms.model_view, centroid),
@@ -2700,12 +2889,7 @@ fn render_flat(
             0.0
         };
         // Unlit faces still shade (to ambient or black) and write depth.
-        let shaded = shade_material(
-            options.material.base_color,
-            options.material,
-            intensity,
-            specular,
-        );
+        let shaded = shade_material(material.base_color, *material, intensity, specular);
         for primitive in &primitives {
             triangle_zbuf_with_render_state(
                 primitive.screen_coords[0],
@@ -2713,8 +2897,8 @@ fn render_flat(
                 primitive.screen_coords[2],
                 zbuffer,
                 image,
-                Fragment::new(shaded, options.material.alpha),
-                options.render_state,
+                Fragment::new(shaded, material.alpha),
+                render_state,
             );
         }
     }
@@ -3157,41 +3341,47 @@ fn intersect_near(a: Vec3, b: Vec3, near_z: f32) -> Vec3 {
     a + (b - a) * t
 }
 
+/// One shadow map for the whole scene: every object is drawn into it from the
+/// light's orthographic camera.
 fn render_shadow_map(
-    model: &Model,
-    transforms: &RenderTransforms,
+    objects: &[SceneObject],
+    per_object: &[RenderTransforms],
     width: u32,
     height: u32,
 ) -> Vec<f32> {
     let shadow_state = shadow_pass_state();
     let mut shadow_image = ImageBuffer::new(width, height);
     let mut shadow_zbuffer = vec![shadow_state.clear_depth; (width * height) as usize];
-    let mut depth_shader = DepthShader {
-        model,
-        transform: transforms.light_transform,
-    };
-    let shadow_transforms = RenderTransforms {
-        transform: transforms.light_transform,
-        model_view: transforms.light_model_view,
-        view_to_clip: transforms.light_view_to_clip,
-        clip_to_screen: transforms.light_clip_to_screen,
-        light_transform: transforms.light_transform,
-        light_model_view: transforms.light_model_view,
-        light_view_to_clip: transforms.light_view_to_clip,
-        light_clip_to_screen: transforms.light_clip_to_screen,
-        light_dir_view: transforms.light_dir_view,
-        // The light's own clip planes: the camera's must not cut the shadow map.
-        near_plane: SHADOW_NEAR_PLANE,
-        far_plane: SHADOW_FAR_PLANE,
-    };
-    render_shader(
-        model,
-        &shadow_transforms,
-        &mut depth_shader,
-        &mut shadow_zbuffer,
-        &mut shadow_image,
-        shadow_state,
-    );
+    for (object, transforms) in objects.iter().zip(per_object) {
+        let mut depth_shader = DepthShader {
+            model: object.model,
+            transform: transforms.light_transform,
+        };
+        let shadow_transforms = RenderTransforms {
+            transform: transforms.light_transform,
+            model_view: transforms.light_model_view,
+            view_to_clip: transforms.light_view_to_clip,
+            clip_to_screen: transforms.light_clip_to_screen,
+            light_transform: transforms.light_transform,
+            light_model_view: transforms.light_model_view,
+            light_view_to_clip: transforms.light_view_to_clip,
+            light_clip_to_screen: transforms.light_clip_to_screen,
+            light_dir_view: transforms.light_dir_view,
+            // The light's own clip planes: the camera's must not cut the shadow map.
+            near_plane: transforms.shadow_near_plane,
+            far_plane: transforms.shadow_far_plane,
+            shadow_near_plane: transforms.shadow_near_plane,
+            shadow_far_plane: transforms.shadow_far_plane,
+        };
+        render_shader(
+            object.model,
+            &shadow_transforms,
+            &mut depth_shader,
+            &mut shadow_zbuffer,
+            &mut shadow_image,
+            shadow_state,
+        );
+    }
     shadow_zbuffer
 }
 
@@ -3216,23 +3406,26 @@ fn shadow_pass_state() -> RenderState {
 }
 
 fn render_normal_debug(
-    model: &Model,
-    transforms: &RenderTransforms,
+    objects: &[SceneObject],
+    per_object: &[RenderTransforms],
     width: u32,
     height: u32,
     options: &RenderOptions,
 ) -> RgbImage {
     let mut image = ImageBuffer::from_pixel(width, height, DEFAULT_BACKGROUND);
     let mut zbuffer = vec![f32::NEG_INFINITY; (width * height) as usize];
-    let mut shader = NormalDebugShader::new(model, transforms.transform, transforms.model_view);
-    render_shader(
-        model,
-        transforms,
-        &mut shader,
-        &mut zbuffer,
-        &mut image,
-        options.render_state,
-    );
+    for (object, transforms) in objects.iter().zip(per_object) {
+        let mut shader =
+            NormalDebugShader::new(object.model, transforms.transform, transforms.model_view);
+        render_shader(
+            object.model,
+            transforms,
+            &mut shader,
+            &mut zbuffer,
+            &mut image,
+            options.render_state,
+        );
+    }
     image
 }
 
@@ -4444,7 +4637,12 @@ map_Bump normal-checker.ppm
         };
         let (shadow_width, shadow_height) = shadow_dimensions(&options, 128, 128);
         let transforms = build_transforms(&model, &options, 128, 128, shadow_width, shadow_height);
-        let shadow_map = render_shadow_map(&model, &transforms, shadow_width, shadow_height);
+        let shadow_map = render_shadow_map(
+            &[SceneObject::normalized(&model, Material::default())],
+            std::slice::from_ref(&transforms),
+            shadow_width,
+            shadow_height,
+        );
 
         let receiver = [model.vertices[0], model.vertices[1], model.vertices[2]];
         let occluder = [model.vertices[3], model.vertices[4], model.vertices[5]];
@@ -4948,6 +5146,235 @@ map_Bump normal-checker.ppm
             };
         }
         hash
+    }
+
+    /// Square panel in the plane `y`, facing +Y, centred on the y axis.
+    fn horizontal_panel(y: f32, half: f32) -> Model {
+        let corner = |v: usize| FaceVertex {
+            v,
+            vt: None,
+            vn: None,
+        };
+        Model {
+            vertices: vec![
+                Vec3::new(-half, y, -half),
+                Vec3::new(-half, y, half),
+                Vec3::new(half, y, half),
+                Vec3::new(half, y, -half),
+            ],
+            texcoords: Vec::new(),
+            normals: Vec::new(),
+            faces: vec![
+                [corner(0), corner(1), corner(2)],
+                [corner(0), corner(2), corner(3)],
+            ],
+            materials: Vec::new(),
+            face_materials: vec![None, None],
+        }
+    }
+
+    fn solid_material(r: u8, g: u8, b: u8) -> Material {
+        Material {
+            base_color: Rgb([r, g, b]),
+            ..Material::default()
+        }
+    }
+
+    /// Final image pixel (after the vertical flip) showing scene point `p`.
+    fn scene_pixel(options: &RenderOptions, scene_radius: f32, p: Vec3) -> (u32, u32) {
+        let (shadow_width, shadow_height) =
+            shadow_dimensions(options, options.width, options.height);
+        let frame = frame_transforms(
+            options,
+            options.width,
+            options.height,
+            shadow_width,
+            shadow_height,
+            scene_radius,
+        );
+        let screen = transform_point(&frame.view_projection, p);
+        (screen.x as u32, options.height - 1 - screen.y as u32)
+    }
+
+    #[test]
+    fn scene_objects_occlude_by_depth_not_by_list_order() {
+        let triangle = tiny_model();
+        let far = SceneObject {
+            model: &triangle,
+            transform: Mat4::IDENTITY,
+            material: solid_material(200, 0, 0),
+        };
+        let near = SceneObject {
+            model: &triangle,
+            transform: Mat4::from_translation(Vec3::new(0.0, 0.0, 0.5))
+                * Mat4::from_scale(Vec3::splat(0.5)),
+            material: solid_material(0, 0, 200),
+        };
+        let options = RenderOptions {
+            width: 64,
+            height: 64,
+            mode: RenderMode::Flat,
+            camera_eye: Some(TEST_EYE),
+            light_dir: Vec3::Z,
+            ..RenderOptions::default()
+        };
+        let forward = render_scene(&[far, near], &options, SCENE_RADIUS);
+        let backward = render_scene(&[near, far], &options, SCENE_RADIUS);
+        assert_eq!(forward.image.as_raw(), backward.image.as_raw());
+        assert_eq!(
+            depth_bits_hash(&forward.zbuffer),
+            depth_bits_hash(&backward.zbuffer)
+        );
+        // The nearer, blue object covers the centre; the red one shows around it.
+        assert_eq!(forward.image.get_pixel(32, 32), &Rgb([0, 0, 200]));
+        assert!(forward.image.pixels().any(|p| *p == Rgb([200, 0, 0])));
+        assert_eq!(forward.stats.triangles, 2);
+    }
+
+    fn floor_and_panel_options(include_panel: bool) -> (Vec<Model>, RenderOptions) {
+        let mut models = vec![horizontal_panel(-1.0, 2.0)];
+        if include_panel {
+            models.push(horizontal_panel(0.0, 0.5));
+        }
+        let options = RenderOptions {
+            width: 96,
+            height: 96,
+            mode: RenderMode::Shadow,
+            camera_eye: Some(Vec3::new(0.0, 3.0, 5.0)),
+            camera_target: Some(Vec3::new(0.0, -0.5, 0.0)),
+            light_dir: Vec3::new(0.05, 1.0, 0.02),
+            shadow: ShadowOptions {
+                size: 256,
+                ..ShadowOptions::default()
+            },
+            ..RenderOptions::default()
+        };
+        (models, options)
+    }
+
+    #[test]
+    fn a_floating_panel_casts_a_shadow_on_the_floor() {
+        let scene_radius = 3.2;
+        let render = |include_panel: bool| {
+            let (models, options) = floor_and_panel_options(include_panel);
+            let objects: Vec<SceneObject> = models
+                .iter()
+                .map(|model| SceneObject {
+                    model,
+                    transform: Mat4::IDENTITY,
+                    material: solid_material(220, 220, 220),
+                })
+                .collect();
+            (render_scene(&objects, &options, scene_radius), options)
+        };
+        let (with_panel, options) = render(true);
+        let (floor_only, _) = render(false);
+        let (ux, uy) = scene_pixel(&options, scene_radius, Vec3::new(0.0, -1.0, 0.0));
+        let (ox, oy) = scene_pixel(&options, scene_radius, Vec3::new(1.4, -1.0, 1.4));
+        let under = with_panel.image.get_pixel(ux, uy)[0] as f32;
+        let open = with_panel.image.get_pixel(ox, oy)[0] as f32;
+        let unshadowed = floor_only.image.get_pixel(ux, uy)[0] as f32;
+        assert!(under < open * 0.6, "under {under}, open {open}");
+        assert!(
+            (unshadowed - open).abs() <= 2.0,
+            "unshadowed {unshadowed}, open {open}"
+        );
+    }
+
+    #[test]
+    fn shadow_camera_at_the_scene_radius_keeps_its_constants() {
+        assert_eq!(
+            shadow_camera(SCENE_RADIUS),
+            ShadowCamera {
+                half_extent: 2.05,
+                eye_distance: 4.0,
+                near_plane: 1.5,
+                far_plane: 6.5,
+                depth_per_unit: 0.25,
+            }
+        );
+    }
+
+    #[test]
+    fn scaling_the_scene_and_its_radius_together_keeps_the_shadow_map() {
+        let (models, options) = floor_and_panel_options(true);
+        let shadow_map = |scale: f32| {
+            let objects: Vec<SceneObject> = models
+                .iter()
+                .map(|model| SceneObject {
+                    model,
+                    transform: Mat4::from_scale(Vec3::splat(scale)),
+                    material: Material::default(),
+                })
+                .collect();
+            let frame = frame_transforms(&options, 96, 96, 128, 128, 3.2 * scale);
+            let per_object: Vec<RenderTransforms> = objects
+                .iter()
+                .map(|object| object_transforms(&frame, object.transform))
+                .collect();
+            render_shadow_map(&objects, &per_object, 128, 128)
+        };
+        let base = shadow_map(1.0);
+        assert!(base.iter().filter(|z| z.is_finite()).count() > 1000);
+        assert_eq!(depth_bits_hash(&base), depth_bits_hash(&shadow_map(2.0)));
+    }
+
+    #[test]
+    fn camera_target_defaults_to_the_scene_centre() {
+        let teapot = Model::load("resources/teapot.obj").unwrap();
+        let options = RenderOptions {
+            width: 48,
+            height: 48,
+            mode: RenderMode::Gouraud,
+            ..RenderOptions::default()
+        };
+        let aimed = RenderOptions {
+            camera_target: Some(Vec3::ZERO),
+            ..options.clone()
+        };
+        assert_eq!(
+            render_output_hash(&render_model(&teapot, &options)),
+            render_output_hash(&render_model(&teapot, &aimed))
+        );
+    }
+
+    #[test]
+    fn render_model_is_a_scene_of_one_normalized_object() {
+        let teapot = Model::load("resources/teapot.obj").unwrap();
+        let options = RenderOptions {
+            width: 48,
+            height: 48,
+            mode: RenderMode::Shadow,
+            debug_outputs: true,
+            ..RenderOptions::default()
+        };
+        let scene = [SceneObject::normalized(&teapot, options.material)];
+        assert_eq!(
+            render_output_hash(&render_model(&teapot, &options)),
+            render_output_hash(&render_scene(&scene, &options, SCENE_RADIUS))
+        );
+    }
+
+    #[test]
+    fn an_empty_scene_renders_the_clear_colour() {
+        for mode in [
+            RenderMode::Wireframe,
+            RenderMode::Flat,
+            RenderMode::Shadow,
+            RenderMode::Ssao,
+        ] {
+            let options = RenderOptions {
+                width: 16,
+                height: 16,
+                mode,
+                debug_outputs: true,
+                ..RenderOptions::default()
+            };
+            let output = render_scene(&[], &options, SCENE_RADIUS);
+            assert!(output.image.pixels().all(|p| *p == DEFAULT_BACKGROUND));
+            assert!(output.zbuffer.iter().all(|z| *z == f32::NEG_INFINITY));
+            assert_eq!(output.stats.triangles, 0);
+        }
     }
 
     /// Pins every render mode, plus PCF, culling, a non-square frame, and a

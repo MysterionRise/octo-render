@@ -30,7 +30,7 @@ Workspace root package `octo-render`:
   - Render state: `RenderState`, `CullMode`, `FrontFace`, `DepthState`, `FillMode`, `ScissorRect`, `BlendMode`
   - `Shader` trait and built-ins: `GouraudShader`, `TextureShader`, `NormalMapShader`, `NormalDebugShader`, `DepthShader`, `ShadowShader`
   - Textures: `TextureSampler`, `sample_texture_with_mipmaps`, `build_mipmaps`
-  - `render_model(&Model, &RenderOptions) -> RenderOutput` orchestrates a frame: shadow-map depth pass (fixed depth-only state) → main pass → SSAO post-process → debug maps → vertical flip
+  - `render_scene(&[SceneObject], &RenderOptions, scene_radius) -> RenderOutput` orchestrates a frame: shadow-map depth pass over every object (fixed depth-only state) → main pass per object (each `SceneObject` has its own model-to-scene transform and material, sharing one z-buffer) → SSAO post-process → debug maps → vertical flip. `render_model(&Model, &RenderOptions)` is a scene of one object recentred and scaled to `SCENE_RADIUS` (`SceneObject::normalized`, `normalized_transform`).
 - **`src/main.rs`** — `app` CLI: hand-rolled flag parser, material and texture resolution, writes the image plus optional debug PNGs
 - **`benches/line_benchmark.rs`** — Criterion suite
 - **`scripts/render-gallery.sh`** — reproducible gallery renders
@@ -39,7 +39,7 @@ Workspace root package `octo-render`:
 
 ## Conventions
 
-- **Light direction**: `RenderOptions::light_dir` and `--light` give the direction *toward* the light in normalized scene space (default `DEFAULT_LIGHT_DIR`, 1,1,1). `render_model` rotates it into eye space once for shading, and renders the shadow map with an orthographic camera along it (half-extent 2.05, its own near/far planes, ~32 depth units per scene unit), so diffuse, specular, and shadows always agree. Built-in shaders take the eye-space light.
+- **Light direction**: `RenderOptions::light_dir` and `--light` give the direction *toward* the light in normalized scene space (default `DEFAULT_LIGHT_DIR`, 1,1,1). `render_model` rotates it into eye space once for shading, and renders the shadow map with an orthographic camera along it, so diffuse, specular, and shadows always agree. The shadow camera scales with the scene radius `r` (`shadow_camera`): half-extent `1.025r`, eye `2r` out, its own near/far planes, `0.5/r` NDC depth per unit; at `SCENE_RADIUS` (2) that is 2.05, 4, and ~32 depth units per scene unit. `--shadow-bias` is in depth units, so one unit is `r/63.75` scene units. `RenderOptions::camera_target` (default the origin) is where the camera looks; the light always aims at the origin. Built-in shaders take the eye-space light.
 - **Normals** point outward. `Model::face_normal` assumes counter-clockwise winding (the OBJ convention) and only falls back to +Z for zero-area faces. `Model::load` generates smooth normals for corners without `vn` (crease angle `DEFAULT_CREASE_ANGLE_DEG`, 60°); flat mode always uses face normals.
 - **Camera**: `build_transforms` uses `lookat` (eye at the view-space origin) and `perspective` (vertical FOV, aspect-correct, reversed-Z with an infinite far plane, `depth_scale = distance² / 4`), with a margin-free viewport. Default eye `DEFAULT_CAMERA_EYE` (0, 0.5, 6), FOV `DEFAULT_FOV_Y_DEGREES` (45). Near/far are view-space distances from the eye, applied by the clipper; each pass (camera, shadow) carries its own in `RenderTransforms`. The legacy `projection` helper is unused by `render_model`.
 - **Depth**: larger z is closer. The z-buffer clears to `-inf` and the depth test passes when `z > current`.

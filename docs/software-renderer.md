@@ -90,6 +90,12 @@ An earlier version used a perspective camera at `light_dir * 3`. That is a point
 
 Shadow depth is linear: 0.25 NDC per scene unit, about 32 depth units through the 255-deep viewport. The default `--shadow-bias` of 4 therefore means 1/8 of a scene unit everywhere, instead of varying with distance from the light. Tests check the shadow map against exact ray casts from receiver points toward the light.
 
+These numbers are for the normalized single-model scene (radius 2). For a multi-object scene of radius `r` (see below), the whole shadow camera scales by `r / 2`: half-extent `1.025r`, eye `2r` out, `0.5/r` NDC per unit. Bias stays in depth units, so one unit of bias is `r / 63.75` scene units. Scaling a scene and its radius together leaves the shadow map bit-identical, which a test checks.
+
+## Multi-Object Scenes
+
+`render_scene` draws a list of `SceneObject`s, each with its own model, model-to-scene transform, and material, into one frame. All objects share one z-buffer and one shadow map, so they occlude and shadow each other regardless of list order. Nothing is normalized: the caller places objects in scene space and passes the radius that holds them. `render_model` is a scene of one object, recentred and scaled to radius 2; it is pinned bit for bit against the single-model renderer it replaced. The camera can aim anywhere with `camera_target`; the light's shadow camera always looks at the origin.
+
 ## Shadow Pass State
 
 The light-space depth pass uses a fixed raster state: depth test and write on, no culling, no scissor, colour writes off, blending off. It also has its own clip planes, so the camera's near and far planes never clip the shadow map. It does not inherit the camera pass's `RenderState`, so flags like `--scissor` or `--depth-write off` cannot crop or empty the shadow map.

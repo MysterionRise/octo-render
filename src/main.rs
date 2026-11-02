@@ -146,6 +146,7 @@ fn run() -> Result<(), String> {
         height: cli.height,
         mode: cli.shader,
         camera_eye: cli.camera,
+        camera_target: None,
         fov_y_degrees: cli.fov,
         light_dir: cli.light,
         debug_outputs: cli.debug_dir.is_some(),
