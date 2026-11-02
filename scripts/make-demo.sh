@@ -145,7 +145,7 @@ for setting in "360 15" "320 12" "270 12"; do
     read -r gif_width gif_fps <<<"$setting"
     if ((preview)); then gif_width=$WIDTH; fi
     ffmpeg -hide_banner -loglevel error -y -i "$mp4" -vf \
-        "fps=$gif_fps,scale=$gif_width:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle" \
+        "fps=$gif_fps,scale=$gif_width:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=256:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle" \
         -loop 0 "$gif"
     gif_bytes=$(bytes "$gif")
     echo "make-demo: $gif at ${gif_width}px, ${gif_fps} fps ($(mb "$gif_bytes"))"
