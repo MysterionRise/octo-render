@@ -4926,6 +4926,135 @@ map_Bump normal-checker.ppm
         (947_016, 4_147_875_905_691_957_963),
     ];
 
+    /// FNV-1a over a byte stream, for pinning exact render output.
+    fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
+        bytes.iter().fold(hash, |hash, &byte| {
+            (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Exact hash of everything a render produces: image bytes, depth bits, and
+    /// every debug map (a missing map hashes differently from an empty one).
+    fn render_output_hash(output: &RenderOutput) -> u64 {
+        let mut hash = fnv1a(0xcbf2_9ce4_8422_2325, output.image.as_raw());
+        for z in &output.zbuffer {
+            hash = fnv1a(hash, &z.to_bits().to_le_bytes());
+        }
+        let debug = &output.debug;
+        for map in [&debug.depth, &debug.shadow, &debug.normals, &debug.ao] {
+            hash = match map {
+                Some(image) => fnv1a(fnv1a(hash, b"some"), image.as_raw()),
+                None => fnv1a(hash, b"none"),
+            };
+        }
+        hash
+    }
+
+    /// Pins every render mode, plus PCF, culling, a non-square frame, and a
+    /// mipmapped alpha-blended quad, bit for bit. Engine refactors that should
+    /// not change output must leave every hash untouched.
+    #[test]
+    fn every_render_mode_stays_bit_identical() {
+        let teapot = Model::load("resources/teapot.obj").unwrap();
+        let teapot_options = |mode: RenderMode| RenderOptions {
+            width: 64,
+            height: 64,
+            mode,
+            debug_outputs: true,
+            ..RenderOptions::default()
+        };
+        let mut hashes = Vec::new();
+        for mode in [
+            RenderMode::Wireframe,
+            RenderMode::Flat,
+            RenderMode::Gouraud,
+            RenderMode::Texture,
+            RenderMode::NormalMap,
+            RenderMode::NormalDebug,
+            RenderMode::Shadow,
+            RenderMode::Ssao,
+        ] {
+            let output = render_model(&teapot, &teapot_options(mode));
+            hashes.push((mode.as_str().to_string(), render_output_hash(&output)));
+        }
+
+        let mut pcf = teapot_options(RenderMode::Shadow);
+        pcf.shadow = ShadowOptions {
+            filter: ShadowFilter::Pcf,
+            size: 48,
+            ..ShadowOptions::default()
+        };
+        pcf.material.specular = 0.5;
+        hashes.push((
+            "shadow-pcf".into(),
+            render_output_hash(&render_model(&teapot, &pcf)),
+        ));
+
+        let mut culled = teapot_options(RenderMode::Gouraud);
+        culled.render_state.cull_mode = CullMode::Back;
+        culled.light_dir = Vec3::new(-1.0, 1.0, 1.0);
+        hashes.push((
+            "gouraud-cull".into(),
+            render_output_hash(&render_model(&teapot, &culled)),
+        ));
+
+        let mut wide = teapot_options(RenderMode::Shadow);
+        wide.width = 96;
+        wide.camera_eye = Some(Vec3::new(1.5, 1.0, 4.0));
+        hashes.push((
+            "shadow-96x64".into(),
+            render_output_hash(&render_model(&teapot, &wide)),
+        ));
+
+        let quad = Model::load("resources/material-quad.obj").unwrap();
+        let texture = image::open("resources/checker.ppm").unwrap().to_rgb8();
+        let quad_options = RenderOptions {
+            width: 48,
+            height: 48,
+            mode: RenderMode::Texture,
+            debug_outputs: true,
+            texture_mipmaps: build_mipmaps(&texture),
+            texture: Some(texture),
+            texture_sampler: TextureSampler {
+                wrap: TextureWrap::Repeat,
+                filter: TextureFilter::Mipmap,
+            },
+            material: quad.materials[0].material,
+            render_state: RenderState {
+                blend_mode: BlendMode::Alpha,
+                ..RenderState::default()
+            },
+            ..RenderOptions::default()
+        };
+        hashes.push((
+            "texture-quad-mipmap-alpha".into(),
+            render_output_hash(&render_model(&quad, &quad_options)),
+        ));
+
+        let pinned: Vec<(String, u64)> = PINNED_RENDER_HASHES
+            .iter()
+            .map(|&(name, hash)| (name.to_string(), hash))
+            .collect();
+        assert_eq!(hashes, pinned);
+    }
+
+    /// Texture mode equals Gouraud and normal-map mode equals flat here: the
+    /// teapot has no UVs, and a neutral normal map yields face normals.
+    const PINNED_RENDER_HASHES: [(&str, u64); 12] = [
+        ("wireframe", 17_057_964_585_505_469_428),
+        ("flat", 12_019_327_363_507_412_909),
+        ("gouraud", 15_895_224_757_263_435_894),
+        ("texture", 15_895_224_757_263_435_894),
+        ("normal-map", 12_019_327_363_507_412_909),
+        ("normal-debug", 5_985_129_636_838_609_635),
+        ("shadow", 750_628_622_060_466_440),
+        ("ssao", 18_271_014_815_851_721_349),
+        ("shadow-pcf", 16_972_816_156_598_238_096),
+        ("gouraud-cull", 1_472_020_026_185_960_699),
+        ("shadow-96x64", 1_137_753_099_846_616_844),
+        ("texture-quad-mipmap-alpha", 4_623_189_509_575_395_039),
+    ];
+
     /// Order-sensitive hash of the exact depth bits.
     fn depth_bits_hash(zbuffer: &[f32]) -> u64 {
         zbuffer.iter().fold(0u64, |hash, z| {
