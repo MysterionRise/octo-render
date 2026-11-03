@@ -24,3 +24,10 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Kernel dependency rule
+        run: |
+          if cargo tree -p colony-sim -e normal | grep -E '(^|[ ─])(wgpu|winit|glam) '; then
+            echo "colony-sim must not depend on wgpu, winit, or glam"
+            exit 1
+          fi

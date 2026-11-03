@@ -284,10 +284,11 @@ Current test coverage includes:
 
 ## Architecture
 
-The workspace has two layers:
+The workspace has three layers:
 
 - Root package `octo-render`: CPU software-renderer library (`renderer`) plus the `app` CLI.
 - `crates/*`: GPU viewer stack split into core data, asset loading, `wgpu` helpers, renderer passes, and `octo-app`.
+- `colony/*`: the start of a purpose-built colony-sim engine: `colony-sim`, a deterministic fixed-point cell-simulation kernel (gas, heat, chunk skipping, hashes), and `colony-headless`, its runner and PNG dumper. The design and roadmap are in [docs/colony-engine-design.md](docs/colony-engine-design.md).
 
 The CPU renderer is the OpenGL-style reimplementation. The GPU viewer is intentionally separate because it delegates rasterization to `wgpu`/Metal/Vulkan/DX backends.
 

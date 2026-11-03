@@ -1,0 +1,21 @@
+[package]
+name = "colony-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic fixed-point cell-simulation kernel for the colony engine"
+
+# Rules for this crate (docs/colony-engine-design.md, sections 6 and 11):
+# no wgpu, winit, or glam; no floats in state or tick code; no wall clock.
+[dependencies]
+rayon = { version = "1", optional = true }
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "sim_benchmark"
+harness = false

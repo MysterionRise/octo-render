@@ -1,0 +1,21 @@
+[package]
+name = "colony-headless"
+version = "0.1.0"
+edition = "2021"
+description = "Headless runner for the colony-sim kernel: timings, hashes, and PNG dumps"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "colony-headless"
+path = "src/main.rs"
+
+[dependencies]
+colony-sim = { path = "../sim", default-features = false }
+rayon = { version = "1", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = ["parallel"]
+parallel = ["colony-sim/parallel", "dep:rayon"]

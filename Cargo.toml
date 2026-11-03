@@ -7,6 +7,8 @@ members = [
     "crates/gpu",
     "crates/renderer",
     "crates/app",
+    "colony/sim",
+    "colony/headless",
 ]
 
 [package]

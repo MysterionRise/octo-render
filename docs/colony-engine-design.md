@@ -1,6 +1,6 @@
 # Colony Engine Design And Roadmap
 
-Status: design only, written 2026-11-03. No engine code exists yet. This document is the research record, the architecture, and the milestone plan for a purpose-built 2D colony-simulation engine that will grow next to `octo-render`. Crate names in it are placeholders.
+Status: design written 2026-11-03; milestone M1 (the headless kernel) landed the same day under `colony/`, see the M1 result in section 14. This document is the research record, the architecture, and the milestone plan for a purpose-built 2D colony-simulation engine that grows next to `octo-render`. `colony-sim` and `colony-headless` exist; the other crate names are placeholders.
 
 The portfolio story stays split. `octo-render` proves graphics fundamentals on the CPU. The colony engine is a separate product whose proof is a deterministic, benchmarked cell simulation.
 
@@ -199,7 +199,7 @@ The sim runs on its own `std::thread`. The game thread sends `Command` values ov
 
 Inside a pass the kernel uses a **gather formulation with a double buffer**: every flux or swap is computed from the old buffer by both endpoint cells, and each cell writes only its own new value. Passes are therefore a plain `rayon` `par_chunks_mut` over row bands of the write buffer, with no checkerboard scheduling and results identical to a single-threaded run. Pairwise swaps (a liquid falling through a gas, a heavy gas displacing a light one) use **mutual proposal**: each cell proposes at most one partner by a fixed priority (down, left, right, up), and a swap happens only when both cells propose each other. Because each cell has at most one partner, no cell is in two swaps.
 
-Noita's two- and four-phase checkerboard is documented as the fallback if a scatter-style update is ever needed. Chunks whose 3×3 neighbourhood had no flux last tick are marked settled and skipped; on a quiet base most of the world should be skipped.
+Noita's two- and four-phase checkerboard is documented as the fallback if a scatter-style update is ever needed. Chunks whose 3×3 neighbourhood had no exchange last tick are skipped. Activity is tracked separately for the mass passes (sort and flux, which never read temperature) and for the heat pass, so a solid region that is only conducting heat costs nothing in the mass passes. On a quiet base most of the world is skipped in every pass.
 
 ### 6.5 Gas
 
@@ -216,7 +216,12 @@ for each cell a, reading only the OLD buffers:
     mass_new[a] = mass_old[a] - out + inflow
 ```
 
-With `K ≤ 1/4` the four outbound fluxes sum to at most the cell's mass, so no cell goes negative. Both endpoints compute the same `f`, so the world total is exactly constant; a debug assertion checks it every tick. A vacuum cell accepts gas only from its highest-mass gas neighbour (ties by the priority order), and every sender evaluates the same rule for the vacuum cell, so the winner is agreed without communication. Two different gases interact by displacement: if one cell's mass is more than twice the other's, the heavier proposes a swap of element and mass, which executes under mutual proposal.
+With `K ≤ 1/4` the four outbound fluxes sum to at most the cell's mass, so no cell goes negative. Both endpoints compute the same `f`, so the world total is exactly constant; a debug assertion checks it every tick. A vacuum cell accepts gas only from its highest-mass gas neighbour (ties by the priority order), and every sender evaluates the same rule for the vacuum cell, so the winner is agreed without communication. Two different gases never exchange mass directly. They interact through two rules that both terminate.
+
+- **Buoyancy sort**, a pass of its own before flux: a gas cell proposes to swap with the cell below if that holds a lighter gas, otherwise with the cell above if that holds a denser one. A swap happens only when the two cells propose each other, and each swap removes one density inversion, so sorting cannot oscillate.
+- **Pressure evacuation.** The sort pass also flags a gas cell as *pressed* when a different gas next to it has more than twice the mean mass of the cell and its same-gas neighbours. Comparing against that regional mean rather than the cell alone keeps a freshly filled interface cell, which starts thin, from being pushed straight back. In the flux pass a pressed cell sends all of its mass to its heaviest unpressed same-gas neighbour and becomes vacuum, which the heavier gas fills next tick. Mass only ever moves into the gas's own region, so the interface advances until the regional pressures are within a factor of two, then stops.
+
+The design first proposed a direct swap between a heavy cell and a light cell of different gases. The first golden image showed why that is wrong: the displaced light cell is still under pressure inside the heavy region, swaps again every tick, and the two gases end up as marching one-cell stripes that never settle.
 
 ### 6.6 Liquid
 
@@ -358,6 +363,22 @@ Solo developer at roughly ten hours a week.
 
 Total: roughly nine to twelve months.
 
+### M1 result (2026-11-03)
+
+`colony/sim` (`colony-sim`) and `colony/headless` (`colony-headless`) implement the kernel as specified above with the displacement change from section 6.5. Measured in release on a four-core container at 512×512, sequential unless stated:
+
+| Exit criterion | Measured | Met |
+| --- | --- | --- |
+| Gas plus heat tick ≤ 8 ms on one core | Gas-mixing (one interface, slow diffusion, 63% of chunks conducting): 9.0 ms, 3.8 ms on four threads. Seeded noise (every cell a random gas and temperature, every chunk active in every pass): 41 ms, 14 ms on four threads. Settled world: 2.3 ms | Narrowly missed for the realistic case on one core; met with the thread pool |
+| Total mass bit-exact over 10,000 ticks | Exact in every scenario and every test run; the headless runner asserts it | Yes |
+| Two runs hash-identical | Identical per-tick hashes; the parallel run matches the sequential run bit for bit in every scenario | Yes |
+| ≥ 90% chunks skipped on a settled world | 99.5% skipped from the second tick | Yes |
+| Gas-mixing golden image | `colony/headless/tests/golden/gas-mixing-64-120.png` plus hash goldens in `colony/sim/tests/golden/`, inspected and pinned | Yes |
+
+Per-cell cost in the all-active worst case is 39 ns (sort), 67 ns (flux), and 49 ns (heat): the passes construct a cell view per neighbour and the flux pass re-evaluates radius-two decisions (evacuation targets, vacuum winners) from each endpoint. Energy drift stayed inside the rounding bound in every run.
+
+**Gate decision: go.** The realistic tick is inside the 25 ms budget on one core with room for liquids, networks, and entities, and the adversarial case fits with the thread pool. The first task of M2 is to halve the per-cell cost by sweeping rows with pre-sliced neighbour rows (no per-load bounds checks, no repeated cell construction) and by caching per-cell decisions in the flags byte, with the noise scenario as the benchmark.
+
 ## 15. Risks
 
 | Risk | Mitigation |
@@ -375,7 +396,7 @@ Total: roughly nine to twelve months.
 
 **Limitations by design.** Finite worlds. One element per cell, no mixtures. No latent heat. No fluid momentum; liquids spread by mass difference only. Networks are abstract graphs, not simulated flow.
 
-**Next work after approval.** M1: create the `colony/` workspace folder, `colony-sim` with the cell buffers and element table, the gas and heat passes, `colony-headless`, Criterion benches, and the hash test, then profile and hold the gate review.
+**Next work.** M2: liquids, phase change, seeded worldgen, saves and the command log, plus the kernel optimisation named in the M1 result. The buoyancy and evacuation rules should be revisited once liquids exist, because a liquid surface is another interface the pressed test has to respect.
 
 ## Appendix A: Roads Not Taken
 
