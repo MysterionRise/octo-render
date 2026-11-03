@@ -225,13 +225,13 @@ The design first proposed a direct swap between a heavy cell and a light cell of
 
 ### 6.6 Liquid
 
-Liquids use the same flux step with three extra rules:
+Liquids share the sort and flux passes with gases (implemented in M2):
 
-- **Fall.** A liquid above a gas or vacuum proposes a swap downward; the gas proposes upward. A liquid above a liquid of the same element flows down by `min(mass_a, max_mass - mass_b)`.
-- **Spread.** Horizontal flux goes only toward cells with lower mass, capped so the receiver never exceeds the element's `max_mass` (1,000 kg for water in the reference game).
-- **Over-pressure.** Mass above `max_mass` pushes its excess upward into the cell above; stacked liquid adds a pressure term that can break weak solid tiles above a threshold.
+- **Fall.** The buoyancy sort covers every fluid: a liquid above a gas or a vacuum swaps with it under mutual proposal, and denser liquids sink below lighter ones. A liquid above a same-element liquid pours down up to a quarter of its mass per tick, as much as the lower cell can take below its `max_mass` (1,000 kg for water).
+- **Spread.** Sideways, a quarter of the level difference flows toward the lower same-element cell, capped so the receiver never exceeds `max_mass`. A liquid of at least 80 g beside a gas cell presses it: the gas evacuates into its own region, and the liquid spreads a quarter of its mass into the vacuum next tick.
+- **Over-pressure.** A cell more than 10 g above `max_mass` pushes up to a quarter of its excess into the cell above (pressing a gas there out of the way). Smaller overfills are tolerated, because pushing them up would only create sub-floor residue that merges straight back down and never settles.
 
-Liquids and gases never share a cell, and a liquid cell below 10 g outside a pipe is removed under the mass-floor rule.
+Each flow is budgeted at a quarter of the cell (down, left, right, up), so the four together can never exceed its mass. Liquids and gases never share a cell, and a liquid cell below 10 g merges into its heaviest same-element neighbour. The stacked-liquid pressure that damages weak tiles is deferred to the buildings milestone.
 
 ### 6.7 Heat and phase change
 
@@ -249,7 +249,7 @@ for each cell a, reading only the OLD buffers:
     temp_new[a] = temp_old[a] + dq / C_a
 ```
 
-The clamp makes the explicit scheme unconditionally stable without a smaller step. Vacuum conducts nothing. Buildings are heat bodies with their own mass and temperature, coupled to the cells they occupy. Phase change compares a cell's temperature with its element's melt and boil points with a ±3 K hysteresis band; the element id changes, the mass does not, and there is no latent heat (the reference game makes the same simplification).
+The clamp makes the explicit scheme unconditionally stable without a smaller step. Vacuum conducts nothing. Buildings are heat bodies with their own mass and temperature, coupled to the cells they occupy. Phase change runs at the end of the heat pass on the cell's new temperature (it is cell-local, so it needs no pass of its own): the element's melt and boil points with a ±3 K hysteresis band decide whether the cell becomes its solid, liquid, or gas form; the mass does not change and there is no latent heat (the reference game makes the same simplification). A phase change marks the chunk active for every pass, since the mass passes do not otherwise watch the heat pass.
 
 ### 6.8 Conservation and the gather rule
 
@@ -396,7 +396,7 @@ Per-cell cost in the all-active worst case is 39 ns (sort), 69 ns (flux), and 45
 
 **Limitations by design.** Finite worlds. One element per cell, no mixtures. No latent heat. No fluid momentum; liquids spread by mass difference only. Networks are abstract graphs, not simulated flow.
 
-**Next work.** M2: liquids, phase change, seeded worldgen, saves and the command log, plus the kernel optimisation named in the M1 result. The buoyancy and evacuation rules should be revisited once liquids exist, because a liquid surface is another interface the pressed test has to respect.
+**M2 progress.** Liquids and phase change are in (`colony/sim/src/fluid.rs`, `heat.rs`), with the `pool` scenario and its golden. Remaining for M2: seeded worldgen, saves and the command log, then the decision caching named in the M1 result. One observation from the pool: the water comes to rest within a few hundred ticks, but the air it displaced keeps diffusing for thousands, so "settled" has to be judged per element, not by chunk activity alone.
 
 ## Appendix A: Roads Not Taken
 

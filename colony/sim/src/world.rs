@@ -189,6 +189,9 @@ pub struct CellOut {
     pub temp: i32,
     pub flags: u8,
     pub active: bool,
+    /// The element changed phase in a pass that the mass passes do not otherwise watch
+    /// (heat), so the chunk must be visited by every pass next tick.
+    pub phase_changed: bool,
 }
 
 impl CellOut {
@@ -198,6 +201,7 @@ impl CellOut {
         temp: 0,
         flags: 0,
         active: true,
+        phase_changed: false,
     };
 
     #[inline]
@@ -208,6 +212,7 @@ impl CellOut {
             temp: cell.temp,
             flags: cell.flags,
             active: false,
+            phase_changed: false,
         }
     }
 }

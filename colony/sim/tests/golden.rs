@@ -45,3 +45,12 @@ fn golden_pressure_burst_48_after_200_ticks() {
     }
     check("pressure-burst-48-200.hash", sim.state_hash());
 }
+
+#[test]
+fn golden_pool_64_after_300_ticks() {
+    let mut sim = scenario::pool(64, 64);
+    for _ in 0..300 {
+        sim.step();
+    }
+    check("pool-64-300.hash", sim.state_hash());
+}

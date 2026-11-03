@@ -9,7 +9,7 @@
 //! An [`ElementId`] packs the phase into its top two bits, so a pass can tell a gas
 //! from a solid with a shift instead of a table lookup per neighbour.
 
-use crate::fixed::{q16, ONE};
+use crate::fixed::{q16, Mass, Temp, ONE};
 
 /// The phase of an element, which decides which passes touch a cell.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -76,10 +76,21 @@ pub struct ElementDef {
     pub shc: i64,
     /// Conductive transfer per kelvin of difference per tick, Q16.16 J/(K·tick).
     pub conduct: i64,
-    /// Density, Q16.16 kg/m³; orders gases for buoyancy.
+    /// Density, Q16.16 kg/m³; orders fluids for buoyancy.
     pub density: i64,
     /// Display colour for debug renders.
     pub colour: [u8; 3],
+    /// For liquids: the mass one cell holds before pushing upward (raw Q16.16 kg);
+    /// `u32::MAX` means unlimited.
+    pub max_mass: u32,
+    /// Melting point (raw Q16.16 K); `None` never melts or freezes.
+    pub melt: Option<i32>,
+    /// Boiling point (raw Q16.16 K); `None` never boils or condenses.
+    pub boil: Option<i32>,
+    /// The element this one becomes when it freezes, melts, or boils / condenses.
+    pub solid_of: Option<ElementId>,
+    pub liquid_of: Option<ElementId>,
+    pub gas_of: Option<ElementId>,
 }
 
 impl ElementDef {
@@ -98,7 +109,37 @@ impl ElementDef {
             conduct,
             density,
             colour,
+            max_mass: u32::MAX,
+            melt: None,
+            boil: None,
+            solid_of: None,
+            liquid_of: None,
+            gas_of: None,
         }
+    }
+
+    /// Caps how much of a liquid one cell holds.
+    pub fn with_max_mass(mut self, max_mass: u32) -> ElementDef {
+        self.max_mass = max_mass;
+        self
+    }
+
+    /// Links the three phases of one substance; pass `None` for a phase that does not
+    /// exist. Thresholds are raw Q16.16 kelvin.
+    pub fn with_phases(
+        mut self,
+        melt: Option<i32>,
+        boil: Option<i32>,
+        solid: Option<ElementId>,
+        liquid: Option<ElementId>,
+        gas: Option<ElementId>,
+    ) -> ElementDef {
+        self.melt = melt;
+        self.boil = boil;
+        self.solid_of = solid;
+        self.liquid_of = liquid;
+        self.gas_of = gas;
+        self
     }
 }
 
@@ -109,6 +150,7 @@ pub struct ElementTable {
     shc: Vec<i64>,
     conduct: Vec<i64>,
     density: Vec<i64>,
+    max_mass: Vec<u32>,
     /// Symmetric Q16.16 multiplier applied to conduction between two phases.
     pair_mult: [[i64; 4]; 4],
 }
@@ -137,13 +179,38 @@ impl ElementTable {
         let shc = defs.iter().map(|d| d.shc).collect();
         let conduct = defs.iter().map(|d| d.conduct).collect();
         let density = defs.iter().map(|d| d.density).collect();
-        ElementTable {
+        let max_mass = defs.iter().map(|d| d.max_mass).collect();
+        let table = ElementTable {
             defs,
             shc,
             conduct,
             density,
+            max_mass,
             pair_mult: [[ONE; 4]; 4],
+        };
+        for def in &table.defs {
+            for (link, phase) in [
+                (def.solid_of, Phase::Solid),
+                (def.liquid_of, Phase::Liquid),
+                (def.gas_of, Phase::Gas),
+            ] {
+                if let Some(id) = link {
+                    assert!(
+                        table.contains(id) && id.phase() == phase,
+                        "{}: phase link {id:?} is not a {phase:?} in this table",
+                        def.name
+                    );
+                }
+            }
+            if let (Some(melt), Some(boil)) = (def.melt, def.boil) {
+                assert!(
+                    melt < boil,
+                    "{}: melting point must be below boiling point",
+                    def.name
+                );
+            }
         }
+        table
     }
 
     /// Sets the conduction multiplier between two phases (applied in both directions).
@@ -210,6 +277,11 @@ impl ElementTable {
     }
 
     #[inline]
+    pub fn max_mass(&self, element: u16) -> u32 {
+        self.max_mass[ElementId(element).index()]
+    }
+
+    #[inline]
     pub fn pair_mult(&self, a: Phase, b: Phase) -> i64 {
         self.pair_mult[a.index()][b.index()]
     }
@@ -218,6 +290,9 @@ impl ElementTable {
     /// vacuum, oxygen, carbon dioxide, water, sandstone. Conduction is the real
     /// conductivity in W/(m·K) times the 0.1 s tick; densities are at room conditions.
     pub fn builtin() -> ElementTable {
+        use builtin::{ICE, STEAM, WATER};
+        let freeze = Temp::from_millikelvin(273_150).raw();
+        let boil = Temp::from_millikelvin(373_150).raw();
         ElementTable::new(vec![
             ElementDef::new("vacuum", Phase::Vacuum, 0, 0, 0, [8, 8, 12]),
             ElementDef::new(
@@ -243,6 +318,14 @@ impl ElementTable {
                 q16(0, 60_900),
                 q16(1000, 0),
                 [60, 110, 220],
+            )
+            .with_max_mass(Mass::from_kg(1000).raw())
+            .with_phases(
+                Some(freeze),
+                Some(boil),
+                Some(ICE),
+                Some(WATER),
+                Some(STEAM),
             ),
             ElementDef::new(
                 "sandstone",
@@ -251,6 +334,36 @@ impl ElementTable {
                 q16(0, 290_000),
                 q16(2323, 0),
                 [160, 140, 100],
+            ),
+            ElementDef::new(
+                "ice",
+                Phase::Solid,
+                q16(2050, 0),
+                q16(0, 220_000),
+                q16(917, 0),
+                [200, 230, 255],
+            )
+            .with_phases(
+                Some(freeze),
+                Some(boil),
+                Some(ICE),
+                Some(WATER),
+                Some(STEAM),
+            ),
+            ElementDef::new(
+                "steam",
+                Phase::Gas,
+                q16(2080, 0),
+                q16(0, 1_840),
+                q16(0, 600_000),
+                [220, 220, 230],
+            )
+            .with_phases(
+                Some(freeze),
+                Some(boil),
+                Some(ICE),
+                Some(WATER),
+                Some(STEAM),
             ),
         ])
     }
@@ -265,6 +378,8 @@ pub mod builtin {
     pub const CARBON_DIOXIDE: ElementId = ElementId::new(Phase::Gas, 2);
     pub const WATER: ElementId = ElementId::new(Phase::Liquid, 3);
     pub const SANDSTONE: ElementId = ElementId::new(Phase::Solid, 4);
+    pub const ICE: ElementId = ElementId::new(Phase::Solid, 5);
+    pub const STEAM: ElementId = ElementId::new(Phase::Gas, 6);
 }
 
 #[cfg(test)]
@@ -286,7 +401,11 @@ mod tests {
     #[test]
     fn builtin_table_is_consistent() {
         let table = ElementTable::builtin();
-        assert_eq!(table.len(), 5);
+        assert_eq!(table.len(), 7);
+        assert_eq!(table.get(builtin::WATER).gas_of, Some(builtin::STEAM));
+        assert_eq!(table.get(builtin::STEAM).liquid_of, Some(builtin::WATER));
+        assert_eq!(table.max_mass(builtin::WATER.0), Mass::from_kg(1000).raw());
+        assert_eq!(table.max_mass(builtin::OXYGEN.0), u32::MAX);
         assert_eq!(table.id_by_name("oxygen"), Some(builtin::OXYGEN));
         assert_eq!(table.id(4), builtin::SANDSTONE);
         assert!(table.contains(builtin::WATER));
@@ -309,6 +428,14 @@ mod tests {
         table.set_pair_mult(Phase::Gas, Phase::Solid, 25 * ONE);
         assert_eq!(table.pair_mult(Phase::Solid, Phase::Gas), 25 * ONE);
         assert_eq!(table.pair_mult(Phase::Gas, Phase::Gas), ONE);
+    }
+
+    #[test]
+    #[should_panic(expected = "phase link")]
+    fn rejects_a_phase_link_with_the_wrong_phase() {
+        let mut defs = ElementTable::builtin().defs().to_vec();
+        defs[3].gas_of = Some(builtin::SANDSTONE);
+        ElementTable::new(defs);
     }
 
     #[test]

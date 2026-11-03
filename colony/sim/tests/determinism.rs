@@ -181,3 +181,59 @@ fn hot_rock_edge_cools_and_its_surroundings_warm() {
     let drift = (sim.total_energy() - energy_before).abs();
     assert!(drift <= 2 * 2000 * sim.total_capacity());
 }
+
+#[test]
+fn water_falls_covers_the_floor_and_loses_no_mass() {
+    let mut sim = scenario::pool(64, 64);
+    let max = sim.table().max_mass(builtin::WATER.0) as u64
+        + colony_sim::fluid::LIQUID_FLOOR.raw() as u64;
+    let water = |sim: &Sim| -> Vec<(usize, usize, u32)> {
+        let w = sim.world();
+        (0..w.height)
+            .flat_map(|y| (0..w.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| w.get(x, y).0 == builtin::WATER)
+            .map(|(x, y)| (x, y, w.get(x, y).1.raw()))
+            .collect()
+    };
+    let start = sim.total_mass();
+    let water_start: u64 = water(&sim).iter().map(|c| c.2 as u64).sum();
+    for _ in 0..1500 {
+        sim.step();
+        assert_eq!(sim.total_mass(), start);
+    }
+    let before = water(&sim);
+    for _ in 0..100 {
+        sim.step();
+    }
+    let after = water(&sim);
+    assert_eq!(
+        after.iter().map(|c| c.2 as u64).sum::<u64>(),
+        water_start,
+        "water neither froze nor vanished"
+    );
+    // The pool keeps levelling for thousands of ticks, so "at rest" is judged by what
+    // cannot change any more: the bottom row is covered and nothing is left up high.
+    assert!(
+        after.len() >= before.len(),
+        "water cells only spread, never vanish"
+    );
+    let width = sim.world().width;
+    let bottom_row = after.iter().filter(|c| c.1 == 1).count();
+    assert!(
+        bottom_row >= (width - 2) * 9 / 10,
+        "bottom row covered by {bottom_row} of {} cells",
+        width - 2
+    );
+    let highest_water_row = after.iter().map(|c| c.1).max().unwrap();
+    assert!(
+        highest_water_row < sim.world().height / 2,
+        "water should have fallen to the floor, highest row {highest_water_row}"
+    );
+    for (x, y, mass) in &after {
+        assert!(
+            *mass as u64 <= max,
+            "cell ({x}, {y}) holds {} g",
+            colony_sim::Mass(*mass).to_grams()
+        );
+    }
+}

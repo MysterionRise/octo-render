@@ -13,7 +13,10 @@ use crate::fixed::{Mass, Temp};
 use crate::hash::Fnv1a;
 use crate::heat::capacity;
 use crate::world::{CellBuffers, CellOut, Grid, World};
-use crate::{gas, heat};
+use crate::{fluid, heat};
+
+const ACTIVE_EXCHANGE: u8 = 1;
+const ACTIVE_PHASE: u8 = 2;
 
 /// What one tick did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +51,8 @@ pub struct Sim {
     active_heat: Vec<bool>,
     process_mass: Vec<bool>,
     process_heat: Vec<bool>,
-    pass_activity: Vec<bool>,
+    /// Per chunk, bit 0: the last pass exchanged something; bit 1: an element changed phase.
+    pass_activity: Vec<u8>,
     tick_activity_mass: Vec<bool>,
     tick_activity_heat: Vec<bool>,
     scratch: Vec<bool>,
@@ -71,7 +75,7 @@ impl Sim {
             active_heat: vec![true; n],
             process_mass: vec![false; n],
             process_heat: vec![false; n],
-            pass_activity: vec![false; n],
+            pass_activity: vec![0; n],
             tick_activity_mass: vec![false; n],
             tick_activity_heat: vec![false; n],
             scratch: vec![false; n],
@@ -161,11 +165,11 @@ impl Sim {
     }
 
     pub fn pass_sort(&mut self) {
-        self.run_pass(PassKind::Mass, gas::sort_cell);
+        self.run_pass(PassKind::Mass, fluid::sort_cell);
     }
 
     pub fn pass_flux(&mut self) {
-        self.run_pass(PassKind::Mass, gas::flux_cell);
+        self.run_pass(PassKind::Mass, fluid::flux_cell);
     }
 
     pub fn pass_heat(&mut self) {
@@ -205,14 +209,23 @@ impl Sim {
             parallel,
             ..
         } = self;
-        let (process, tick_activity) = match kind {
-            PassKind::Mass => (&*process_mass, tick_activity_mass),
-            PassKind::Heat => (&*process_heat, tick_activity_heat),
+        let process = match kind {
+            PassKind::Mass => &*process_mass,
+            PassKind::Heat => &*process_heat,
         };
         let grid = Grid::new(world, table);
         sweep(&grid, *chunks, process, back, pass_activity, *parallel, &f);
-        for (t, p) in tick_activity.iter_mut().zip(pass_activity.iter()) {
-            *t |= *p;
+        for (i, p) in pass_activity.iter().enumerate() {
+            let exchanged = p & ACTIVE_EXCHANGE != 0;
+            let changed = p & ACTIVE_PHASE != 0;
+            match kind {
+                PassKind::Mass => tick_activity_mass[i] |= exchanged | changed,
+                PassKind::Heat => tick_activity_heat[i] |= exchanged | changed,
+            }
+            if changed {
+                tick_activity_mass[i] = true;
+                tick_activity_heat[i] = true;
+            }
         }
         std::mem::swap(&mut world.cells, back);
     }
@@ -267,7 +280,7 @@ struct BandOut<'a> {
     mass: &'a mut [u32],
     temp: &'a mut [i32],
     flags: &'a mut [u8],
-    act: &'a mut [bool],
+    act: &'a mut [u8],
 }
 
 /// Runs `f` over every processed cell, copies skipped chunks, and records per-chunk
@@ -278,7 +291,7 @@ fn sweep<F>(
     chunks: ChunkGrid,
     process: &[bool],
     out: &mut CellBuffers,
-    activity: &mut [bool],
+    activity: &mut [u8],
     parallel: bool,
     f: &F,
 ) where
@@ -348,7 +361,7 @@ where
         let x0 = cx * CHUNK;
         let x1 = (x0 + CHUNK).min(w);
         let run = process[chunks.index(cx, band)];
-        let mut active = false;
+        let mut active: u8 = 0;
         for y in y0..y1 {
             let row = y * w;
             if run {
@@ -359,7 +372,8 @@ where
                     mass[i] = o.mass;
                     temp[i] = o.temp;
                     flags[i] = o.flags;
-                    active |= o.active;
+                    active |= ((o.active as u8) * ACTIVE_EXCHANGE)
+                        | ((o.phase_changed as u8) * ACTIVE_PHASE);
                 }
             } else {
                 let (s, e) = (row + x0 - base, row + x1 - base);

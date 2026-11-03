@@ -8,12 +8,13 @@ use crate::rng::Pcg32;
 use crate::sim::Sim;
 
 /// Names accepted by [`by_name`].
-pub const NAMES: [&str; 5] = [
+pub const NAMES: [&str; 6] = [
     "gas-mixing",
     "settled",
     "pressure-burst",
     "hot-rock",
     "noise",
+    "pool",
 ];
 
 /// Builds a scenario by name, or `None` for an unknown name or a world under 3×3.
@@ -27,6 +28,7 @@ pub fn by_name(name: &str, width: usize, height: usize) -> Option<Sim> {
         "pressure-burst" => Some(pressure_burst(width, height)),
         "hot-rock" => Some(hot_rock(width, height)),
         "noise" => Some(noise(width, height, 1)),
+        "pool" => Some(pool(width, height)),
         _ => None,
     }
 }
@@ -152,6 +154,35 @@ pub fn noise(width: usize, height: usize, seed: u64) -> Sim {
             sim.set_cell(x, y, element, mass, temp);
         }
     }
+    sim
+}
+
+/// Oxygen at 1 kg everywhere with a block of water (one eighth of the world, 1,000 kg
+/// per cell) hanging in the upper half: it falls, spreads along the floor, and pushes
+/// the air out of its way.
+pub fn pool(width: usize, height: usize) -> Sim {
+    let mut sim = bordered(width, height, Temp::from_kelvin(300));
+    sim.fill_rect(
+        1,
+        1,
+        width - 1,
+        height - 1,
+        builtin::OXYGEN,
+        Mass::from_kg(1),
+        Temp::from_kelvin(300),
+    );
+    let (bw, bh) = ((width / 8).max(1), (height / 8).max(1));
+    let x0 = (width - bw) / 2;
+    let y0 = (height * 3 / 4).min(height - 1 - bh).max(1);
+    sim.fill_rect(
+        x0,
+        y0,
+        (x0 + bw).min(width - 1),
+        (y0 + bh).min(height - 1),
+        builtin::WATER,
+        Mass::from_kg(1000),
+        Temp::from_kelvin(290),
+    );
     sim
 }
 

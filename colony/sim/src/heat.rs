@@ -6,8 +6,41 @@
 //! converting it back to a temperature rounds per cell, which the energy-ledger test
 //! bounds.
 
-use crate::fixed::scale_mag;
-use crate::world::{Cell, CellOut, Grid};
+use crate::element::{ElementId, ElementTable, Phase};
+use crate::fixed::{scale_mag, Temp};
+use crate::world::{Cell, CellOut, Grid, Stencil};
+
+/// Half-width of the band around a melting or boiling point inside which a cell keeps
+/// its phase (3 K), so a cell sitting on a threshold does not flip every tick.
+pub const HYSTERESIS: i32 = Temp::from_kelvin(3).raw();
+
+/// The element a cell of `element` at `temp` turns into, if it crosses a threshold by
+/// more than [`HYSTERESIS`]. Mass is unchanged and there is no latent heat, as in the
+/// reference game.
+pub fn phase_change(table: &ElementTable, element: u16, temp: i32) -> Option<u16> {
+    let def = table.get(ElementId(element));
+    let target = match def.phase {
+        Phase::Solid => def
+            .melt
+            .filter(|m| temp > m + HYSTERESIS)
+            .and(def.liquid_of),
+        Phase::Liquid => {
+            if def.boil.is_some_and(|b| temp > b + HYSTERESIS) {
+                def.gas_of
+            } else if def.melt.is_some_and(|m| temp < m - HYSTERESIS) {
+                def.solid_of
+            } else {
+                None
+            }
+        }
+        Phase::Gas => def
+            .boil
+            .filter(|b| temp < b - HYSTERESIS)
+            .and(def.liquid_of),
+        Phase::Vacuum => None,
+    };
+    target.map(|id| id.0).filter(|id| *id != element)
+}
 
 /// Heat capacity of a cell in Q16.16 J/K.
 #[inline]
@@ -23,6 +56,34 @@ pub fn conduct_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
     if cap_c == 0 {
         return CellOut::keep(c);
     }
+    let conducted = conduct(grid, &st, cap_c);
+    let temp = conducted.unwrap_or(c.temp);
+    match phase_change(grid.table, c.element, temp) {
+        Some(element) => CellOut {
+            element,
+            mass: c.mass,
+            temp,
+            flags: 0,
+            active: true,
+            phase_changed: true,
+        },
+        None => match conducted {
+            Some(temp) => CellOut {
+                element: c.element,
+                mass: c.mass,
+                temp,
+                flags: c.flags,
+                active: true,
+                phase_changed: false,
+            },
+            None => CellOut::keep(c),
+        },
+    }
+}
+
+/// The cell's temperature after conduction, or `None` when nothing moved.
+fn conduct(grid: &Grid, st: &Stencil, cap_c: i64) -> Option<i32> {
+    let c = &st.cell;
     let k_c = grid.table.conduct(c.element);
     let mut dq: i128 = 0;
     let mut active = false;
@@ -54,21 +115,14 @@ pub fn conduct_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
         }
     }
     if !active {
-        return CellOut::keep(c);
+        return None;
     }
     // The 64-bit division covers every realistic cell; the wide path keeps it exact.
     let delta = match i64::try_from(dq << 16) {
         Ok(wide) => (wide / cap_c) as i128,
         Err(_) => (dq << 16) / cap_c as i128,
     };
-    let temp = (c.temp as i128 + delta).clamp(i32::MIN as i128, i32::MAX as i128) as i32;
-    CellOut {
-        element: c.element,
-        mass: c.mass,
-        temp,
-        flags: c.flags,
-        active,
-    }
+    Some((c.temp as i128 + delta).clamp(i32::MIN as i128, i32::MAX as i128) as i32)
 }
 
 #[cfg(test)]
@@ -124,6 +178,70 @@ mod tests {
         let grid = Grid::new(&world, &table);
         assert_eq!(conduct_cell(&grid, 0, 0), CellOut::keep(&grid.cell(0, 0)));
         assert_eq!(conduct_cell(&grid, 1, 0), CellOut::keep(&grid.cell(1, 0)));
+    }
+
+    #[test]
+    fn water_freezes_boils_and_keeps_its_phase_inside_the_hysteresis_band() {
+        let table = ElementTable::builtin();
+        let freeze = Temp::from_millikelvin(273_150).raw();
+        let boil = Temp::from_millikelvin(373_150).raw();
+        assert_eq!(
+            phase_change(&table, builtin::WATER.0, freeze - HYSTERESIS - 1),
+            Some(builtin::ICE.0)
+        );
+        assert_eq!(
+            phase_change(&table, builtin::WATER.0, freeze - HYSTERESIS),
+            None
+        );
+        assert_eq!(
+            phase_change(&table, builtin::WATER.0, boil + HYSTERESIS + 1),
+            Some(builtin::STEAM.0)
+        );
+        assert_eq!(
+            phase_change(&table, builtin::ICE.0, freeze + HYSTERESIS + 1),
+            Some(builtin::WATER.0)
+        );
+        assert_eq!(
+            phase_change(&table, builtin::ICE.0, freeze + HYSTERESIS),
+            None
+        );
+        assert_eq!(
+            phase_change(&table, builtin::STEAM.0, boil - HYSTERESIS - 1),
+            Some(builtin::WATER.0)
+        );
+        assert_eq!(
+            phase_change(&table, builtin::STEAM.0, Temp::from_kelvin(500).raw()),
+            None
+        );
+        assert_eq!(
+            phase_change(&table, builtin::SANDSTONE.0, Temp::from_kelvin(5000).raw()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cold_water_cell_freezes_in_the_heat_pass_without_any_conduction() {
+        let table = ElementTable::builtin();
+        let mut world = World::new(1, 1);
+        world.set(
+            &table,
+            0,
+            0,
+            builtin::WATER,
+            Mass::from_kg(500),
+            Temp::from_kelvin(250),
+        );
+        let grid = Grid::new(&world, &table);
+        let out = conduct_cell(&grid, 0, 0);
+        assert_eq!(
+            (out.element, out.mass, out.temp),
+            (
+                builtin::ICE.0,
+                Mass::from_kg(500).raw(),
+                Temp::from_kelvin(250).raw()
+            )
+        );
+        assert!(out.active && out.phase_changed);
     }
 
     #[test]

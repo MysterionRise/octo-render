@@ -19,7 +19,7 @@
 pub mod chunk;
 pub mod element;
 pub mod fixed;
-pub mod gas;
+pub mod fluid;
 pub mod hash;
 pub mod heat;
 pub mod rng;
