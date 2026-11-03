@@ -1,6 +1,6 @@
 # Colony Engine Design And Roadmap
 
-Status: design written 2026-11-03; milestone M1 (the headless kernel) landed the same day under `colony/`, see the M1 result in section 14. This document is the research record, the architecture, and the milestone plan for a purpose-built 2D colony-simulation engine that grows next to `octo-render`. `colony-sim` and `colony-headless` exist; the other crate names are placeholders.
+Status: design written 2026-11-03; M1 (the headless kernel), M2 (fluids, worldgen, snapshots, replay), and M3 (the windowed renderer) landed the same day under `colony/`, see the results in section 14. This document is the research record, the architecture, and the milestone plan for a purpose-built 2D colony-simulation engine that grows next to `octo-render`. `colony-sim`, `colony-headless`, `colony-render`, and `colony-game` exist; `colony-content` remains a placeholder name.
 
 The portfolio story stays split. `octo-render` proves graphics fundamentals on the CPU. The colony engine is a separate product whose proof is a deterministic, benchmarked cell simulation.
 
@@ -379,6 +379,19 @@ Per-cell cost in the all-active worst case is 39 ns (sort), 69 ns (flux), and 45
 
 **Gate decision: go.** The realistic tick is inside the 25 ms budget on one core with room for liquids, networks, and entities, and the adversarial case fits with the thread pool. Caching per-cell decisions (evacuation direction, vacuum winner) in the flags byte so that neighbours read them instead of recomputing them is the remaining lever for the noise case; it is deferred until liquids exist, because the liquid rules add to the same decisions.
 
+### M3 result (2026-11-03)
+
+`colony/render` (`colony-render`) and `colony/game` (`colony-game`) implement the renderer as specified in section 10, with two simplifications: the whole view is one fullscreen-triangle draw whose fragment shader does every lookup with integer coordinates (no per-chunk quads), and there is no offscreen HDR pass, since pixel art wants exact palette values on a linear surface. The kernel runs in `SimHost` on its own thread and publishes snapshots through a latest-snapshot mailbox; dirty chunks come from `Sim::processed_chunks`.
+
+| Exit criterion | Status |
+| --- | --- |
+| 60 fps at 1080p with an overlay on | Not measurable here: the container has no GPU adapter. The window shows fps and frame time, and `colony-game --benchmark 300 --overlay temperature` reports ms per frame offscreen on any machine with an adapter |
+| A stalled sim never blocks rendering | By construction (the game thread only ever `take`s the mailbox) and pinned by the host tests: a paused host publishes nothing and the last snapshot stays |
+| The cell probe matches headless values | Pinned: `Snapshot::probe` equals `World::get` for every cell, and the CPU twin of the shader reproduces `colony-headless` renders byte for byte for gases, vacuum, solids' presence, and the temperature overlay |
+| Shader correctness | `cells.wgsl` is parsed and validated with naga in a unit test and its uniform layout checked; `tests/gpu_matches_cpu.rs` renders on the GPU and compares to the CPU reference and the golden, and skips (passing) without an adapter; it must be run on a machine with a GPU before trusting the shader |
+
+What a developer with a display should do first: `cargo run --release -p colony-game -- --scenario cave`, hover cells and compare the probe with `colony-headless --png-dir`, pause, dig and pour, save and load, then `cargo test -p colony-render -- --nocapture gpu` to see the GPU parity test run instead of skip.
+
 ## 15. Risks
 
 | Risk | Mitigation |
@@ -396,7 +409,7 @@ Per-cell cost in the all-active worst case is 39 ns (sort), 69 ns (flux), and 45
 
 **Limitations by design.** Finite worlds. One element per cell, no mixtures. No latent heat. No fluid momentum; liquids spread by mass difference only. Networks are abstract graphs, not simulated flow.
 
-**M2 progress.** Liquids and phase change (`colony/sim/src/fluid.rs`, `heat.rs`), seeded worldgen (`worldgen.rs`: integer value noise, a sandstone body with air pockets, carbon dioxide low down, water pools at the bottom), snapshots (`save.rs`: a versioned little-endian layout with the element-table hash and a trailing state hash), and the command log with replay (`command.rs`, `Sim::queue`, `Sim::log`, `Sim::replay`) are in, each with goldens or replay-equality tests: a save at tick t continued for k ticks hashes identically to the uninterrupted run, and a logged run replays to the same hash from the seed. Snapshots use a hand-rolled layout rather than `postcard` so the kernel stays dependency-free; compression is left for when saves get large. Remaining for M2: the decision caching named in the M1 result. One observation from the pool: the water comes to rest within a few hundred ticks, but the air it displaced keeps diffusing for thousands, so "settled" has to be judged per element, not by chunk activity alone.
+**M2 and M3 progress.** Liquids and phase change (`colony/sim/src/fluid.rs`, `heat.rs`), seeded worldgen (`worldgen.rs`: integer value noise, a sandstone body with air pockets, carbon dioxide low down, water pools at the bottom), snapshots (`save.rs`: a versioned little-endian layout with the element-table hash and a trailing state hash), and the command log with replay (`command.rs`, `Sim::queue`, `Sim::log`, `Sim::replay`) are in, each with goldens or replay-equality tests: a save at tick t continued for k ticks hashes identically to the uninterrupted run, and a logged run replays to the same hash from the seed. Snapshots use a hand-rolled layout rather than `postcard` so the kernel stays dependency-free; compression is left for when saves get large. Remaining from M2: the decision caching named in the M1 result. M3 added the renderer and window (section 14). One observation from the pool: the water comes to rest within a few hundred ticks, but the air it displaced keeps diffusing for thousands, so "settled" has to be judged per element, not by chunk activity alone.
 
 ## Appendix A: Roads Not Taken
 
