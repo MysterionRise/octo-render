@@ -1,4 +1,4 @@
-//! Tick-time benchmarks for the M1 exit criteria (design document, section 14).
+//! Tick-time benchmarks for the M1 and M4 exit criteria (design document, section 14).
 
 use colony_sim::scenario;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -47,9 +47,28 @@ fn tick_benches(c: &mut Criterion) {
     });
     group.finish();
 
+    // M4: the agents pass alone (nav refresh, gravity, assignment, routing, work) with
+    // 100 colonists working through hundreds of dig orders in a 512x512 hall.
+    let mut group = c.benchmark_group("agents");
+    group.bench_function(BenchmarkId::new("crew-pass-agents", 512), |b| {
+        let mut sim = scenario::crew(512, 512, 1);
+        sim.set_parallel(false);
+        b.iter(|| {
+            sim.begin_tick();
+            sim.pass_agents();
+            sim.end_tick()
+        });
+    });
+    group.bench_function(BenchmarkId::new("crew-tick-sequential", 512), |b| {
+        let mut sim = scenario::crew(512, 512, 1);
+        sim.set_parallel(false);
+        b.iter(|| sim.step());
+    });
+    group.finish();
+
     let mut group = c.benchmark_group("hash");
     group.bench_function("state-hash-512", |b| {
-        let sim = scenario::gas_mixing(512, 512);
+        let sim = scenario::crew(512, 512, 1);
         b.iter(|| sim.state_hash());
     });
     group.finish();

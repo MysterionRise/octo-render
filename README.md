@@ -288,7 +288,7 @@ The workspace has three layers:
 
 - Root package `octo-render`: CPU software-renderer library (`renderer`) plus the `app` CLI.
 - `crates/*`: GPU viewer stack split into core data, asset loading, `wgpu` helpers, renderer passes, and `octo-app`.
-- `colony/*`: a purpose-built colony-sim engine in progress: `colony-sim`, a deterministic fixed-point cell-simulation kernel (gases, liquids, heat, phase change, seeded worldgen, snapshots, replay); `colony-headless`, its runner and PNG dumper; `colony-render`, a pixel-perfect wgpu renderer with dual-grid autotiling and the sim thread host; and `colony-game`, the window with an egui inspector. The design, measurements, and roadmap are in [docs/colony-engine-design.md](docs/colony-engine-design.md).
+- `colony/*`: a purpose-built colony-sim engine in progress: `colony-sim`, a deterministic fixed-point cell-simulation kernel (gases, liquids, heat, phase change, seeded worldgen, snapshots, replay, and colonists that walk a region graph and dig and build from a job board while cells plus debris stay mass-exact); `colony-headless`, its runner and PNG dumper; `colony-render`, a pixel-perfect wgpu renderer with dual-grid autotiling, instanced colonist sprites, and the sim thread host; and `colony-game`, the window with an egui inspector and order tools. The design, measurements, and roadmap are in [docs/colony-engine-design.md](docs/colony-engine-design.md).
 
 The CPU renderer is the OpenGL-style reimplementation. The GPU viewer is intentionally separate because it delegates rasterization to `wgpu`/Metal/Vulkan/DX backends.
 
