@@ -320,7 +320,7 @@ Power, pipes, and automation are separate graph structures rebuilt only when the
 
 ## 11. Save, Replay, Determinism
 
-- **Save.** A header (format version, content hash, seed, tick) followed by `postcard` encoding of the SoA arrays, `hecs` columns, network graphs, and RNG state, compressed with `lz4_flex` (pure Rust; zstd is the alternative if ratio matters).
+- **Save.** A header (magic, format version, element-table hash, dimensions, tick) followed by the SoA arrays as little-endian bytes and a trailing state hash, hand-rolled so the kernel has no serialisation dependency (implemented in M2). Entity columns and network graphs join the layout when they exist; compression (`lz4_flex`, pure Rust) is added when saves get large.
 - **Replay.** Seed, content hash, and the command log. Replaying a log must reproduce the per-tick state hash exactly.
 - **Forbidden in the kernel.** `std::time`, iteration over `HashMap` or `HashSet` in any mutating path, and `f32` or `f64` in state or tick code. Enforced with `clippy` `disallowed-types` where it accepts primitive types and a CI `grep` otherwise. The kernel's RNG is a PCG32 seeded from the save.
 - **Tests.** Same seed twice gives identical per-tick hashes; save at tick t and continue equals the uninterrupted run at t + k; a committed golden hash for a fixed scenario lives in `tests/golden/sim-*.hash`, first on Linux and later on a macOS runner; `colony-headless --compare a.hashes b.hashes` prints the first divergent tick, which turns a desync from a mystery into a bisection.
@@ -396,7 +396,7 @@ Per-cell cost in the all-active worst case is 39 ns (sort), 69 ns (flux), and 45
 
 **Limitations by design.** Finite worlds. One element per cell, no mixtures. No latent heat. No fluid momentum; liquids spread by mass difference only. Networks are abstract graphs, not simulated flow.
 
-**M2 progress.** Liquids and phase change are in (`colony/sim/src/fluid.rs`, `heat.rs`), with the `pool` scenario and its golden. Remaining for M2: seeded worldgen, saves and the command log, then the decision caching named in the M1 result. One observation from the pool: the water comes to rest within a few hundred ticks, but the air it displaced keeps diffusing for thousands, so "settled" has to be judged per element, not by chunk activity alone.
+**M2 progress.** Liquids and phase change (`colony/sim/src/fluid.rs`, `heat.rs`), seeded worldgen (`worldgen.rs`: integer value noise, a sandstone body with air pockets, carbon dioxide low down, water pools at the bottom), snapshots (`save.rs`: a versioned little-endian layout with the element-table hash and a trailing state hash), and the command log with replay (`command.rs`, `Sim::queue`, `Sim::log`, `Sim::replay`) are in, each with goldens or replay-equality tests: a save at tick t continued for k ticks hashes identically to the uninterrupted run, and a logged run replays to the same hash from the seed. Snapshots use a hand-rolled layout rather than `postcard` so the kernel stays dependency-free; compression is left for when saves get large. Remaining for M2: the decision caching named in the M1 result. One observation from the pool: the water comes to rest within a few hundred ticks, but the air it displaced keeps diffusing for thousands, so "settled" has to be judged per element, not by chunk activity alone.
 
 ## Appendix A: Roads Not Taken
 

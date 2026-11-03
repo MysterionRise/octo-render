@@ -1,0 +1,181 @@
+//! Commands: the only way the outside world changes a running simulation. They are
+//! queued, applied in order at the start of a tick, and logged with that tick, so a
+//! seed plus the log replays a run exactly.
+
+use crate::element::ElementId;
+use crate::fixed::{Mass, Temp};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// Overwrite one cell.
+    SetCell {
+        x: usize,
+        y: usize,
+        element: ElementId,
+        mass: Mass,
+        temp: Temp,
+    },
+    /// Overwrite the half-open rectangle `[x0, x1) × [y0, y1)`.
+    FillRect {
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+        element: ElementId,
+        mass: Mass,
+        temp: Temp,
+    },
+}
+
+/// A command with the tick it was applied at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    pub tick: u64,
+    pub command: Command,
+}
+
+const TAG_SET: u8 = 1;
+const TAG_FILL: u8 = 2;
+
+fn put_usize(out: &mut Vec<u8>, v: usize) {
+    out.extend_from_slice(&(v as u64).to_le_bytes());
+}
+
+/// Serialises a log as little-endian records.
+pub fn encode_log(log: &[LogEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(log.len() * 48);
+    out.extend_from_slice(&(log.len() as u64).to_le_bytes());
+    for entry in log {
+        out.extend_from_slice(&entry.tick.to_le_bytes());
+        match entry.command {
+            Command::SetCell {
+                x,
+                y,
+                element,
+                mass,
+                temp,
+            } => {
+                out.push(TAG_SET);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+                out.extend_from_slice(&element.0.to_le_bytes());
+                out.extend_from_slice(&mass.0.to_le_bytes());
+                out.extend_from_slice(&temp.0.to_le_bytes());
+            }
+            Command::FillRect {
+                x0,
+                y0,
+                x1,
+                y1,
+                element,
+                mass,
+                temp,
+            } => {
+                out.push(TAG_FILL);
+                for v in [x0, y0, x1, y1] {
+                    put_usize(&mut out, v);
+                }
+                out.extend_from_slice(&element.0.to_le_bytes());
+                out.extend_from_slice(&mass.0.to_le_bytes());
+                out.extend_from_slice(&temp.0.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// Parses [`encode_log`] output; `None` if the bytes are malformed.
+pub fn decode_log(bytes: &[u8]) -> Option<Vec<LogEntry>> {
+    let mut pos = 0usize;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let s = bytes.get(pos..pos.checked_add(n)?)?;
+        pos += n;
+        Some(s)
+    };
+    let count = u64::from_le_bytes(take(8)?.try_into().ok()?);
+    let mut log = Vec::new();
+    for _ in 0..count {
+        let tick = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        let tag = take(1)?[0];
+        let mut usize_field = || -> Option<usize> {
+            usize::try_from(u64::from_le_bytes(take(8)?.try_into().ok()?)).ok()
+        };
+        let command = match tag {
+            TAG_SET => {
+                let x = usize_field()?;
+                let y = usize_field()?;
+                let element = ElementId(u16::from_le_bytes(take(2)?.try_into().ok()?));
+                let mass = Mass(u32::from_le_bytes(take(4)?.try_into().ok()?));
+                let temp = Temp(i32::from_le_bytes(take(4)?.try_into().ok()?));
+                Command::SetCell {
+                    x,
+                    y,
+                    element,
+                    mass,
+                    temp,
+                }
+            }
+            TAG_FILL => {
+                let x0 = usize_field()?;
+                let y0 = usize_field()?;
+                let x1 = usize_field()?;
+                let y1 = usize_field()?;
+                let element = ElementId(u16::from_le_bytes(take(2)?.try_into().ok()?));
+                let mass = Mass(u32::from_le_bytes(take(4)?.try_into().ok()?));
+                let temp = Temp(i32::from_le_bytes(take(4)?.try_into().ok()?));
+                Command::FillRect {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    element,
+                    mass,
+                    temp,
+                }
+            }
+            _ => return None,
+        };
+        log.push(LogEntry { tick, command });
+    }
+    Some(log)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::element::builtin;
+
+    #[test]
+    fn log_round_trips_and_rejects_garbage() {
+        let log = vec![
+            LogEntry {
+                tick: 3,
+                command: Command::SetCell {
+                    x: 4,
+                    y: 5,
+                    element: builtin::WATER,
+                    mass: Mass::from_kg(7),
+                    temp: Temp::from_kelvin(280),
+                },
+            },
+            LogEntry {
+                tick: 9,
+                command: Command::FillRect {
+                    x0: 1,
+                    y0: 2,
+                    x1: 3,
+                    y1: 4,
+                    element: builtin::OXYGEN,
+                    mass: Mass::from_grams(500),
+                    temp: Temp::from_kelvin(300),
+                },
+            },
+        ];
+        let bytes = encode_log(&log);
+        assert_eq!(decode_log(&bytes).unwrap(), log);
+        assert_eq!(decode_log(&bytes[..bytes.len() - 1]), None);
+        let mut bad = bytes.clone();
+        bad[16] = 77;
+        assert_eq!(decode_log(&bad), None);
+    }
+}

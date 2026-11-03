@@ -17,16 +17,20 @@
 //! exactly conserving by construction.
 
 pub mod chunk;
+pub mod command;
 pub mod element;
 pub mod fixed;
 pub mod fluid;
 pub mod hash;
 pub mod heat;
 pub mod rng;
+pub mod save;
 pub mod scenario;
 pub mod sim;
 pub mod world;
+pub mod worldgen;
 
+pub use command::{Command, LogEntry};
 pub use element::{builtin, ElementDef, ElementId, ElementTable, Phase};
 pub use fixed::{Mass, Temp};
 pub use sim::{Sim, TickStats};

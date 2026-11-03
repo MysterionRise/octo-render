@@ -54,3 +54,12 @@ fn golden_pool_64_after_300_ticks() {
     }
     check("pool-64-300.hash", sim.state_hash());
 }
+
+#[test]
+fn golden_cave_96x64_seed_1_after_200_ticks() {
+    let mut sim = scenario::cave(96, 64);
+    for _ in 0..200 {
+        sim.step();
+    }
+    check("cave-96x64-1-200.hash", sim.state_hash());
+}

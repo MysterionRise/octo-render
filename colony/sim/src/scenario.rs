@@ -8,17 +8,24 @@ use crate::rng::Pcg32;
 use crate::sim::Sim;
 
 /// Names accepted by [`by_name`].
-pub const NAMES: [&str; 6] = [
+pub const NAMES: [&str; 7] = [
     "gas-mixing",
     "settled",
     "pressure-burst",
     "hot-rock",
     "noise",
     "pool",
+    "cave",
 ];
 
-/// Builds a scenario by name, or `None` for an unknown name or a world under 3×3.
+/// Builds a scenario by name with seed 1; see [`by_name_seeded`].
 pub fn by_name(name: &str, width: usize, height: usize) -> Option<Sim> {
+    by_name_seeded(name, width, height, 1)
+}
+
+/// Builds a scenario by name, or `None` for an unknown name or a world under 3×3.
+/// The seed only matters for `noise` and `cave`.
+pub fn by_name_seeded(name: &str, width: usize, height: usize, seed: u64) -> Option<Sim> {
     if width < 3 || height < 3 {
         return None;
     }
@@ -27,8 +34,9 @@ pub fn by_name(name: &str, width: usize, height: usize) -> Option<Sim> {
         "settled" => Some(settled(width, height)),
         "pressure-burst" => Some(pressure_burst(width, height)),
         "hot-rock" => Some(hot_rock(width, height)),
-        "noise" => Some(noise(width, height, 1)),
+        "noise" => Some(noise(width, height, seed)),
         "pool" => Some(pool(width, height)),
+        "cave" => Some(crate::worldgen::cave(width, height, seed)),
         _ => None,
     }
 }
@@ -155,6 +163,11 @@ pub fn noise(width: usize, height: usize, seed: u64) -> Sim {
         }
     }
     sim
+}
+
+/// A seeded cave world; see [`crate::worldgen::cave`].
+pub fn cave(width: usize, height: usize) -> Sim {
+    crate::worldgen::cave(width, height, 1)
 }
 
 /// Oxygen at 1 kg everywhere with a block of water (one eighth of the world, 1,000 kg

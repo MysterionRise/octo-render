@@ -1,7 +1,7 @@
 //! Kernel invariants the design document promises: exact mass conservation, bounded
 //! energy drift, bit-identical runs, parallel equals sequential, and chunk skipping.
 
-use colony_sim::{builtin, scenario, Mass, Sim, Temp};
+use colony_sim::{builtin, save, scenario, Command, ElementTable, Mass, Sim, Temp};
 
 fn run(sim: &mut Sim, ticks: usize) -> Vec<u64> {
     (0..ticks)
@@ -236,4 +236,58 @@ fn water_falls_covers_the_floor_and_loses_no_mass() {
             colony_sim::Mass(*mass).to_grams()
         );
     }
+}
+
+#[test]
+fn save_then_continue_matches_the_uninterrupted_run() {
+    let mut whole = scenario::pool(48, 40);
+    let mut first_half = scenario::pool(48, 40);
+    for _ in 0..40 {
+        whole.step();
+        first_half.step();
+    }
+    let bytes = save::encode(&first_half);
+    let mut resumed = save::decode(ElementTable::builtin(), &bytes).unwrap();
+    assert_eq!(resumed.state_hash(), whole.state_hash());
+    for _ in 0..60 {
+        whole.step();
+        resumed.step();
+        assert_eq!(resumed.state_hash(), whole.state_hash());
+    }
+}
+
+#[test]
+fn a_logged_run_replays_to_the_same_hashes() {
+    let mut live = scenario::cave(96, 64);
+    let mut hashes = Vec::new();
+    for tick in 0..120u64 {
+        if tick % 25 == 3 {
+            live.queue(Command::FillRect {
+                x0: 10,
+                y0: 40,
+                x1: 14,
+                y1: 44,
+                element: builtin::WATER,
+                mass: Mass::from_kg(800),
+                temp: Temp::from_kelvin(285),
+            });
+            live.queue(Command::SetCell {
+                x: 30,
+                y: 30,
+                element: builtin::CARBON_DIOXIDE,
+                mass: Mass::from_kg(3),
+                temp: Temp::from_kelvin(320),
+            });
+        }
+        live.step();
+        hashes.push(live.state_hash());
+    }
+    let log = live.log().to_vec();
+    assert_eq!(log.len(), 10);
+    let bytes = colony_sim::command::encode_log(&log);
+    let decoded = colony_sim::command::decode_log(&bytes).unwrap();
+    let mut replayed = scenario::cave(96, 64);
+    replayed.replay(&decoded, 120);
+    assert_eq!(replayed.state_hash(), *hashes.last().unwrap());
+    assert_eq!(replayed.log(), log.as_slice());
 }

@@ -8,6 +8,7 @@
 //! 3×3 neighbourhood had no relevant activity last tick is copied instead of computed.
 
 use crate::chunk::{ChunkGrid, CHUNK};
+use crate::command::{Command, LogEntry};
 use crate::element::{ElementId, ElementTable};
 use crate::fixed::{Mass, Temp};
 use crate::hash::Fnv1a;
@@ -58,13 +59,21 @@ pub struct Sim {
     scratch: Vec<bool>,
     tick: u64,
     parallel: bool,
+    pending: Vec<Command>,
+    log: Vec<LogEntry>,
+    record: bool,
 }
 
 impl Sim {
     /// An all-vacuum world. Every chunk starts active so the first tick visits it.
     pub fn new(table: ElementTable, width: usize, height: usize) -> Sim {
-        let world = World::new(width, height);
-        let chunks = ChunkGrid::new(width, height);
+        Sim::from_parts(table, World::new(width, height), 0)
+    }
+
+    /// Wraps existing cell state (a loaded snapshot) at a given tick. Every chunk
+    /// starts active, which gives the same results as the activity the snapshot had.
+    pub fn from_parts(table: ElementTable, world: World, tick: u64) -> Sim {
+        let chunks = ChunkGrid::new(world.width, world.height);
         let n = chunks.len();
         Sim {
             back: CellBuffers::new(world.cells.len()),
@@ -79,8 +88,61 @@ impl Sim {
             tick_activity_mass: vec![false; n],
             tick_activity_heat: vec![false; n],
             scratch: vec![false; n],
-            tick: 0,
+            tick,
             parallel: cfg!(feature = "parallel"),
+            pending: Vec::new(),
+            log: Vec::new(),
+            record: true,
+        }
+    }
+
+    /// Queues a command for the start of the next tick. Commands apply in the order
+    /// they were queued and are logged with that tick.
+    pub fn queue(&mut self, command: Command) {
+        self.pending.push(command);
+    }
+
+    /// Every command applied so far, with its tick.
+    pub fn log(&self) -> &[LogEntry] {
+        &self.log
+    }
+
+    /// Whether applied commands are kept in the log (on by default).
+    pub fn set_recording(&mut self, record: bool) {
+        self.record = record;
+    }
+
+    /// Replays a log: queues each entry at its tick while stepping to `until_tick`.
+    /// Entries before the current tick are applied immediately.
+    pub fn replay(&mut self, log: &[LogEntry], until_tick: u64) {
+        let mut next = 0;
+        while self.tick < until_tick {
+            while next < log.len() && log[next].tick <= self.tick {
+                self.queue(log[next].command);
+                next += 1;
+            }
+            self.step();
+        }
+    }
+
+    fn apply(&mut self, command: Command) {
+        match command {
+            Command::SetCell {
+                x,
+                y,
+                element,
+                mass,
+                temp,
+            } => self.set_cell(x, y, element, mass, temp),
+            Command::FillRect {
+                x0,
+                y0,
+                x1,
+                y1,
+                element,
+                mass,
+                temp,
+            } => self.fill_rect(x0, y0, x1, y1, element, mass, temp),
         }
     }
 
@@ -148,6 +210,16 @@ impl Sim {
     /// First phase of a tick: decides which chunks each pass visits. The phases are
     /// public so a runner can time them; call them in order or use [`Sim::step`].
     pub fn begin_tick(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        for command in pending {
+            self.apply(command);
+            if self.record {
+                self.log.push(LogEntry {
+                    tick: self.tick,
+                    command,
+                });
+            }
+        }
         self.chunks
             .process_from_active(&self.active_mass, &mut self.process_mass);
         for ((s, m), h) in self

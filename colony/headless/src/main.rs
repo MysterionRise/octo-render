@@ -20,19 +20,21 @@ struct Options {
     png_every: usize,
     compare: Option<(PathBuf, PathBuf)>,
     profile: bool,
+    seed: u64,
 }
 
 const USAGE: &str = "usage: colony-headless [--scenario NAME] [--width N] [--height N] [--ticks N]
-                       [--threads N] [--hash-out FILE] [--png-dir DIR] [--png-every N] [--profile]
+                       [--threads N] [--hash-out FILE] [--png-dir DIR] [--png-every N] [--profile] [--seed N]
        colony-headless --compare A.hashes B.hashes
 
-  --scenario   one of gas-mixing, settled, pressure-burst, hot-rock (default gas-mixing)
+  --scenario   gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave (default gas-mixing)
   --width/--height   world size in cells (default 512 x 512)
   --ticks      ticks to run (default 300)
   --threads    0 = all cores, 1 = sequential (default 1)
   --hash-out   write one 'tick hash' line per tick
   --png-dir    write element and temperature PNGs every --png-every ticks (default 100)
   --profile    also report the time spent in each pass (sort, flux, heat)
+  --seed       world seed for the noise and cave scenarios (default 1)
   --compare    print the first tick where two hash logs differ";
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -47,6 +49,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         png_every: 100,
         compare: None,
         profile: false,
+        seed: 1,
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> Result<String, String> {
@@ -72,6 +75,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 o.compare = Some((PathBuf::from(a), PathBuf::from(b)));
             }
             "--profile" => o.profile = true,
+            "--seed" => o.seed = parse_num(&value(&mut i, flag)?, flag)? as u64,
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown flag {other}\n{USAGE}")),
         }
@@ -134,7 +138,9 @@ fn compare(a: &PathBuf, b: &PathBuf) -> ExitCode {
 }
 
 fn run(opts: &Options) -> ExitCode {
-    let Some(mut sim) = scenario::by_name(&opts.scenario, opts.width, opts.height) else {
+    let Some(mut sim) =
+        scenario::by_name_seeded(&opts.scenario, opts.width, opts.height, opts.seed)
+    else {
         eprintln!(
             "unknown scenario {:?} or world under 3x3; known: {}",
             opts.scenario,
