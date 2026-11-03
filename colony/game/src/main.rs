@@ -48,7 +48,7 @@ const USAGE: &str =
        colony-game --screenshot FILE.png [--ticks N] [other flags]
        colony-game --benchmark FRAMES [--ticks N] [other flags]
 
-  --scenario    gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave (default cave)
+  --scenario    gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave, crew (default cave)
   --width/--height   world size in cells (default 256 x 192)
   --seed        world seed for the noise and cave scenarios (default 1)
   --ticks       steps to run before a screenshot or benchmark (default 0)
@@ -59,7 +59,8 @@ const USAGE: &str =
   --benchmark   render FRAMES frames offscreen at 1920x1080 and report ms per frame
 
 Window controls: WASD or arrows pan, + and - or the wheel zoom, space pauses, 1/2/3 set
-the speed, left click digs (oxygen), right click pours water, Esc quits.";
+the speed, Q/E/C/N/P/O pick the dig, build, cancel, spawn, pour, or oxygen tool, left
+click applies it, right click pours water, Esc quits. Hover a colonist for its state.";
 
 fn parse_num<T: std::str::FromStr>(s: &str, flag: &str) -> Result<T, String> {
     s.parse()

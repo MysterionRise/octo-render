@@ -1,4 +1,5 @@
-//! The wgpu side: one pipeline, four integer textures, one uniform buffer, one draw.
+//! The wgpu side: the cell pass (one pipeline, four integer textures, one uniform
+//! buffer, one draw) and, over it, the sprite pass.
 
 use bytemuck::{Pod, Zeroable};
 use colony_sim::ElementTable;
@@ -8,6 +9,7 @@ use crate::atlas::Atlas;
 use crate::corners::CornerGrid;
 use crate::palette::{solid_ranks, Luts};
 use crate::snapshot::Snapshot;
+use crate::sprites::{SpriteInstance, SpriteRenderer};
 use crate::{Overlay, PixelCamera, CHUNK, TILE_PX};
 
 pub const SHADER: &str = include_str!("../shaders/cells.wgsl");
@@ -115,6 +117,7 @@ pub struct CellRenderer {
     corner_grid: CornerGrid,
     solid_ranks: Vec<u8>,
     uploaded_generation: Option<u64>,
+    sprites: SpriteRenderer,
 }
 
 impl CellRenderer {
@@ -259,6 +262,7 @@ impl CellRenderer {
             multiview: None,
             cache: None,
         });
+        let sprites = SpriteRenderer::new(device, target_format, &uniforms.buffer);
         CellRenderer {
             pipeline,
             bind_group,
@@ -269,6 +273,7 @@ impl CellRenderer {
             corner_grid: CornerGrid::new(w, h),
             solid_ranks: solid_ranks(table),
             uploaded_generation: None,
+            sprites,
         }
     }
 
@@ -340,10 +345,27 @@ impl CellRenderer {
         );
     }
 
+    /// Replaces the sprites drawn over the cells (see `sprites::sprite_instances`).
+    pub fn set_sprites(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        instances: &[SpriteInstance],
+    ) {
+        self.sprites
+            .set_instances(device, queue, &self.uniforms.buffer, instances);
+    }
+
+    pub fn sprite_count(&self) -> usize {
+        self.sprites.count()
+    }
+
+    /// Draws the cells, then the sprites.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
+        self.sprites.draw(pass);
     }
 
     pub fn corner_grid(&self) -> &CornerGrid {

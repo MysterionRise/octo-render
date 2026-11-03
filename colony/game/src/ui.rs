@@ -1,7 +1,12 @@
-//! The egui inspector: timings, sim controls, overlays, the cell probe, save and load.
+//! The egui inspector: timings, sim controls, overlays, the tool selector, colonists and
+//! jobs, the cell and colonist probe, save and load.
 
-use colony_render::{CellProbe, Overlay, PixelCamera, Snapshot};
+use colony_render::snapshot::state_label;
+use colony_render::{CellProbe, ColonistPose, Overlay, PixelCamera, Snapshot};
+use colony_sim::agent::NO_JOB;
 use colony_sim::{scenario, ElementTable};
+
+use crate::input::Tool;
 
 pub struct UiState {
     pub paused: bool,
@@ -9,6 +14,7 @@ pub struct UiState {
     pub scenario: String,
     pub seed: u64,
     pub overlay: Overlay,
+    pub tool: Tool,
     pub status: String,
     pub fps: f32,
     pub frame_ms: f32,
@@ -23,8 +29,8 @@ pub enum UiAction {
     Load,
 }
 
-/// The probe under the cursor: cell coordinates and its values.
-pub type Probe = Option<((usize, usize), CellProbe)>;
+/// The probe under the cursor: cell coordinates, its values, and the colonist there.
+pub type Probe = Option<((usize, usize), CellProbe, Option<ColonistPose>)>;
 
 pub fn draw(
     ctx: &egui::Context,
@@ -75,6 +81,23 @@ pub fn draw(
         });
         ui.separator();
 
+        ui.heading("Tool");
+        ui.horizontal_wrapped(|ui| {
+            for tool in Tool::ALL {
+                ui.selectable_value(&mut state.tool, tool, tool.label());
+            }
+        });
+        ui.separator();
+
+        ui.heading("Colonists");
+        if let Some(s) = snapshot {
+            let j = s.stats.jobs;
+            ui.label(format!("{} colonists, {} items", s.stats.colonists, s.items.len()));
+            ui.label(format!("jobs: {} open, {} reserved, {} done, {} cancelled", j.open, j.reserved, j.done, j.cancelled));
+            ui.label(format!("{} path solves this tick", s.stats.path_solves));
+        }
+        ui.separator();
+
         ui.heading("World");
         egui::ComboBox::from_id_salt("scenario").selected_text(state.scenario.clone()).show_ui(ui, |ui| {
             for name in scenario::NAMES {
@@ -103,20 +126,28 @@ pub fn draw(
 
         ui.heading("Probe");
         match probe {
-            Some(((x, y), p)) => {
+            Some(((x, y), p, colonist)) => {
                 ui.label(format!("cell ({x}, {y}), chunk ({}, {})", p.chunk.0, p.chunk.1));
                 ui.label(table.get(p.element).name.as_str());
                 ui.label(format!("{} g", p.mass.to_grams()));
                 let mk = p.temp.to_millikelvin();
                 ui.label(format!("{}.{:03} K", mk.div_euclid(1000), mk.rem_euclid(1000)));
                 ui.label(format!("flags {:#04b}", p.flags));
+                if let Some(c) = colonist {
+                    let job = if c.job == NO_JOB { "no job".to_string() } else { format!("job {}", c.job) };
+                    let carrying = match c.carrying {
+                        Some(e) => format!(", carrying {}", table.get(table.id(e as usize)).name),
+                        None => String::new(),
+                    };
+                    ui.label(format!("colonist {}: {}, {job}{carrying}", c.id, state_label(c.state)));
+                }
             }
             None => {
                 ui.label("hover a cell");
             }
         }
         ui.separator();
-        ui.small("WASD/arrows pan, +/- or wheel zoom, space pause, 1/2/3 speed,\nleft click digs, right click pours water, Esc quits");
+        ui.small("WASD/arrows pan, +/- or wheel zoom, space pause, 1/2/3 speed,\nQ/E/C/N/P/O pick a tool, left click applies it, right click pours water, Esc quits");
     });
     actions
 }

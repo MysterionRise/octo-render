@@ -5,7 +5,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use colony_render::headless::{render_to_image, request_device_headless, OFFSCREEN_FORMAT};
-use colony_render::{CellRenderer, PixelCamera, Snapshot, TILE_PX};
+use colony_render::palette::Luts;
+use colony_render::{sprite_instances, CellRenderer, PixelCamera, Snapshot, TILE_PX};
 use colony_sim::{scenario, TickStats};
 
 use crate::Options;
@@ -36,6 +37,12 @@ pub fn run(opts: &Options) -> ExitCode {
     let world = (opts.width as u32, opts.height as u32);
     let mut renderer = CellRenderer::new(&device, &queue, OFFSCREEN_FORMAT, sim.table(), world);
     renderer.upload(&queue, &snapshot);
+    let luts = Luts::from_table(sim.table());
+    renderer.set_sprites(
+        &device,
+        &queue,
+        &sprite_instances(&snapshot, &luts, TILE_PX, 0),
+    );
     let camera = PixelCamera::new(world, TILE_PX, FRAME_SIZE, opts.zoom);
     renderer.set_view(&queue, &camera, opts.overlay);
 

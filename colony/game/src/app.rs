@@ -4,10 +4,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
+use colony_render::host::STEP_PERIOD;
+use colony_render::palette::Luts;
 use colony_render::{
-    CellRenderer, HostEvent, HostRequest, PixelCamera, SimHost, Snapshot, TILE_PX,
+    sprite_instances, CellRenderer, HostEvent, HostRequest, PixelCamera, SimHost, Snapshot, TILE_PX,
 };
-use colony_sim::{builtin, scenario, Command, Mass, Temp};
+use colony_sim::scenario;
 use octo_gpu::{GpuContext, GpuContextOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -16,7 +18,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::input::{self, Action, Held};
+use crate::input::{self, command_for, drags, Action, Held, Tool};
 use crate::ui::{self, UiAction, UiState};
 use crate::Options;
 
@@ -44,6 +46,7 @@ pub fn run(opts: Options) -> ExitCode {
 struct Gfx {
     gpu: GpuContext,
     renderer: CellRenderer,
+    luts: Luts,
     camera: PixelCamera,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -56,6 +59,8 @@ struct App {
     gfx: Option<Gfx>,
     host: Option<SimHost>,
     latest: Option<Arc<Snapshot>>,
+    /// When `latest` arrived, for interpolating sprites between ticks.
+    latest_at: Instant,
     uploaded: Option<Arc<Snapshot>>,
     ui: UiState,
     held: Held,
@@ -74,6 +79,7 @@ impl App {
             scenario: opts.scenario.clone(),
             seed: opts.seed,
             overlay: opts.overlay,
+            tool: Tool::default(),
             status: String::new(),
             fps: 0.0,
             frame_ms: 0.0,
@@ -84,6 +90,7 @@ impl App {
             gfx: None,
             host: None,
             latest: None,
+            latest_at: Instant::now(),
             uploaded: None,
             ui,
             held: Held::default(),
@@ -99,32 +106,38 @@ impl App {
         (self.opts.width as u32, self.opts.height as u32)
     }
 
-    /// Dig (oxygen) or pour (water) at the cursor.
-    fn paint(&mut self, button: MouseButton) {
+    /// Applies the current tool (left button) or pours water (right button) at the cursor.
+    fn apply_tool(&mut self, button: MouseButton) {
         let (Some(gfx), Some(host), Some(cursor)) = (&self.gfx, &self.host, self.cursor) else {
             return;
         };
         let Some((x, y)) = gfx.camera.screen_to_cell(cursor) else {
             return;
         };
-        let command = match button {
-            MouseButton::Left => Command::SetCell {
-                x,
-                y,
-                element: builtin::OXYGEN,
-                mass: Mass::from_kg(1),
-                temp: Temp::from_kelvin(300),
-            },
-            MouseButton::Right => Command::SetCell {
-                x,
-                y,
-                element: builtin::WATER,
-                mass: Mass::from_kg(1000),
-                temp: Temp::from_kelvin(290),
-            },
+        let tool = match button {
+            MouseButton::Left => self.ui.tool,
+            MouseButton::Right => Tool::Pour,
             _ => return,
         };
-        host.send(HostRequest::Command(command));
+        host.send(HostRequest::Command(command_for(tool, x, y)));
+    }
+
+    /// How far into the current step period the sim thread is, in 1/256ths, for
+    /// interpolating colonists between the snapshot's cells.
+    fn step_alpha_x256(&self) -> u32 {
+        let Some(s) = &self.latest else {
+            return 0;
+        };
+        if self.ui.paused {
+            return 0;
+        }
+        let period = if s.ticks_per_s_x100 > 0 {
+            100.0 / s.ticks_per_s_x100 as f32
+        } else {
+            STEP_PERIOD.as_secs_f32() / self.ui.speed.max(1) as f32
+        };
+        let elapsed = self.latest_at.elapsed().as_secs_f32();
+        ((elapsed / period.max(1e-3)).clamp(0.0, 1.0) * 256.0) as u32
     }
 
     fn apply_ui_actions(&mut self, actions: Vec<UiAction>) {
@@ -200,8 +213,10 @@ impl App {
             }
             if let Some(s) = host.take_latest() {
                 self.latest = Some(s);
+                self.latest_at = now;
             }
         }
+        let alpha = self.step_alpha_x256();
         let gfx = self.gfx.as_mut().unwrap();
         let host = self.host.as_ref().unwrap();
 
@@ -239,15 +254,15 @@ impl App {
             gfx.camera.pan(ix as i64, iy as i64);
         }
 
-        // Probe under the cursor.
+        // Probe under the cursor, and the colonist there if any.
         let probe = self
             .cursor
             .and_then(|c| gfx.camera.screen_to_cell(c))
             .and_then(|(x, y)| {
-                self.latest
-                    .as_ref()
-                    .and_then(|s| s.probe(host.table(), x as u32, y as u32))
-                    .map(|p| ((x, y), p))
+                self.latest.as_ref().and_then(|s| {
+                    s.probe(host.table(), x as u32, y as u32)
+                        .map(|p| ((x, y), p, s.colonist_at(x as u32, y as u32).copied()))
+                })
             });
 
         // egui.
@@ -268,12 +283,15 @@ impl App {
             .egui_ctx
             .tessellate(egui_output.shapes, egui_output.pixels_per_point);
 
-        // Upload what changed and set the view.
+        // Upload what changed, the sprites for this frame, and the view.
         if let Some(s) = &self.latest {
             if !self.uploaded.as_ref().is_some_and(|u| Arc::ptr_eq(u, s)) {
                 gfx.renderer.upload(&gfx.gpu.queue, s);
                 self.uploaded = Some(s.clone());
             }
+            let sprites = sprite_instances(s, &gfx.luts, TILE_PX, alpha);
+            gfx.renderer
+                .set_sprites(&gfx.gpu.device, &gfx.gpu.queue, &sprites);
         }
         gfx.renderer
             .set_view(&gfx.gpu.queue, &gfx.camera, self.ui.overlay);
@@ -399,6 +417,7 @@ impl ApplicationHandler for App {
             host.table(),
             (w, h),
         );
+        let luts = Luts::from_table(host.table());
         let size = window.inner_size();
         let camera = PixelCamera::new((w, h), TILE_PX, (size.width, size.height), self.opts.zoom);
         let egui_ctx = egui::Context::default();
@@ -415,6 +434,7 @@ impl ApplicationHandler for App {
         self.gfx = Some(Gfx {
             gpu,
             renderer,
+            luts,
             camera,
             egui_ctx,
             egui_state,
@@ -484,6 +504,7 @@ impl ApplicationHandler for App {
                                 gfx.camera.zoom_by((vw / 2, vh / 2), steps);
                             }
                         }
+                        Some(Action::Tool(tool)) => self.ui.tool = tool,
                         Some(Action::Quit) => event_loop.exit(),
                         _ => {}
                     }
@@ -492,10 +513,10 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Some((position.x.max(0.0) as u32, position.y.max(0.0) as u32));
                 if !over_ui {
-                    if self.left_down {
-                        self.paint(MouseButton::Left);
+                    if self.left_down && drags(self.ui.tool) {
+                        self.apply_tool(MouseButton::Left);
                     } else if self.right_down {
-                        self.paint(MouseButton::Right);
+                        self.apply_tool(MouseButton::Right);
                     }
                 }
             }
@@ -508,7 +529,7 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
                 if down && !consumed && !over_ui {
-                    self.paint(button);
+                    self.apply_tool(button);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {

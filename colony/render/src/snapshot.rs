@@ -28,10 +28,56 @@ pub struct Snapshot {
     /// Per chunk in [`ChunkGrid`] order: the chunk may differ from the last snapshot.
     pub dirty: Vec<bool>,
     pub stats: TickStats,
+    /// Every colonist, in arena index order.
+    pub colonists: Vec<ColonistPose>,
+    /// Every debris item, in arena index order (carried ones included, flagged `held`).
+    pub items: Vec<ItemPose>,
     /// Time the last step took on the sim thread.
     pub step_micros: u32,
     /// Steps per second times 100, smoothed on the sim thread.
     pub ticks_per_s_x100: u32,
+}
+
+/// Where a colonist is and what it is doing, enough to draw and interpolate it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColonistPose {
+    pub id: u32,
+    /// The cell the current move started from.
+    pub from: (u32, u32),
+    /// The cell the colonist is in (or arriving at).
+    pub to: (u32, u32),
+    /// Ticks into the move, `MOVE_TICKS` once arrived.
+    pub progress: u8,
+    /// `AgentState::tag()`: 0 idle, 1 walking, 2 fetching, 3 working, 4 stuck.
+    pub state: u8,
+    /// Job id, or `NO_JOB`.
+    pub job: u32,
+    /// Element table index of the carried item, if any.
+    pub carrying: Option<u8>,
+}
+
+/// A debris item's cell and element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItemPose {
+    pub id: u32,
+    pub x: u32,
+    pub y: u32,
+    /// Element table index.
+    pub element: u8,
+    /// In a colonist's hands rather than on the ground.
+    pub held: bool,
+}
+
+/// The name of an `AgentState::tag()`.
+pub fn state_label(tag: u8) -> &'static str {
+    match tag {
+        0 => "idle",
+        1 => "walking",
+        2 => "fetching",
+        3 => "working",
+        4 => "stuck",
+        _ => "?",
+    }
 }
 
 /// Exact values of one cell, read from a snapshot.
@@ -116,6 +162,32 @@ impl Snapshot {
                 )
             })
             .collect();
+        let items_arena = sim.items();
+        let colonists = sim
+            .colonists()
+            .iter()
+            .map(|(id, c)| ColonistPose {
+                id: id.index,
+                from: c.from,
+                to: c.cell,
+                progress: c.progress,
+                state: c.state.tag(),
+                job: c.job,
+                carrying: items_arena
+                    .get(c.carrying)
+                    .map(|item| item.element.index() as u8),
+            })
+            .collect();
+        let items = items_arena
+            .iter()
+            .map(|(id, item)| ItemPose {
+                id: id.index,
+                x: item.x,
+                y: item.y,
+                element: item.element.index() as u8,
+                held: !item.on_ground(),
+            })
+            .collect();
         Snapshot {
             generation,
             width: world.width as u32,
@@ -128,9 +200,18 @@ impl Snapshot {
             chunk_rows: chunks.rows as u32,
             dirty: dirty.to_vec(),
             stats,
+            colonists,
+            items,
             step_micros,
             ticks_per_s_x100,
         }
+    }
+
+    /// The first colonist standing in (or walking into) a cell.
+    pub fn colonist_at(&self, x: u32, y: u32) -> Option<&ColonistPose> {
+        self.colonists.iter().find(|c| {
+            c.to == (x, y) || (c.progress < colony_sim::agent::MOVE_TICKS && c.from == (x, y))
+        })
     }
 
     #[inline]
@@ -252,6 +333,73 @@ mod tests {
         assert_eq!(snap.dirty, dirty);
         assert_eq!((snap.chunk_cols, snap.chunk_rows), (2, 2));
         assert_eq!(snap.tick, 1);
+    }
+
+    #[test]
+    fn poses_mirror_the_arenas_and_flag_carried_items() {
+        use colony_sim::agent::DEFAULT_PRIORITY;
+        use colony_sim::JobKind;
+        let mut sim = scenario::hall(48, 16, 1, 2, 0);
+        let party: Vec<(u32, u32)> = sim.colonists().iter().map(|(_, c)| c.cell).collect();
+        let (cx, cy) = party[0];
+        // Dig the two lowest cells of the first pillar to the right of the party.
+        let pillar = (cx + 1..48)
+            .find(|&x| sim.nav().is_solid(x, cy))
+            .expect("a pillar");
+        sim.order(JobKind::Dig { x: pillar, y: cy }, DEFAULT_PRIORITY);
+        sim.order(
+            JobKind::Dig {
+                x: pillar,
+                y: cy + 1,
+            },
+            DEFAULT_PRIORITY,
+        );
+        let mut stats = sim.step();
+        let mut ticks = 1;
+        while sim.items().is_empty() && ticks < 400 {
+            stats = sim.step();
+            ticks += 1;
+        }
+        assert!(!sim.items().is_empty(), "a dig produced an item");
+        // A build site over a free floor cell, reachable from the cell below it.
+        let site = (cx + 1..47)
+            .find(|&x| {
+                let nav = sim.nav();
+                nav.is_standing(x, cy) && !nav.is_solid(x, cy + 1) && x != pillar
+            })
+            .expect("a site");
+        sim.order(JobKind::Build { x: site, y: cy + 1 }, DEFAULT_PRIORITY);
+        while !sim.items().iter().any(|(_, i)| !i.on_ground()) && ticks < 800 {
+            stats = sim.step();
+            ticks += 1;
+        }
+        let snap = Snapshot::from_sim(&sim, sim.processed_chunks(), 0, stats, 0, 0);
+        assert_eq!(snap.colonists.len(), 2);
+        for (pose, (id, c)) in snap.colonists.iter().zip(sim.colonists().iter()) {
+            assert_eq!(pose.id, id.index);
+            assert_eq!(
+                (pose.from, pose.to, pose.progress),
+                (c.from, c.cell, c.progress)
+            );
+            assert_eq!(pose.state, c.state.tag());
+            assert_eq!(pose.job, c.job);
+            assert_eq!(pose.carrying.is_some(), sim.items().contains(c.carrying));
+        }
+        assert_eq!(snap.items.len(), sim.items().len());
+        assert!(snap.items.iter().any(|i| i.held), "one item is carried");
+        let carrier = snap
+            .colonists
+            .iter()
+            .find(|c| c.carrying.is_some())
+            .unwrap();
+        assert_eq!(
+            carrier.carrying,
+            Some(colony_sim::builtin::SANDSTONE.index() as u8)
+        );
+        let (x, y) = carrier.to;
+        assert_eq!(snap.colonist_at(x, y).map(|c| c.id), Some(carrier.id));
+        assert_eq!(state_label(carrier.state), "walking");
+        assert!(snap.colonist_at(47, 15).is_none());
     }
 
     #[test]
