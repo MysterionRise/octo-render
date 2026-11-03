@@ -291,3 +291,35 @@ fn a_logged_run_replays_to_the_same_hashes() {
     assert_eq!(replayed.state_hash(), *hashes.last().unwrap());
     assert_eq!(replayed.log(), log.as_slice());
 }
+
+#[test]
+fn processed_chunks_name_exactly_the_chunks_that_can_change() {
+    let mut sim = scenario::settled(128, 128);
+    assert!(
+        sim.processed_chunks().iter().all(|p| *p),
+        "everything is dirty before the first tick"
+    );
+    sim.step();
+    sim.step();
+    assert!(
+        sim.processed_chunks().iter().all(|p| !p),
+        "a settled world changes nothing"
+    );
+    sim.set_cell(
+        40,
+        40,
+        builtin::OXYGEN,
+        Mass::from_kg(3),
+        Temp::from_kelvin(300),
+    );
+    sim.step();
+    let chunks = sim.chunks();
+    let processed = sim.processed_chunks();
+    assert!(processed[chunks.index(1, 1)]);
+    assert!(
+        processed[chunks.index(0, 0)] && processed[chunks.index(2, 2)],
+        "the 3×3 ring is visited"
+    );
+    assert!(!processed[chunks.index(3, 3)]);
+    assert_eq!(processed.iter().filter(|p| **p).count(), 9);
+}

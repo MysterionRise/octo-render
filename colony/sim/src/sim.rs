@@ -82,8 +82,8 @@ impl Sim {
             chunks,
             active_mass: vec![true; n],
             active_heat: vec![true; n],
-            process_mass: vec![false; n],
-            process_heat: vec![false; n],
+            process_mass: vec![true; n],
+            process_heat: vec![true; n],
             pass_activity: vec![0; n],
             tick_activity_mass: vec![false; n],
             tick_activity_heat: vec![false; n],
@@ -300,6 +300,14 @@ impl Sim {
             }
         }
         std::mem::swap(&mut world.cells, back);
+    }
+
+    /// Chunks visited by at least one pass during the last tick, in [`ChunkGrid`] order.
+    /// A chunk outside this set is bit-identical to the previous tick (skipped chunks
+    /// are copied), which is what a renderer needs to upload only what changed. Valid
+    /// after [`Sim::step`]; before the first tick it names every chunk.
+    pub fn processed_chunks(&self) -> &[bool] {
+        &self.process_heat
     }
 
     /// Sum of all cell masses in raw units. Exactly constant across ticks.
