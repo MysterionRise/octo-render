@@ -10,10 +10,32 @@ pub struct GpuContext {
     pub surface_format: TextureFormat,
 }
 
+/// How a [`GpuContext`] picks its backend and surface format.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuContextOptions {
+    pub backends: wgpu::Backends,
+    /// Prefer an sRGB surface format (the viewer's HDR pipeline wants one); a pixel-art
+    /// renderer that writes exact palette values prefers a linear format instead.
+    pub prefer_srgb: bool,
+}
+
+impl Default for GpuContextOptions {
+    fn default() -> Self {
+        GpuContextOptions {
+            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN,
+            prefer_srgb: true,
+        }
+    }
+}
+
 impl GpuContext {
     pub async fn new(window: Arc<Window>) -> Self {
+        Self::new_with(window, GpuContextOptions::default()).await
+    }
+
+    pub async fn new_with(window: Arc<Window>, options: GpuContextOptions) -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN,
+            backends: options.backends,
             ..Default::default()
         });
 
@@ -46,7 +68,7 @@ impl GpuContext {
         let surface_format = surface_caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|f| f.is_srgb() == options.prefer_srgb)
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
