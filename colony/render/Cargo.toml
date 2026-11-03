@@ -1,0 +1,18 @@
+[package]
+name = "colony-render"
+version = "0.1.0"
+edition = "2021"
+description = "Pixel-art renderer for the colony-sim kernel: snapshots, pixel camera, dual-grid autotiling, a wgpu cell pass, and the sim thread host"
+
+[dependencies]
+colony-sim = { path = "../sim" }
+octo-gpu = { path = "../../crates/gpu" }
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+pollster = "0.4"
+
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in"] }
+colony-headless = { path = "../headless" }

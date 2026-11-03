@@ -1,0 +1,23 @@
+[package]
+name = "colony-game"
+version = "0.1.0"
+edition = "2021"
+description = "Windowed colony-sim viewer: winit, wgpu, egui inspector, offscreen screenshot and benchmark"
+
+[[bin]]
+name = "colony-game"
+path = "src/main.rs"
+
+[dependencies]
+colony-sim = { path = "../sim" }
+colony-render = { path = "../render" }
+octo-gpu = { path = "../../crates/gpu" }
+wgpu = "24"
+winit = "0.30"
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+pollster = "0.4"
+env_logger = "0.11"
+log = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -9,6 +9,8 @@ members = [
     "crates/app",
     "colony/sim",
     "colony/headless",
+    "colony/render",
+    "colony/game",
 ]
 
 [package]
