@@ -250,7 +250,7 @@ fn vacuum_winner<'a>(st: &'a Stencil, table: &ElementTable) -> Option<(&'a Cell,
 
 /// Temperature of a cell after `m_in` of mass at a mass-weighted energy `e_in`
 /// (sum of mass × temperature) joins `m0` of mass at `t0`. Rounds to nearest.
-fn mix_temp(m0: u64, t0: i32, m_in: u64, e_in: i128) -> i32 {
+pub(crate) fn mix_temp(m0: u64, t0: i32, m_in: u64, e_in: i128) -> i32 {
     let total = (m0 + m_in) as i128;
     debug_assert!(total > 0);
     let num = m0 as i128 * t0 as i128 + e_in;

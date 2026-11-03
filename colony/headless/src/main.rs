@@ -27,7 +27,7 @@ const USAGE: &str = "usage: colony-headless [--scenario NAME] [--width N] [--hei
                        [--threads N] [--hash-out FILE] [--png-dir DIR] [--png-every N] [--profile] [--seed N]
        colony-headless --compare A.hashes B.hashes
 
-  --scenario   gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave (default gas-mixing)
+  --scenario   gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave, crew (default gas-mixing)
   --width/--height   world size in cells (default 512 x 512)
   --ticks      ticks to run (default 300)
   --threads    0 = all cores, 1 = sequential (default 1)
@@ -164,9 +164,10 @@ fn run(opts: &Options) -> ExitCode {
     }
     let mut hashes = String::new();
     let mut times = Vec::with_capacity(opts.ticks);
-    let mut pass_times = [std::time::Duration::ZERO; 3];
+    let mut pass_times = [std::time::Duration::ZERO; 4];
     let mut processed_total = 0usize;
     let mut processed_mass_total = 0usize;
+    let mut path_solves_total = 0usize;
     let start_mass = sim.total_mass();
     let start_energy = sim.total_energy();
     let chunks = sim.chunks().len();
@@ -197,6 +198,9 @@ fn run(opts: &Options) -> ExitCode {
                 mark = Instant::now();
                 sim.pass_heat();
                 pass_times[2] += mark.elapsed();
+                mark = Instant::now();
+                sim.pass_agents();
+                pass_times[3] += mark.elapsed();
                 sim.end_tick()
             };
             match &pool {
@@ -212,6 +216,7 @@ fn run(opts: &Options) -> ExitCode {
         times.push(t0.elapsed());
         processed_total += stats.chunks_processed;
         processed_mass_total += stats.chunks_processed_mass;
+        path_solves_total += stats.path_solves as usize;
         if opts.hash_out.is_some() {
             hashes.push_str(&format!("{} {:016x}\n", stats.tick, sim.state_hash()));
         }
@@ -253,10 +258,19 @@ fn run(opts: &Options) -> ExitCode {
     if opts.profile {
         let per = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / n as f64;
         println!(
-            "passes: sort {:.3} ms, flux {:.3} ms, heat {:.3} ms per tick",
+            "passes: sort {:.3} ms, flux {:.3} ms, heat {:.3} ms, agents {:.3} ms per tick",
             per(pass_times[0]),
             per(pass_times[1]),
-            per(pass_times[2])
+            per(pass_times[2]),
+            per(pass_times[3])
+        );
+    }
+    if !sim.colonists().is_empty() {
+        println!(
+            "agents: {} colonists, {:.2} path solves per tick, jobs {:?}",
+            sim.colonists().len(),
+            path_solves_total as f64 / n as f64,
+            sim.jobs().counts()
         );
     }
     let pct = |count: usize| 100.0 * count as f64 / (chunks * n) as f64;

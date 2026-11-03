@@ -34,7 +34,7 @@ fn golden_gas_mixing_64_after_120_ticks() {
     for _ in 0..120 {
         sim.step();
     }
-    check("gas-mixing-64-120.hash", sim.state_hash());
+    check("gas-mixing-64-120.hash", sim.cell_hash());
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn golden_pressure_burst_48_after_200_ticks() {
     for _ in 0..200 {
         sim.step();
     }
-    check("pressure-burst-48-200.hash", sim.state_hash());
+    check("pressure-burst-48-200.hash", sim.cell_hash());
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn golden_pool_64_after_300_ticks() {
     for _ in 0..300 {
         sim.step();
     }
-    check("pool-64-300.hash", sim.state_hash());
+    check("pool-64-300.hash", sim.cell_hash());
 }
 
 #[test]
@@ -61,5 +61,14 @@ fn golden_cave_96x64_seed_1_after_200_ticks() {
     for _ in 0..200 {
         sim.step();
     }
-    check("cave-96x64-1-200.hash", sim.state_hash());
+    check("cave-96x64-1-200.hash", sim.cell_hash());
+}
+
+#[test]
+fn golden_crew_128x96_seed_1_after_200_ticks_pins_entities_too() {
+    let mut sim = scenario::crew(128, 96, 1);
+    for _ in 0..200 {
+        sim.step();
+    }
+    check("crew-128x96-1-200.hash", sim.state_hash());
 }

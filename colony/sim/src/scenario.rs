@@ -8,7 +8,7 @@ use crate::rng::Pcg32;
 use crate::sim::Sim;
 
 /// Names accepted by [`by_name`].
-pub const NAMES: [&str; 7] = [
+pub const NAMES: [&str; 8] = [
     "gas-mixing",
     "settled",
     "pressure-burst",
@@ -16,6 +16,7 @@ pub const NAMES: [&str; 7] = [
     "noise",
     "pool",
     "cave",
+    "crew",
 ];
 
 /// Builds a scenario by name with seed 1; see [`by_name_seeded`].
@@ -36,7 +37,8 @@ pub fn by_name_seeded(name: &str, width: usize, height: usize, seed: u64) -> Opt
         "hot-rock" => Some(hot_rock(width, height)),
         "noise" => Some(noise(width, height, seed)),
         "pool" => Some(pool(width, height)),
-        "cave" => Some(crate::worldgen::cave(width, height, seed)),
+        "cave" => Some(cave_with_colonists(width, height, seed, 4)),
+        "crew" => Some(crew(width, height, seed)),
         _ => None,
     }
 }
@@ -165,9 +167,95 @@ pub fn noise(width: usize, height: usize, seed: u64) -> Sim {
     sim
 }
 
-/// A seeded cave world; see [`crate::worldgen::cave`].
+/// A seeded cave world without colonists; see [`crate::worldgen::cave`].
 pub fn cave(width: usize, height: usize) -> Sim {
     crate::worldgen::cave(width, height, 1)
+}
+
+/// A seeded cave with `n` colonists in its largest cavern, on the standing cells of
+/// that cavern nearest the world centre.
+pub fn cave_with_colonists(width: usize, height: usize, seed: u64, n: usize) -> Sim {
+    let mut sim = crate::worldgen::cave(width, height, seed);
+    sim.refresh_nav();
+    let mask = sim.nav.largest_component();
+    let (cx, cy) = (width as i64 / 2, height as i64 / 2);
+    let mut spots: Vec<(u64, u32, u32)> = Vec::new();
+    for y in 0..height as u32 {
+        for x in 0..width as u32 {
+            if mask[(y as usize) * width + x as usize] {
+                let d = (x as i64 - cx).unsigned_abs() + (y as i64 - cy).unsigned_abs();
+                spots.push((d, y, x));
+            }
+        }
+    }
+    spots.sort_unstable();
+    for &(_, y, x) in spots.iter().take(n) {
+        sim.spawn_colonist(x as usize, y as usize);
+    }
+    sim
+}
+
+/// A hall with a solid floor and ceiling, seeded pillars and climbable staircases,
+/// `colonists` colonists spread along the floor, and up to `orders` dig orders on pillar
+/// and stair cells, all reachable on foot.
+pub fn hall(width: usize, height: usize, seed: u64, colonists: usize, orders: usize) -> Sim {
+    let mut sim = Sim::new(ElementTable::builtin(), width, height);
+    let rock = Mass::from_kg(1800);
+    let temp = Temp::from_kelvin(295);
+    sim.fill_rect(0, 0, width, height, builtin::OXYGEN, Mass::from_kg(1), temp);
+    sim.fill_rect(0, 0, width, 2, builtin::SANDSTONE, rock, temp);
+    sim.fill_rect(0, height - 1, width, height, builtin::SANDSTONE, rock, temp);
+    sim.fill_rect(0, 0, 1, height, builtin::SANDSTONE, rock, temp);
+    sim.fill_rect(width - 1, 0, width, height, builtin::SANDSTONE, rock, temp);
+    let mut rng = Pcg32::new(seed, 11);
+    let mut diggable: Vec<(u32, u32)> = Vec::new();
+    // Pillars every three cells, two to six cells tall, with a four-step staircase in
+    // place of two pillars every 24 cells. Only the two lowest pillar cells are ordered
+    // dug: once the base is dug the cell above it stands on the floor, but nothing
+    // above that does, and digging stairs would cut off the cells they lead to.
+    let mut x = 3usize;
+    while x + 8 < width - 1 {
+        if x % 24 == 12 {
+            for step in 0..4usize {
+                for y in 2..(3 + step).min(height - 2) {
+                    sim.set_cell(x + step, y, builtin::SANDSTONE, rock, temp);
+                }
+            }
+            x += 6;
+            continue;
+        }
+        let tall = 2 + rng.below(5) as usize;
+        for y in 2..(2 + tall).min(height - 2) {
+            sim.set_cell(x, y, builtin::SANDSTONE, rock, temp);
+            if y <= 3 {
+                diggable.push((x as u32, y as u32));
+            }
+        }
+        x += 3;
+    }
+    sim.refresh_nav();
+    let mut spots: Vec<(u32, u32)> = (1..width as u32 - 1)
+        .filter(|&x| sim.nav().is_standing(x, 2))
+        .map(|x| (x, 2))
+        .collect();
+    let stride = (spots.len() / colonists.max(1)).max(1);
+    spots = spots.into_iter().step_by(stride).take(colonists).collect();
+    for (x, y) in spots {
+        sim.spawn_colonist(x as usize, y as usize);
+    }
+    let stride = (diggable.len() / orders.max(1)).max(1);
+    for (x, y) in diggable.into_iter().step_by(stride).take(orders) {
+        sim.order(
+            crate::job::JobKind::Dig { x, y },
+            crate::agent::DEFAULT_PRIORITY,
+        );
+    }
+    sim
+}
+
+/// The agents benchmark: a hall with 100 colonists and 400 dig orders.
+pub fn crew(width: usize, height: usize, seed: u64) -> Sim {
+    hall(width, height, seed, 100, 400)
 }
 
 /// Oxygen at 1 kg everywhere with a block of water (one eighth of the world, 1,000 kg
@@ -202,6 +290,22 @@ pub fn pool(width: usize, height: usize) -> Sim {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caves_get_colonists_and_the_crew_gets_orders() {
+        let sim = cave_with_colonists(96, 64, 3, 5);
+        assert_eq!(sim.colonists().len(), 5);
+        for (_, c) in sim.colonists().iter() {
+            assert!(sim.nav().is_standing(c.cell.0, c.cell.1));
+        }
+        let crew = crew(256, 64, 1);
+        assert_eq!(crew.colonists().len(), 100);
+        assert!(
+            crew.jobs().counts().open >= 100,
+            "orders: {:?}",
+            crew.jobs().counts()
+        );
+    }
 
     #[test]
     fn every_name_builds_and_unknown_names_do_not() {

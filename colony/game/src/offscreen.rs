@@ -28,12 +28,7 @@ pub fn run(opts: &Options) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let n = sim.chunks().len();
-    let mut stats = TickStats {
-        tick: 0,
-        chunks_processed: n,
-        chunks_skipped: 0,
-        chunks_processed_mass: n,
-    };
+    let mut stats = TickStats::fresh(n, 0);
     for _ in 0..opts.ticks {
         stats = sim.step();
     }

@@ -141,12 +141,7 @@ impl Worker {
         self.generation += 1;
         let n = self.sim.chunks().len();
         self.dirty_accum = vec![true; n];
-        self.last_stats = TickStats {
-            tick: self.sim.tick_count(),
-            chunks_processed: n,
-            chunks_skipped: 0,
-            chunks_processed_mass: n,
-        };
+        self.last_stats = TickStats::fresh(n, self.sim.tick_count());
     }
 
     fn step(&mut self) {
@@ -199,12 +194,7 @@ fn run(
 ) {
     let n = sim.chunks().len();
     let mut w = Worker {
-        last_stats: TickStats {
-            tick: sim.tick_count(),
-            chunks_processed: n,
-            chunks_skipped: 0,
-            chunks_processed_mass: n,
-        },
+        last_stats: TickStats::fresh(n, sim.tick_count()),
         sim,
         speed,
         paused,

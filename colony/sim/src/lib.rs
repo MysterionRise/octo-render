@@ -16,6 +16,7 @@
 //! identically from both ends. That makes passes parallel-safe, deterministic, and
 //! exactly conserving by construction.
 
+pub mod agent;
 pub mod chunk;
 pub mod command;
 pub mod element;
@@ -34,6 +35,7 @@ pub mod sim;
 pub mod world;
 pub mod worldgen;
 
+pub use agent::{AgentState, Colonist};
 pub use command::{Command, LogEntry};
 pub use element::{builtin, ElementDef, ElementId, ElementTable, Phase};
 pub use entity::{Arena, EntityId};

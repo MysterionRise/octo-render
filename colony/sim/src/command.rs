@@ -25,6 +25,29 @@ pub enum Command {
         mass: Mass,
         temp: Temp,
     },
+    /// Order the solid cell dug out.
+    Dig {
+        x: usize,
+        y: usize,
+    },
+    /// Order a tile built from debris at the cell.
+    Build {
+        x: usize,
+        y: usize,
+    },
+    CancelOrders {
+        x: usize,
+        y: usize,
+    },
+    SpawnColonist {
+        x: usize,
+        y: usize,
+    },
+    SetPriority {
+        x: usize,
+        y: usize,
+        priority: u8,
+    },
 }
 
 /// A command with the tick it was applied at.
@@ -36,6 +59,11 @@ pub struct LogEntry {
 
 const TAG_SET: u8 = 1;
 const TAG_FILL: u8 = 2;
+const TAG_DIG: u8 = 3;
+const TAG_BUILD: u8 = 4;
+const TAG_CANCEL: u8 = 5;
+const TAG_SPAWN: u8 = 6;
+const TAG_PRIORITY: u8 = 7;
 
 fn put_usize(out: &mut Vec<u8>, v: usize) {
     out.extend_from_slice(&(v as u64).to_le_bytes());
@@ -78,6 +106,32 @@ pub fn encode_log(log: &[LogEntry]) -> Vec<u8> {
                 out.extend_from_slice(&element.0.to_le_bytes());
                 out.extend_from_slice(&mass.0.to_le_bytes());
                 out.extend_from_slice(&temp.0.to_le_bytes());
+            }
+            Command::Dig { x, y } => {
+                out.push(TAG_DIG);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+            }
+            Command::Build { x, y } => {
+                out.push(TAG_BUILD);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+            }
+            Command::CancelOrders { x, y } => {
+                out.push(TAG_CANCEL);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+            }
+            Command::SpawnColonist { x, y } => {
+                out.push(TAG_SPAWN);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+            }
+            Command::SetPriority { x, y, priority } => {
+                out.push(TAG_PRIORITY);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+                out.push(priority);
             }
         }
     }
@@ -133,6 +187,22 @@ pub fn decode_log(bytes: &[u8]) -> Option<Vec<LogEntry>> {
                     temp,
                 }
             }
+            TAG_DIG | TAG_BUILD | TAG_CANCEL | TAG_SPAWN => {
+                let x = usize_field()?;
+                let y = usize_field()?;
+                match tag {
+                    TAG_DIG => Command::Dig { x, y },
+                    TAG_BUILD => Command::Build { x, y },
+                    TAG_CANCEL => Command::CancelOrders { x, y },
+                    _ => Command::SpawnColonist { x, y },
+                }
+            }
+            TAG_PRIORITY => {
+                let x = usize_field()?;
+                let y = usize_field()?;
+                let priority = take(1)?[0];
+                Command::SetPriority { x, y, priority }
+            }
             _ => return None,
         };
         log.push(LogEntry { tick, command });
@@ -171,6 +241,36 @@ mod tests {
                 },
             },
         ];
+        let log = [
+            log,
+            vec![
+                LogEntry {
+                    tick: 10,
+                    command: Command::Dig { x: 1, y: 2 },
+                },
+                LogEntry {
+                    tick: 11,
+                    command: Command::Build { x: 3, y: 4 },
+                },
+                LogEntry {
+                    tick: 12,
+                    command: Command::CancelOrders { x: 5, y: 6 },
+                },
+                LogEntry {
+                    tick: 13,
+                    command: Command::SpawnColonist { x: 7, y: 8 },
+                },
+                LogEntry {
+                    tick: 14,
+                    command: Command::SetPriority {
+                        x: 9,
+                        y: 10,
+                        priority: 7,
+                    },
+                },
+            ],
+        ]
+        .concat();
         let bytes = encode_log(&log);
         assert_eq!(decode_log(&bytes).unwrap(), log);
         assert_eq!(decode_log(&bytes[..bytes.len() - 1]), None);

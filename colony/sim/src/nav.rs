@@ -52,7 +52,7 @@ pub struct RegionEdge {
     pub weight: u16,
 }
 
-/// A cell path; `cells` is stored reversed so `next()` pops the next cell.
+/// A cell path; `cells` is stored reversed so `advance()` pops the next cell.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Path {
     pub cells: Vec<(u32, u32)>,
@@ -61,7 +61,7 @@ pub struct Path {
 }
 
 impl Path {
-    pub fn next(&mut self) -> Option<(u32, u32)> {
+    pub fn advance(&mut self) -> Option<(u32, u32)> {
         self.cells.pop()
     }
 
@@ -275,10 +275,7 @@ impl NavGrid {
             }
         }
         let mut edge_blocks = vec![false; self.block_count()];
-        for b in 0..self.block_count() {
-            if !dirty_blocks[b] {
-                continue;
-            }
+        for b in (0..self.block_count()).filter(|&b| dirty_blocks[b]) {
             self.rebuild_block(b as u32);
             let (bx, by) = (b as u32 % self.bcols, b as u32 / self.bcols);
             for ny in by.saturating_sub(1)..=(by + 1).min(self.brows - 1) {
@@ -287,10 +284,8 @@ impl NavGrid {
                 }
             }
         }
-        for b in 0..self.block_count() {
-            if edge_blocks[b] {
-                self.rebuild_edges(b as u32);
-            }
+        for b in (0..self.block_count()).filter(|&b| edge_blocks[b]) {
+            self.rebuild_edges(b as u32);
         }
     }
 
@@ -655,6 +650,47 @@ impl NavGrid {
         Path { cells, chunks }
     }
 
+    /// A per-cell mask of the standing cells reachable from the seed region whose
+    /// reachable set holds the most standing cells (a benchmark helper: "the biggest
+    /// cavern"). Regions already reached by an earlier seed are not re-seeded.
+    pub fn largest_component(&mut self) -> Vec<bool> {
+        let n_regions = self.block_count() * REGIONS_PER_BLOCK as usize;
+        let mut cells_per_region = vec![0u32; n_regions];
+        for r in &self.region {
+            if *r != NO_REGION {
+                cells_per_region[*r as usize] += 1;
+            }
+        }
+        let mut visited = vec![false; n_regions];
+        let mut best: Option<(u32, Vec<u32>)> = None;
+        for seed in 0..n_regions as u32 {
+            if cells_per_region[seed as usize] == 0 || visited[seed as usize] {
+                continue;
+            }
+            let stamp = self.dijkstra_regions(seed, u32::MAX);
+            let reached: Vec<u32> = (0..n_regions as u32)
+                .filter(|r| self.rmark[*r as usize] == stamp)
+                .collect();
+            let size: u32 = reached.iter().map(|r| cells_per_region[*r as usize]).sum();
+            for r in &reached {
+                visited[*r as usize] = true;
+            }
+            if best.as_ref().is_none_or(|(bs, _)| size > *bs) {
+                best = Some((size, reached));
+            }
+        }
+        let mut in_best = vec![false; n_regions];
+        if let Some((_, reached)) = best {
+            for r in reached {
+                in_best[r as usize] = true;
+            }
+        }
+        self.region
+            .iter()
+            .map(|r| *r != NO_REGION && in_best[*r as usize])
+            .collect()
+    }
+
     /// Standing cells a goal can be reached from.
     pub fn goal_cells(&self, goal: Goal) -> Vec<(u32, u32)> {
         match goal {
@@ -866,7 +902,7 @@ mod tests {
             .expect("a path up the stairs");
         let mut at = (0, 1);
         let mut p = path.clone();
-        while let Some(next) = p.next() {
+        while let Some(next) = p.advance() {
             assert!(nav.is_legal_move(at, next), "{at:?} -> {next:?}");
             at = next;
         }
@@ -912,7 +948,7 @@ mod tests {
                 reachable += 1;
                 let mut at = a;
                 let mut p = p;
-                while let Some(next) = p.next() {
+                while let Some(next) = p.advance() {
                     assert!(nav.is_legal_move(at, next), "{at:?} -> {next:?}");
                     at = next;
                 }

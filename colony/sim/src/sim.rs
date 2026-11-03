@@ -7,12 +7,17 @@
 //! that is only conducting heat costs nothing in the mass passes, and a chunk whose
 //! 3×3 neighbourhood had no relevant activity last tick is copied instead of computed.
 
+use crate::agent::{Colonist, DEFAULT_PRIORITY};
 use crate::chunk::{ChunkGrid, CHUNK};
 use crate::command::{Command, LogEntry};
 use crate::element::{ElementId, ElementTable};
+use crate::entity::Arena;
 use crate::fixed::{Mass, Temp};
 use crate::hash::Fnv1a;
 use crate::heat::capacity;
+use crate::item::Item;
+use crate::job::{JobBoard, JobCounts, JobKind};
+use crate::nav::NavGrid;
 use crate::world::{CellBuffers, CellOut, Grid, World};
 use crate::{fluid, heat};
 
@@ -30,6 +35,25 @@ pub struct TickStats {
     pub chunks_skipped: usize,
     /// Chunks visited by the sort and flux passes.
     pub chunks_processed_mass: usize,
+    /// Path solves (assignment scans and route planning) the agents pass spent.
+    pub path_solves: u32,
+    pub jobs: JobCounts,
+    pub colonists: u32,
+}
+
+impl TickStats {
+    /// Stats for a world that has not stepped yet: every chunk counts as processed.
+    pub fn fresh(chunks: usize, tick: u64) -> TickStats {
+        TickStats {
+            tick,
+            chunks_processed: chunks,
+            chunks_skipped: 0,
+            chunks_processed_mass: chunks,
+            path_solves: 0,
+            jobs: JobCounts::default(),
+            colonists: 0,
+        }
+    }
 }
 
 /// Which activity set a pass reads and feeds.
@@ -42,8 +66,8 @@ enum PassKind {
 /// A running simulation.
 #[derive(Clone, Debug)]
 pub struct Sim {
-    table: ElementTable,
-    world: World,
+    pub(crate) table: ElementTable,
+    pub(crate) world: World,
     back: CellBuffers,
     chunks: ChunkGrid,
     /// Chunks where the mass passes exchanged something during the previous tick.
@@ -51,17 +75,22 @@ pub struct Sim {
     /// Chunks where the heat pass exchanged something during the previous tick.
     active_heat: Vec<bool>,
     process_mass: Vec<bool>,
-    process_heat: Vec<bool>,
+    pub(crate) process_heat: Vec<bool>,
     /// Per chunk, bit 0: the last pass exchanged something; bit 1: an element changed phase.
     pass_activity: Vec<u8>,
     tick_activity_mass: Vec<bool>,
     tick_activity_heat: Vec<bool>,
     scratch: Vec<bool>,
-    tick: u64,
+    pub(crate) tick: u64,
     parallel: bool,
     pending: Vec<Command>,
     log: Vec<LogEntry>,
     record: bool,
+    pub(crate) colonists: Arena<Colonist>,
+    pub(crate) items: Arena<Item>,
+    pub(crate) jobs: JobBoard,
+    pub(crate) nav: NavGrid,
+    last_path_solves: u32,
 }
 
 impl Sim {
@@ -70,11 +99,34 @@ impl Sim {
         Sim::from_parts(table, World::new(width, height), 0)
     }
 
-    /// Wraps existing cell state (a loaded snapshot) at a given tick. Every chunk
-    /// starts active, which gives the same results as the activity the snapshot had.
+    /// Wraps existing cell state (a loaded snapshot) at a given tick with no entities.
     pub fn from_parts(table: ElementTable, world: World, tick: u64) -> Sim {
+        Sim::from_parts_with(
+            table,
+            world,
+            tick,
+            Arena::new(),
+            Arena::new(),
+            JobBoard::new(),
+        )
+    }
+
+    /// Wraps existing cell and entity state at a given tick. Every chunk starts active,
+    /// which gives the same results as the activity the snapshot had.
+    pub fn from_parts_with(
+        table: ElementTable,
+        world: World,
+        tick: u64,
+        colonists: Arena<Colonist>,
+        items: Arena<Item>,
+        jobs: JobBoard,
+    ) -> Sim {
         let chunks = ChunkGrid::new(world.width, world.height);
         let n = chunks.len();
+        let mut nav = NavGrid::new(world.width as u32, world.height as u32);
+        nav.refresh_all(&world.cells, &table);
+        // A tick boundary never carries walkability changes, so a loaded world must not either.
+        nav.clear_changed();
         Sim {
             back: CellBuffers::new(world.cells.len()),
             table,
@@ -93,7 +145,34 @@ impl Sim {
             pending: Vec::new(),
             log: Vec::new(),
             record: true,
+            colonists,
+            items,
+            jobs,
+            nav,
+            last_path_solves: 0,
         }
+    }
+
+    pub fn colonists(&self) -> &Arena<Colonist> {
+        &self.colonists
+    }
+
+    pub fn items(&self) -> &Arena<Item> {
+        &self.items
+    }
+
+    pub fn jobs(&self) -> &JobBoard {
+        &self.jobs
+    }
+
+    pub fn nav(&self) -> &NavGrid {
+        &self.nav
+    }
+
+    /// Recomputes walkability from the current cells (scenario builders use it before
+    /// the first tick; the agents pass keeps it fresh afterwards).
+    pub fn refresh_nav(&mut self) {
+        self.nav.refresh_all(&self.world.cells, &self.table);
     }
 
     /// Queues a command for the start of the next tick. Commands apply in the order
@@ -143,6 +222,33 @@ impl Sim {
                 mass,
                 temp,
             } => self.fill_rect(x0, y0, x1, y1, element, mass, temp),
+            Command::Dig { x, y } => {
+                self.order(
+                    JobKind::Dig {
+                        x: x as u32,
+                        y: y as u32,
+                    },
+                    DEFAULT_PRIORITY,
+                );
+            }
+            Command::Build { x, y } => {
+                self.order(
+                    JobKind::Build {
+                        x: x as u32,
+                        y: y as u32,
+                    },
+                    DEFAULT_PRIORITY,
+                );
+            }
+            Command::CancelOrders { x, y } => {
+                self.cancel_orders(x as u32, y as u32);
+            }
+            Command::SpawnColonist { x, y } => {
+                self.spawn_colonist(x, y);
+            }
+            Command::SetPriority { x, y, priority } => {
+                self.set_priority(x as u32, y as u32, priority);
+            }
         }
     }
 
@@ -171,12 +277,17 @@ impl Sim {
         self.parallel
     }
 
-    /// Writes a cell and marks its chunk active so the next tick visits it.
+    /// Writes a cell and marks its chunk active so the next tick visits it. Both the
+    /// pending and the accumulating activity sets are marked, so the mark survives
+    /// whether the write happens before the passes (a command) or after them (an
+    /// agent's dig or build).
     pub fn set_cell(&mut self, x: usize, y: usize, element: ElementId, mass: Mass, temp: Temp) {
         self.world.set(&self.table, x, y, element, mass, temp);
         let idx = self.chunks.index(x / CHUNK, y / CHUNK);
         self.active_mass[idx] = true;
         self.active_heat[idx] = true;
+        self.tick_activity_mass[idx] = true;
+        self.tick_activity_heat[idx] = true;
     }
 
     /// Fills the half-open rectangle `[x0, x1) × [y0, y1)`.
@@ -198,12 +309,14 @@ impl Sim {
         }
     }
 
-    /// Runs one tick: buoyancy sort (which also records pressure flags), flux, heat.
+    /// Runs one tick: buoyancy sort (which also records pressure flags), flux, heat,
+    /// agents.
     pub fn step(&mut self) -> TickStats {
         self.begin_tick();
         self.pass_sort();
         self.pass_flux();
         self.pass_heat();
+        self.pass_agents();
         self.end_tick()
     }
 
@@ -248,6 +361,12 @@ impl Sim {
         self.run_pass(PassKind::Heat, heat::conduct_cell);
     }
 
+    /// Colonists and items: walkability refresh, gravity, job assignment, movement,
+    /// digging and building. Sequential, after the gather passes.
+    pub fn pass_agents(&mut self) {
+        self.last_path_solves = self.agents_step();
+    }
+
     /// Last phase of a tick: publishes activity for the next tick and counts the tick.
     pub fn end_tick(&mut self) -> TickStats {
         let processed = self.process_heat.iter().filter(|p| **p).count();
@@ -259,7 +378,11 @@ impl Sim {
             chunks_processed: processed,
             chunks_skipped: self.chunks.len() - processed,
             chunks_processed_mass: processed_mass,
+            path_solves: self.last_path_solves,
+            jobs: self.jobs.counts(),
+            colonists: self.colonists.len() as u32,
         };
+        self.jobs.prune(self.tick);
         self.tick += 1;
         stats
     }
@@ -310,9 +433,19 @@ impl Sim {
         &self.process_heat
     }
 
-    /// Sum of all cell masses in raw units. Exactly constant across ticks.
+    /// Sum of all cell and item masses in raw units. Exactly constant across ticks.
     pub fn total_mass(&self) -> u64 {
-        self.world.cells.mass.iter().map(|m| *m as u64).sum()
+        self.world.cells.mass.iter().map(|m| *m as u64).sum::<u64>()
+            + self
+                .items
+                .iter()
+                .map(|(_, it)| it.mass.raw() as u64)
+                .sum::<u64>()
+    }
+
+    /// Sum of item masses in raw units (on the ground and carried).
+    pub fn item_mass(&self) -> u64 {
+        self.items.iter().map(|(_, it)| it.mass.raw() as u64).sum()
     }
 
     /// Sum of heat capacity × temperature over all cells, in Q32.32 joules.
@@ -324,6 +457,10 @@ impl Sim {
                 let c = grid.cell(x, y);
                 total += capacity(&grid, &c) as i128 * c.temp as i128;
             }
+        }
+        for (_, it) in self.items.iter() {
+            let cap = (it.mass.raw() as i64 * self.table.shc(it.element.0)) >> 16;
+            total += cap as i128 * it.temp.raw() as i128;
         }
         total
     }
@@ -337,11 +474,18 @@ impl Sim {
                 total += capacity(&grid, &grid.cell(x, y)) as i128;
             }
         }
+        for (_, it) in self.items.iter() {
+            total += ((it.mass.raw() as i64 * self.table.shc(it.element.0)) >> 16) as i128;
+        }
         total
     }
 
-    /// FNV-1a over the tick number and every cell array, for replay and golden tests.
-    pub fn state_hash(&self) -> u64 {
+    /// FNV-1a over the tick number and every cell array (no entities).
+    pub fn cell_hash(&self) -> u64 {
+        self.cell_hasher().finish()
+    }
+
+    fn cell_hasher(&self) -> Fnv1a {
         let mut h = Fnv1a::new();
         h.write_u64(self.tick);
         h.write_u64(self.world.width as u64);
@@ -350,6 +494,16 @@ impl Sim {
         h.write_u32s(&self.world.cells.mass);
         h.write_i32s(&self.world.cells.temp);
         h.write_bytes(&self.world.cells.flags);
+        h
+    }
+
+    /// FNV-1a over the cells and every entity (the same bytes a snapshot writes), for
+    /// replay and golden tests.
+    pub fn state_hash(&self) -> u64 {
+        let mut h = self.cell_hasher();
+        let mut entities = Vec::new();
+        crate::save::encode_entities(self, &mut entities);
+        h.write_bytes(&entities);
         h.finish()
     }
 }

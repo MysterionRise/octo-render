@@ -102,12 +102,7 @@ mod tests {
 
     fn snapshot_of(sim: &Sim) -> Snapshot {
         let dirty = vec![true; sim.chunks().len()];
-        let stats = TickStats {
-            tick: 0,
-            chunks_processed: 0,
-            chunks_skipped: 0,
-            chunks_processed_mass: 0,
-        };
+        let stats = TickStats::fresh(0, 0);
         Snapshot::from_sim(sim, &dirty, 0, stats, 0, 0)
     }
 

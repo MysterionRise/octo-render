@@ -295,6 +295,6 @@ mod tests {
         board.prune(5 + PRUNE_AFTER_TICKS);
         assert!(board.jobs.is_empty());
         assert_eq!(board.counts().done, 1, "counts survive pruning");
-        assert!(board.set_priority_at(1, 1, 3) == false, "no live job there");
+        assert!(!board.set_priority_at(1, 1, 3), "no live job there");
     }
 }
