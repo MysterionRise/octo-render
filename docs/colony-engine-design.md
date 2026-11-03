@@ -369,15 +369,15 @@ Total: roughly nine to twelve months.
 
 | Exit criterion | Measured | Met |
 | --- | --- | --- |
-| Gas plus heat tick ≤ 8 ms on one core | Gas-mixing (one interface, slow diffusion, 63% of chunks conducting): 9.0 ms, 3.8 ms on four threads. Seeded noise (every cell a random gas and temperature, every chunk active in every pass): 41 ms, 14 ms on four threads. Settled world: 2.3 ms | Narrowly missed for the realistic case on one core; met with the thread pool |
+| Gas plus heat tick ≤ 8 ms on one core | Gas-mixing (one interface, slow diffusion, 63% of chunks conducting): 7.3 ms, 3.8 ms on four threads. Seeded noise (every cell a random gas and temperature, every chunk active in every pass): 40 ms, 13 ms on four threads. Settled world: 2.3 ms | Met for the realistic case; the adversarial case needs the thread pool |
 | Total mass bit-exact over 10,000 ticks | Exact in every scenario and every test run; the headless runner asserts it | Yes |
 | Two runs hash-identical | Identical per-tick hashes; the parallel run matches the sequential run bit for bit in every scenario | Yes |
 | ≥ 90% chunks skipped on a settled world | 99.5% skipped from the second tick | Yes |
 | Gas-mixing golden image | `colony/headless/tests/golden/gas-mixing-64-120.png` plus hash goldens in `colony/sim/tests/golden/`, inspected and pinned | Yes |
 
-Per-cell cost in the all-active worst case is 39 ns (sort), 67 ns (flux), and 49 ns (heat): the passes construct a cell view per neighbour and the flux pass re-evaluates radius-two decisions (evacuation targets, vacuum winners) from each endpoint. Energy drift stayed inside the rounding bound in every run.
+Per-cell cost in the all-active worst case is 39 ns (sort), 69 ns (flux), and 45 ns (heat). Each rule now works on a stencil (the cell and its four neighbours loaded once per pass, with per-load bounds checks replaced by one coordinate check), which is what brought the realistic case under 8 ms; the noise case is dominated by the radius-two lookups the flux pass makes around pressed and vacuum cells, which almost every cell in that scenario is. Energy drift stayed inside the rounding bound in every run.
 
-**Gate decision: go.** The realistic tick is inside the 25 ms budget on one core with room for liquids, networks, and entities, and the adversarial case fits with the thread pool. The first task of M2 is to halve the per-cell cost by sweeping rows with pre-sliced neighbour rows (no per-load bounds checks, no repeated cell construction) and by caching per-cell decisions in the flags byte, with the noise scenario as the benchmark.
+**Gate decision: go.** The realistic tick is inside the 25 ms budget on one core with room for liquids, networks, and entities, and the adversarial case fits with the thread pool. Caching per-cell decisions (evacuation direction, vacuum winner) in the flags byte so that neighbours read them instead of recomputing them is the remaining lever for the noise case; it is deferred until liquids exist, because the liquid rules add to the same decisions.
 
 ## 15. Risks
 

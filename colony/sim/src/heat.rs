@@ -7,7 +7,7 @@
 //! bounds.
 
 use crate::fixed::scale_mag;
-use crate::world::{Cell, CellOut, Grid, DIRS};
+use crate::world::{Cell, CellOut, Grid};
 
 /// Heat capacity of a cell in Q16.16 J/K.
 #[inline]
@@ -17,19 +17,21 @@ pub fn capacity(grid: &Grid, cell: &Cell) -> i64 {
 
 /// Conduction pass for one cell.
 pub fn conduct_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
-    let c = grid.cell(x, y);
-    let cap_c = capacity(grid, &c);
+    let st = grid.stencil(x, y);
+    let c = &st.cell;
+    let cap_c = capacity(grid, c);
     if cap_c == 0 {
-        return CellOut::keep(&c);
+        return CellOut::keep(c);
     }
     let k_c = grid.table.conduct(c.element);
     let mut dq: i128 = 0;
     let mut active = false;
-    for dir in DIRS {
-        let Some(n) = grid.neighbour(x, y, dir) else {
+    for n in st.iter() {
+        let dt = n.temp as i64 - c.temp as i64;
+        if dt == 0 {
             continue;
-        };
-        let cap_n = capacity(grid, &n);
+        }
+        let cap_n = capacity(grid, n);
         if cap_n == 0 {
             continue;
         }
@@ -38,7 +40,6 @@ pub fn conduct_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
         if k == 0 {
             continue;
         }
-        let dt = n.temp as i64 - c.temp as i64;
         let mag = dt.unsigned_abs();
         let q = scale_mag(mag, k);
         let cap_min = cap_c.min(cap_n) as u64;
@@ -53,7 +54,7 @@ pub fn conduct_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
         }
     }
     if !active {
-        return CellOut::keep(&c);
+        return CellOut::keep(c);
     }
     // The 64-bit division covers every realistic cell; the wide path keeps it exact.
     let delta = match i64::try_from(dq << 16) {

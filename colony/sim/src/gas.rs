@@ -6,14 +6,18 @@
 //!
 //! The sort pass swaps a denser gas below a lighter one under mutual proposal, and
 //! records [`FLAG_PRESSED`] on gas cells that touch a different gas with more than
-//! twice their mass. The flux pass exchanges mass between same-element neighbours,
-//! expands gas into vacuum, merges sub-floor residue, and evacuates pressed cells into
-//! their own gas region. Every rule either moves mass toward equal pressure within one
-//! gas or removes a density inversion, so a closed world settles and stays settled.
+//! twice their regional mass. The flux pass exchanges mass between same-element
+//! neighbours, expands gas into vacuum, merges sub-floor residue, and evacuates pressed
+//! cells into their own gas region. Every rule either moves mass toward equal pressure
+//! within one gas or removes a density inversion, so a closed world settles and stays
+//! settled.
+//!
+//! Each rule works on a [`Stencil`], the cell and its four neighbours loaded once; a
+//! rule that has to look at a neighbour's neighbours loads that neighbour's stencil.
 
-use crate::element::Phase;
+use crate::element::{ElementTable, Phase};
 use crate::fixed::{scale_mag, Mass, ONE};
-use crate::world::{Cell, CellOut, Dir, Grid, DIRS, FLAG_PRESSED};
+use crate::world::{Cell, CellOut, Dir, Grid, Stencil, FLAG_PRESSED};
 
 /// Fraction of a mass difference that crosses one cell boundary per tick (1/4 in
 /// Q16.16). With four neighbours this bounds a cell's total outflow by its own mass,
@@ -40,18 +44,16 @@ fn is_pressed(c: &Cell) -> bool {
 /// neighbours. Comparing against that regional mean rather than the cell alone is what
 /// stops a freshly filled interface cell, which starts thin, from being pushed straight
 /// back; the interface only moves while the regions themselves are out of balance.
-fn pressed_now(grid: &Grid, c: &Cell) -> bool {
+fn pressed_now(st: &Stencil) -> bool {
+    let c = &st.cell;
     if !is_regular_gas(c) {
         return false;
     }
     let mut sum = c.mass as u64;
     let mut count: u64 = 1;
     let mut heaviest_other: u64 = 0;
-    for dir in DIRS {
-        let Some(n) = grid.neighbour(c.x, c.y, dir) else {
-            continue;
-        };
-        if !is_regular_gas(&n) {
+    for n in st.iter() {
+        if !is_regular_gas(n) {
             continue;
         }
         if n.element == c.element {
@@ -67,20 +69,20 @@ fn pressed_now(grid: &Grid, c: &Cell) -> bool {
 /// Buoyancy proposal: sink below a lighter gas, otherwise rise above a denser one.
 /// Each cell proposes at most one partner, so no cell is in two swaps, and each swap
 /// removes one density inversion, so sorting terminates.
-fn sort_proposal(grid: &Grid, x: usize, y: usize) -> Option<(usize, usize)> {
-    let c = grid.cell(x, y);
-    if !is_regular_gas(&c) {
+fn sort_proposal(st: &Stencil, table: &ElementTable) -> Option<Dir> {
+    let c = &st.cell;
+    if !is_regular_gas(c) {
         return None;
     }
-    let density = grid.table.density(c.element);
-    if let Some(b) = grid.neighbour(x, y, Dir::Down) {
-        if is_regular_gas(&b) && grid.table.density(b.element) < density {
-            return Some((b.x, b.y));
+    let density = table.density(c.element);
+    if let Some(b) = st.get(Dir::Down) {
+        if is_regular_gas(b) && table.density(b.element) < density {
+            return Some(Dir::Down);
         }
     }
-    if let Some(a) = grid.neighbour(x, y, Dir::Up) {
-        if is_regular_gas(&a) && grid.table.density(a.element) > density {
-            return Some((a.x, a.y));
+    if let Some(a) = st.get(Dir::Up) {
+        if is_regular_gas(a) && table.density(a.element) > density {
+            return Some(Dir::Up);
         }
     }
     None
@@ -91,15 +93,12 @@ fn sort_proposal(grid: &Grid, x: usize, y: usize) -> Option<(usize, usize)> {
 /// flux pass reads; for a cell that just swapped, the flag describes the old occupant
 /// and is one tick stale, which only delays an evacuation.
 pub fn sort_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
-    let c = grid.cell(x, y);
-    let flags = if pressed_now(grid, &c) {
-        FLAG_PRESSED
-    } else {
-        0
-    };
-    if let Some((px, py)) = sort_proposal(grid, x, y) {
-        if sort_proposal(grid, px, py) == Some((x, y)) {
-            let p = grid.cell(px, py);
+    let st = grid.stencil(x, y);
+    let flags = if pressed_now(&st) { FLAG_PRESSED } else { 0 };
+    if let Some(dir) = sort_proposal(&st, grid.table) {
+        let p = st.get(dir).expect("a proposal names an existing neighbour");
+        let partner = grid.stencil(p.x, p.y);
+        if sort_proposal(&partner, grid.table) == Some(dir.opposite()) {
             return CellOut {
                 element: p.element,
                 mass: p.mass,
@@ -111,35 +110,32 @@ pub fn sort_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
     }
     CellOut {
         flags,
-        ..CellOut::keep(&c)
+        ..CellOut::keep(&st.cell)
     }
 }
 
 /// The regular, unpressed, same-element neighbour with the most mass (ties by priority
 /// order): where sub-floor residue and evacuations go. Pressed cells never receive, so
 /// two pressed cells cannot evacuate into each other.
-fn merge_target(grid: &Grid, x: usize, y: usize) -> Option<Cell> {
-    let c = grid.cell(x, y);
-    let mut best: Option<Cell> = None;
-    for dir in DIRS {
-        if let Some(n) = grid.neighbour(x, y, dir) {
-            if is_regular_gas(&n)
-                && !is_pressed(&n)
-                && n.element == c.element
-                && best.is_none_or(|b| n.mass > b.mass)
-            {
-                best = Some(n);
-            }
+fn merge_target(st: &Stencil) -> Option<&Cell> {
+    let mut best: Option<&Cell> = None;
+    for n in st.iter() {
+        if is_regular_gas(n)
+            && !is_pressed(n)
+            && n.element == st.cell.element
+            && best.is_none_or(|b| n.mass > b.mass)
+        {
+            best = Some(n);
         }
     }
     best
 }
 
-/// Where a pressed regular gas cell sends all of its mass this tick, if anywhere.
+/// Whether a pressed regular gas cell leaves this tick, and where its mass goes.
 #[inline]
-fn evacuation(grid: &Grid, c: &Cell) -> Option<Cell> {
-    if is_regular_gas(c) && is_pressed(c) {
-        merge_target(grid, c.x, c.y)
+fn evacuation(st: &Stencil) -> Option<&Cell> {
+    if is_regular_gas(&st.cell) && is_pressed(&st.cell) {
+        merge_target(st)
     } else {
         None
     }
@@ -150,13 +146,11 @@ fn evacuation(grid: &Grid, c: &Cell) -> Option<Cell> {
 /// cells are skipped by their flag alone (one load) rather than by whether they really
 /// evacuate, so every cell around the vacuum agrees on the winner without a deeper
 /// stencil; a pressed cell that stays merely waits a tick before expanding.
-fn vacuum_winner(grid: &Grid, x: usize, y: usize) -> Option<Cell> {
-    let mut best: Option<Cell> = None;
-    for dir in DIRS {
-        if let Some(n) = grid.neighbour(x, y, dir) {
-            if is_regular_gas(&n) && !is_pressed(&n) && best.is_none_or(|b| n.mass > b.mass) {
-                best = Some(n);
-            }
+fn vacuum_winner(st: &Stencil) -> Option<&Cell> {
+    let mut best: Option<&Cell> = None;
+    for n in st.iter() {
+        if is_regular_gas(n) && !is_pressed(n) && best.is_none_or(|b| n.mass > b.mass) {
+            best = Some(n);
         }
     }
     best
@@ -177,12 +171,18 @@ fn mix_temp(m0: u64, t0: i32, m_in: u64, e_in: i128) -> i32 {
     }
 }
 
+#[inline]
+fn is_me(target: Option<&Cell>, x: usize, y: usize) -> bool {
+    target.is_some_and(|t| t.x == x && t.y == y)
+}
+
 /// Flux pass. Liquids and solids are untouched.
 pub fn flux_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
-    let c = grid.cell(x, y);
+    let st = grid.stencil(x, y);
+    let c = &st.cell;
     match c.phase {
         Phase::Vacuum => {
-            if let Some(w) = vacuum_winner(grid, x, y) {
+            if let Some(w) = vacuum_winner(&st) {
                 let f = scale_mag(w.mass as u64, K_FLUX) as u32;
                 if f > 0 {
                     return CellOut {
@@ -194,42 +194,39 @@ pub fn flux_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
                     };
                 }
             }
-            CellOut::keep(&c)
+            CellOut::keep(c)
         }
         Phase::Gas if c.mass < Mass::FLOOR.0 => {
-            if c.mass == 0 || merge_target(grid, x, y).is_some() {
+            if c.mass == 0 || merge_target(&st).is_some() {
                 CellOut::VACUUM
             } else {
-                CellOut::keep(&c)
+                CellOut::keep(c)
             }
         }
         Phase::Gas => {
-            if evacuation(grid, &c).is_some() {
+            if is_pressed(c) && merge_target(&st).is_some() {
                 return CellOut::VACUUM;
             }
             let mut out: u64 = 0;
             let mut inflow: u64 = 0;
             let mut energy_in: i128 = 0;
             let mut active = false;
-            for dir in DIRS {
-                let Some(n) = grid.neighbour(x, y, dir) else {
-                    continue;
-                };
+            for n in st.iter() {
                 if n.phase == Phase::Gas && n.element == c.element {
                     if n.mass >= Mass::FLOOR.0 {
-                        let leaving = if is_pressed(&n) {
-                            evacuation(grid, &n)
-                        } else {
-                            None
-                        };
-                        if let Some(t) = leaving {
-                            // n leaves this tick; it exchanges only with its target.
-                            if t.x == x && t.y == y {
-                                inflow += n.mass as u64;
-                                energy_in += n.mass as i128 * n.temp as i128;
-                                active = true;
+                        if is_pressed(n) {
+                            let around = grid.stencil(n.x, n.y);
+                            if let Some(t) = evacuation(&around) {
+                                // n leaves this tick; it exchanges only with its target.
+                                if t.x == x && t.y == y {
+                                    inflow += n.mass as u64;
+                                    energy_in += n.mass as i128 * n.temp as i128;
+                                    active = true;
+                                }
+                                continue;
                             }
-                        } else if c.mass > n.mass {
+                        }
+                        if c.mass > n.mass {
                             let f = scale_mag((c.mass - n.mass) as u64, K_FLUX);
                             out += f;
                             active |= f > 0;
@@ -239,15 +236,13 @@ pub fn flux_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
                             energy_in += f as i128 * n.temp as i128;
                             active |= f > 0;
                         }
-                    } else if n.mass > 0
-                        && merge_target(grid, n.x, n.y).is_some_and(|t| t.x == x && t.y == y)
-                    {
+                    } else if n.mass > 0 && is_me(merge_target(&grid.stencil(n.x, n.y)), x, y) {
                         inflow += n.mass as u64;
                         energy_in += n.mass as i128 * n.temp as i128;
                         active = true;
                     }
                 } else if n.phase == Phase::Vacuum
-                    && vacuum_winner(grid, n.x, n.y).is_some_and(|w| w.x == x && w.y == y)
+                    && is_me(vacuum_winner(&grid.stencil(n.x, n.y)), x, y)
                 {
                     let f = scale_mag(c.mass as u64, K_FLUX);
                     out += f;
@@ -277,7 +272,7 @@ pub fn flux_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
                 active,
             }
         }
-        Phase::Liquid | Phase::Solid => CellOut::keep(&c),
+        Phase::Liquid | Phase::Solid => CellOut::keep(c),
     }
 }
 

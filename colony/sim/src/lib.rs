@@ -30,4 +30,4 @@ pub mod world;
 pub use element::{builtin, ElementDef, ElementId, ElementTable, Phase};
 pub use fixed::{Mass, Temp};
 pub use sim::{Sim, TickStats};
-pub use world::{Cell, CellBuffers, CellOut, Dir, Grid, World, DIRS, FLAG_PRESSED};
+pub use world::{Cell, CellBuffers, CellOut, Dir, Grid, Stencil, World, DIRS, FLAG_PRESSED};
