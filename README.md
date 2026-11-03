@@ -16,7 +16,7 @@ The portfolio story is intentionally split:
 - `app` is the CPU software renderer and the main proof of graphics fundamentals.
 - `octo-app` is an interactive `wgpu` viewer used as a GPU comparison/demo layer.
 
-Technical notes: [software renderer write-up](docs/software-renderer.md), [case study](docs/case-study.md), [benchmark methodology/results](docs/benchmarks.md), [profiling notes](docs/profiling.md), and [tinyrenderer/Habr comparison](docs/tinyrenderer-comparison.md).
+Technical notes: [software renderer write-up](docs/software-renderer.md), [case study](docs/case-study.md), [benchmark methodology/results](docs/benchmarks.md), [profiling notes](docs/profiling.md), [tinyrenderer/Habr comparison](docs/tinyrenderer-comparison.md), and [colony engine design and roadmap](docs/colony-engine-design.md).
 
 ## Gallery
 

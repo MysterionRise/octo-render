@@ -50,3 +50,7 @@ Workspace root package `octo-render`:
 - **Scene space**: models are recentred and scaled into a normalized scene before the camera is applied, so `--camera` and `--light` live in that space.
 
 Dependencies: `image` 0.25 (PNG, PNM, TGA, and JPEG codecs only) and `glam` 0.32. OBJ models and textures live in `resources/`; write-ups live in `docs/`.
+
+## Planned: Colony-Sim Engine
+
+`docs/colony-engine-design.md` is the research, architecture, and roadmap for a purpose-built 2D colony-sim engine (an Oxygen Not Included-like cell simulation with pixel art) on a thin custom `wgpu` core that reuses `crates/gpu` and the `crates/app` wiring. It is design only: no engine code exists yet. When that work starts, the crates go under a new top-level `colony/` folder (placeholder names `colony-sim`, `colony-content`, `colony-headless`, `colony-render`, `colony-game`). The simulation kernel crate must not depend on `wgpu`, `winit`, or `glam`, and its state and tick code use fixed-point integers, never `f32`/`f64`; the doc's section 11 lists the determinism rules.
