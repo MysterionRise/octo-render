@@ -19,10 +19,14 @@
 pub mod chunk;
 pub mod command;
 pub mod element;
+pub mod entity;
 pub mod fixed;
 pub mod fluid;
 pub mod hash;
 pub mod heat;
+pub mod item;
+pub mod job;
+pub mod nav;
 pub mod rng;
 pub mod save;
 pub mod scenario;
@@ -32,6 +36,10 @@ pub mod worldgen;
 
 pub use command::{Command, LogEntry};
 pub use element::{builtin, ElementDef, ElementId, ElementTable, Phase};
+pub use entity::{Arena, EntityId};
 pub use fixed::{Mass, Temp};
+pub use item::Item;
+pub use job::{Job, JobBoard, JobCounts, JobKind, JobState};
+pub use nav::{Goal, NavGrid, Path};
 pub use sim::{Sim, TickStats};
 pub use world::{Cell, CellBuffers, CellOut, Dir, Grid, Stencil, World, DIRS, FLAG_PRESSED};
