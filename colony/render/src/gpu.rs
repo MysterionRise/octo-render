@@ -41,7 +41,7 @@ impl ViewUniforms {
             world: [world_cells.0, world_cells.1],
             zoom: camera.zoom(),
             tile_px: camera.tile_px(),
-            overlay: overlay as u32,
+            overlay: overlay.for_cells() as u32,
             _pad: [0; 3],
         }
     }

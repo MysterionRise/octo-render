@@ -27,7 +27,7 @@ pub const TILE_PX: u32 = 8;
 pub use camera::PixelCamera;
 pub use gpu::CellRenderer;
 pub use host::{HostEvent, HostRequest, SimHost};
-pub use snapshot::{CellProbe, ColonistPose, ItemPose, Snapshot};
+pub use snapshot::{BuildingPose, CellProbe, ColonistPose, ItemPose, PacketPose, Snapshot};
 pub use sprites::{sprite_instances, SpriteInstance};
 
 /// Which overlay recolours the world.
@@ -38,16 +38,36 @@ pub enum Overlay {
     None = 0,
     Temperature = 1,
     Pressure = 2,
+    /// Recolours wires and the buildings on them by power status (sprites only).
+    Power = 3,
+    /// Recolours pipes by whether they hold a packet (sprites only).
+    Pipes = 4,
 }
 
 impl Overlay {
-    pub const ALL: [Overlay; 3] = [Overlay::None, Overlay::Temperature, Overlay::Pressure];
+    pub const ALL: [Overlay; 5] = [
+        Overlay::None,
+        Overlay::Temperature,
+        Overlay::Pressure,
+        Overlay::Power,
+        Overlay::Pipes,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Overlay::None => "none",
             Overlay::Temperature => "temperature",
             Overlay::Pressure => "pressure",
+            Overlay::Power => "power",
+            Overlay::Pipes => "pipes",
+        }
+    }
+
+    /// The overlay the cell shader applies: the network overlays leave cells alone.
+    pub fn for_cells(self) -> Overlay {
+        match self {
+            Overlay::Temperature | Overlay::Pressure => self,
+            _ => Overlay::None,
         }
     }
 

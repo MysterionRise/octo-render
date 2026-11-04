@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use colony_sim::{save, Command, ElementTable, Sim, TickStats};
+use colony_sim::{save, BuildingTable, Command, ElementTable, Sim, TickStats};
 
 use crate::snapshot::Snapshot;
 
@@ -24,6 +24,8 @@ pub enum HostRequest {
     /// Load a snapshot written by `colony_sim::save::encode`.
     Load(Vec<u8>),
     Save(PathBuf),
+    /// Swap in a hot-reloaded building table (an append-only extension of the current one).
+    ReloadBuildings(BuildingTable),
     Stop,
 }
 
@@ -32,6 +34,8 @@ pub enum HostEvent {
     Saved(Result<PathBuf, String>),
     Loaded(Result<u64, String>),
     Restarted,
+    /// The number of buildings in the new table, or why the reload was refused.
+    Reloaded(Result<usize, String>),
 }
 
 /// The latest snapshot, replaced by the sim thread and taken by the renderer.
@@ -65,6 +69,7 @@ pub struct SimHost {
     mailbox: Arc<Mailbox>,
     join: Option<JoinHandle<()>>,
     table: ElementTable,
+    building_table: BuildingTable,
     world: (u32, u32),
 }
 
@@ -76,6 +81,7 @@ impl SimHost {
         let (events_tx, events) = mpsc::channel();
         let mailbox = Arc::new(Mailbox::default());
         let table = sim.table().clone();
+        let building_table = sim.building_table().clone();
         let world = (sim.world().width as u32, sim.world().height as u32);
         let worker_mailbox = mailbox.clone();
         let join = std::thread::Builder::new()
@@ -88,6 +94,7 @@ impl SimHost {
             mailbox,
             join: Some(join),
             table,
+            building_table,
             world,
         }
     }
@@ -107,6 +114,12 @@ impl SimHost {
 
     pub fn table(&self) -> &ElementTable {
         &self.table
+    }
+
+    /// The building table the simulation started with (a reload extends it; the game
+    /// keeps the extended copy it sent).
+    pub fn building_table(&self) -> &BuildingTable {
+        &self.building_table
     }
 
     pub fn world(&self) -> (u32, u32) {
@@ -269,6 +282,11 @@ fn run(
                         .map_err(|e| format!("{}: {e}", path.display()));
                     let _ = events.send(HostEvent::Saved(result));
                 }
+                HostRequest::ReloadBuildings(table) => {
+                    let n = table.len();
+                    let result = w.sim.set_building_table(table).map(|_| n);
+                    let _ = events.send(HostEvent::Reloaded(result));
+                }
                 HostRequest::Stop => stop = true,
             }
         }
@@ -345,6 +363,34 @@ mod tests {
         assert!(host.take_latest().is_none());
         host.send(HostRequest::SetPaused(false));
         assert!(wait_for(|| host.take_latest(), Duration::from_secs(2)).is_some());
+    }
+
+    #[test]
+    fn a_reload_extends_the_table_and_a_reorder_is_refused() {
+        use colony_sim::{BuildingDef, BuildingKind};
+        let host = SimHost::spawn(scenario::powered(48, 16, 1, 0), 10, true);
+        wait_for(|| host.take_latest(), Duration::from_secs(2)).expect("initial");
+        let reload_result = |host: &SimHost| {
+            wait_for(
+                || {
+                    host.events().into_iter().find_map(|e| match e {
+                        HostEvent::Reloaded(r) => Some(r),
+                        _ => None,
+                    })
+                },
+                Duration::from_secs(2),
+            )
+            .expect("a reload event")
+        };
+        let mut defs = host.building_table().defs().to_vec();
+        defs.push(BuildingDef::new("lamp", (1, 1), BuildingKind::Wire));
+        host.send(HostRequest::ReloadBuildings(BuildingTable::new(
+            defs.clone(),
+        )));
+        assert_eq!(reload_result(&host), Ok(18));
+        defs.swap(0, 1);
+        host.send(HostRequest::ReloadBuildings(BuildingTable::new(defs)));
+        assert!(reload_result(&host).is_err());
     }
 
     #[test]

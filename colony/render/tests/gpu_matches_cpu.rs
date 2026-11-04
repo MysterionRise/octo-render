@@ -118,7 +118,14 @@ fn gpu_render_with_colonists_equals_cpu_composite() {
     renderer.upload(&queue, &snapshot);
     for (zoom, alpha) in [(1, 0), (3, 128), (8, 256)] {
         let camera = PixelCamera::new((64, 24), TILE_PX, (320, 160), zoom);
-        let sprites = sprite_instances(&snapshot, &luts, TILE_PX, alpha);
+        let sprites = sprite_instances(
+            &snapshot,
+            &luts,
+            sim.building_table(),
+            TILE_PX,
+            alpha,
+            Overlay::None,
+        );
         assert!(sprites.len() >= 4);
         renderer.set_sprites(&device, &queue, &sprites);
         renderer.set_view(&queue, &camera, Overlay::None);
@@ -138,4 +145,51 @@ fn gpu_render_with_colonists_equals_cpu_composite() {
         gpu.as_raw() == cpu_reference(&scene, &camera, Overlay::None).as_raw(),
         "no sprites leaves the cell render alone"
     );
+}
+
+/// The powered yard: building quads, a packet train, overlays that recolour sprites
+/// only, all equal to the CPU composite.
+#[test]
+fn gpu_render_with_buildings_equals_cpu_composite() {
+    use colony_render::sprites::{sprite_instances, stamp_sprites};
+
+    let Some((device, queue)) = request_device_headless() else {
+        println!("skipped: no GPU adapter on this machine");
+        return;
+    };
+    let mut sim = scenario::powered(64, 24, 1, 3);
+    let mut stats = sim.step();
+    for _ in 0..60 {
+        stats = sim.step();
+    }
+    let table = sim.table();
+    let snapshot = Snapshot::from_sim(&sim, &vec![true; sim.chunks().len()], 0, stats, 0, 0);
+    assert!(!snapshot.buildings.is_empty());
+    assert!(!snapshot.packets.is_empty());
+    let mut corners = CornerGrid::new(64, 24);
+    corners.rebuild_all(&snapshot, &solid_ranks(table));
+    let luts = Luts::from_table(table);
+    let atlas = Atlas::build(table, TILE_PX);
+    let scene = Scene {
+        snapshot: &snapshot,
+        corners: &corners,
+        luts: &luts,
+        atlas: &atlas,
+    };
+    let mut renderer = CellRenderer::new(&device, &queue, OFFSCREEN_FORMAT, table, (64, 24));
+    renderer.upload(&queue, &snapshot);
+    let camera = PixelCamera::new((64, 24), TILE_PX, (320, 160), 2);
+    for overlay in Overlay::ALL {
+        let sprites =
+            sprite_instances(&snapshot, &luts, sim.building_table(), TILE_PX, 96, overlay);
+        renderer.set_sprites(&device, &queue, &sprites);
+        renderer.set_view(&queue, &camera, overlay);
+        let gpu = render_to_image(&device, &queue, &renderer, camera.viewport());
+        let mut cpu = cpu_reference(&scene, &camera, overlay);
+        stamp_sprites(&mut cpu, &camera, &sprites);
+        assert!(
+            gpu.as_raw() == cpu.as_raw(),
+            "GPU and CPU composites differ for overlay {overlay:?}"
+        );
+    }
 }

@@ -32,6 +32,10 @@ pub struct Snapshot {
     pub colonists: Vec<ColonistPose>,
     /// Every debris item, in arena index order (carried ones included, flagged `held`).
     pub items: Vec<ItemPose>,
+    /// Every building, in arena index order.
+    pub buildings: Vec<BuildingPose>,
+    /// Every pipe packet, by the cell of the pipe holding it.
+    pub packets: Vec<PacketPose>,
     /// Time the last step took on the sim thread.
     pub step_micros: u32,
     /// Steps per second times 100, smoothed on the sim thread.
@@ -66,6 +70,51 @@ pub struct ItemPose {
     pub element: u8,
     /// In a colonist's hands rather than on the ground.
     pub held: bool,
+}
+
+/// A building's footprint and status, enough to draw and inspect it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildingPose {
+    pub id: u32,
+    /// Index into the building table.
+    pub def: u16,
+    pub x: u32,
+    pub y: u32,
+    pub w: u8,
+    pub h: u8,
+    /// `BuildingState::tag()`: 0 planned, 1 under construction, 2 built.
+    pub state: u8,
+    pub enabled: bool,
+    pub powered: bool,
+    pub blocked: bool,
+    pub signal: bool,
+    /// Whether the definition draws power.
+    pub consumes: bool,
+    /// Battery charge as a fraction of capacity in 1/256ths (0 for other kinds).
+    pub charge_x256: u8,
+    /// Power component index, or `NO_BUILDING` when not on a wire.
+    pub component: u32,
+    /// Stored contents: element index and grams, if any.
+    pub stored: Option<(u8, u64)>,
+}
+
+/// A packet in a pipe cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketPose {
+    pub x: u32,
+    pub y: u32,
+    /// Element table index.
+    pub element: u8,
+}
+
+/// The name of a `BuildingState::tag()`.
+pub fn building_state_label(tag: u8) -> &'static str {
+    match tag {
+        0 => "planned",
+        1 => "under construction",
+        2 => "built",
+        _ => "?",
+    }
 }
 
 /// The name of an `AgentState::tag()`.
@@ -188,6 +237,50 @@ impl Snapshot {
                 held: !item.on_ground(),
             })
             .collect();
+        let defs = sim.building_table();
+        let networks = sim.networks();
+        let mut packets = Vec::new();
+        let buildings = sim
+            .buildings()
+            .iter()
+            .map(|(id, b)| {
+                let def = defs.get(b.def);
+                if let Some(p) = b.packet {
+                    packets.push(PacketPose {
+                        x: b.x,
+                        y: b.y,
+                        element: p.element.index() as u8,
+                    });
+                }
+                let charge_x256 = match def.kind {
+                    colony_sim::BuildingKind::Battery { capacity } if capacity > 0 => {
+                        ((b.battery.clamp(0, capacity) as i128 * 255) / capacity as i128) as u8
+                    }
+                    _ => 0,
+                };
+                BuildingPose {
+                    id: id.index,
+                    def: b.def,
+                    x: b.x,
+                    y: b.y,
+                    w: def.size.0,
+                    h: def.size.1,
+                    state: b.state.tag(),
+                    enabled: b.enabled,
+                    powered: b.powered,
+                    blocked: b.blocked,
+                    signal: b.signal,
+                    consumes: def.consumes_power(),
+                    charge_x256,
+                    component: networks
+                        .component_of
+                        .get(id.index as usize)
+                        .copied()
+                        .unwrap_or(colony_sim::NO_BUILDING),
+                    stored: b.stored.map(|(e, m, _)| (e.index() as u8, m.to_grams())),
+                }
+            })
+            .collect();
         Snapshot {
             generation,
             width: world.width as u32,
@@ -202,9 +295,39 @@ impl Snapshot {
             stats,
             colonists,
             items,
+            buildings,
+            packets,
             step_micros,
             ticks_per_s_x100,
         }
+    }
+
+    /// Whether `def` could be placed at `(x, y)` as far as this snapshot shows: in bounds,
+    /// no solid cell and no building under the footprint. Mirrors `Sim::placement_valid`
+    /// for the window's placement preview.
+    pub fn placement_valid(&self, def: &colony_sim::BuildingDef, x: u32, y: u32) -> bool {
+        let (w, h) = (def.size.0 as u32, def.size.1 as u32);
+        if x + w > self.width || y + h > self.height {
+            return false;
+        }
+        for cy in y..y + h {
+            for cx in x..x + w {
+                let [_, packed, _, _] = self.texels[self.index(cx, cy)];
+                if Phase::from_bits(packed as u16 & 3) == Phase::Solid
+                    || self.building_at(cx, cy).is_some()
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The building whose footprint covers a cell.
+    pub fn building_at(&self, x: u32, y: u32) -> Option<&BuildingPose> {
+        self.buildings
+            .iter()
+            .find(|b| x >= b.x && y >= b.y && x < b.x + b.w as u32 && y < b.y + b.h as u32)
     }
 
     /// The first colonist standing in (or walking into) a cell.
@@ -400,6 +523,41 @@ mod tests {
         assert_eq!(snap.colonist_at(x, y).map(|c| c.id), Some(carrier.id));
         assert_eq!(state_label(carrier.state), "walking");
         assert!(snap.colonist_at(47, 15).is_none());
+    }
+
+    #[test]
+    fn building_poses_carry_footprints_status_and_packets() {
+        let mut sim = scenario::powered(64, 20, 1, 2);
+        let mut stats = sim.step();
+        for _ in 0..300 {
+            stats = sim.step();
+        }
+        let snap = Snapshot::from_sim(&sim, sim.processed_chunks(), 0, stats, 0, 0);
+        assert_eq!(snap.buildings.len(), sim.buildings().len());
+        let crank = snap.building_at(6, 2).expect("the hand crank");
+        assert_eq!((crank.w, crank.h), (2, 2));
+        assert_eq!(snap.building_at(7, 3).map(|b| b.id), Some(crank.id));
+        assert_eq!(building_state_label(crank.state), "built");
+        assert!(!crank.consumes);
+        assert_ne!(crank.component, colony_sim::NO_BUILDING);
+        let heater = snap.building_at(20, 2).expect("the heater");
+        assert!(heater.consumes);
+        assert_eq!(heater.component, crank.component, "one wire joins them");
+        let battery = snap.building_at(16, 2).expect("the battery");
+        assert!(battery.charge_x256 > 0, "the crank charged it");
+        assert!(!snap.packets.is_empty(), "the pump ran");
+        assert!(snap
+            .packets
+            .iter()
+            .all(|p| snap.building_at(p.x, p.y).is_some()));
+        assert!(snap.building_at(40, 10).is_none());
+        let defs = sim.building_table();
+        let wire = defs.get(colony_sim::building::ids::WIRE);
+        assert!(snap.placement_valid(wire, 40, 10));
+        assert!(!snap.placement_valid(wire, 40, 0), "the floor is solid");
+        assert!(!snap.placement_valid(wire, 6, 2), "the crank is there");
+        assert!(!snap.placement_valid(wire, 63, 10), "the border");
+        assert!(!snap.placement_valid(defs.get(colony_sim::building::ids::BATTERY), 62, 10));
     }
 
     #[test]

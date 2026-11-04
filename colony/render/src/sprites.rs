@@ -6,18 +6,31 @@
 
 use bytemuck::{Pod, Zeroable};
 use colony_sim::agent::MOVE_TICKS;
+use colony_sim::{BuildingKind, BuildingTable, NO_BUILDING};
 use image::{Rgba, RgbaImage};
 
 use crate::camera::PixelCamera;
 use crate::palette::Luts;
 use crate::snapshot::Snapshot;
+use crate::Overlay;
 
 pub const SHADER: &str = include_str!("../shaders/sprites.wgsl");
 
-/// Draw order: items on the ground, then colonists, then what they carry.
+/// Draw order: items on the ground, buildings, packets, colonists, then badges.
 pub const LAYER_ITEM: u32 = 0;
-pub const LAYER_COLONIST: u32 = 1;
-pub const LAYER_BADGE: u32 = 2;
+pub const LAYER_BUILDING: u32 = 1;
+pub const LAYER_PACKET: u32 = 2;
+pub const LAYER_COLONIST: u32 = 3;
+pub const LAYER_BADGE: u32 = 4;
+
+/// Overlay colours: powered, brown-out, unconnected, pipe holding a packet, empty pipe.
+pub const POWERED: [u8; 3] = [72, 224, 96];
+pub const BROWNOUT: [u8; 3] = [240, 64, 64];
+pub const UNCONNECTED: [u8; 3] = [128, 128, 128];
+pub const PIPE_FULL: [u8; 3] = [240, 240, 255];
+pub const PIPE_EMPTY: [u8; 3] = [60, 80, 110];
+pub const BLOCKED: [u8; 3] = [255, 40, 40];
+pub const CHARGE: [u8; 3] = [120, 255, 120];
 
 /// Colonist body colour by `AgentState::tag()`: idle, walking, fetching, working, stuck.
 pub const STATE_COLOURS: [[u8; 3]; 5] = [
@@ -83,21 +96,67 @@ pub fn lerp_cell_px(
     (axis(from.0, to.0), axis(from.1, to.1))
 }
 
+/// A building's quad colour: its definition's colour scaled by state (planned a
+/// quarter, under construction half), halved again when a consumer is unpowered or the
+/// building is switched off; the power and pipe overlays replace it outright.
+pub fn building_colour(
+    pose: &crate::snapshot::BuildingPose,
+    def: &colony_sim::BuildingDef,
+    has_packet: bool,
+    overlay: Overlay,
+) -> [u8; 3] {
+    let on_wire = pose.component != NO_BUILDING;
+    match overlay {
+        Overlay::Power if def.kind.is_wire() || def.consumes_power() || def.power_per_tick > 0 => {
+            return if !on_wire {
+                UNCONNECTED
+            } else if pose.powered {
+                POWERED
+            } else {
+                BROWNOUT
+            };
+        }
+        Overlay::Pipes if def.kind.is_pipe_cell() => {
+            return if has_packet { PIPE_FULL } else { PIPE_EMPTY };
+        }
+        _ => {}
+    }
+    let scale = |c: [u8; 3], num: u32, den: u32| c.map(|v| (v as u32 * num / den) as u8);
+    let mut c = match pose.state {
+        0 => scale(def.colour, 1, 4),
+        1 => scale(def.colour, 1, 2),
+        _ => def.colour,
+    };
+    if pose.state == 2 && (!pose.enabled || (pose.consumes && !pose.powered)) {
+        c = scale(c, 1, 2);
+    }
+    c
+}
+
 /// The sprites of a snapshot in draw order: ground items (half a cell, in the element's
+/// colour), buildings (their footprint, see [`building_colour`], with a charge bar on
+/// batteries and a red badge when blocked), packets (half a cell in the element's
 /// colour), colonist bodies (three quarters of a cell wide, a cell tall, coloured by
 /// state), and a badge on each carrying colonist. Carried items draw as badges only.
 pub fn sprite_instances(
     snapshot: &Snapshot,
     luts: &Luts,
+    defs: &BuildingTable,
     tile_px: u32,
     alpha_x256: u32,
+    overlay: Overlay,
 ) -> Vec<SpriteInstance> {
     let t = tile_px as i32;
     let half = (tile_px / 2).max(1);
     let quarter = (tile_px / 4).max(1);
     let body_w = (tile_px * 3 / 4).max(1);
     let body_dx = (t - body_w as i32) / 2;
-    let mut out = Vec::with_capacity(snapshot.items.len() + 2 * snapshot.colonists.len());
+    let mut out = Vec::with_capacity(
+        snapshot.items.len()
+            + 2 * snapshot.buildings.len()
+            + snapshot.packets.len()
+            + 2 * snapshot.colonists.len(),
+    );
     for item in snapshot.items.iter().filter(|i| !i.held) {
         let x = item.x as i32 * t + (t - half as i32) / 2;
         let y = item.y as i32 * t;
@@ -109,6 +168,52 @@ pub fn sprite_instances(
         ));
     }
     let mut badges = Vec::new();
+    for b in &snapshot.buildings {
+        if !defs.contains(b.def) {
+            continue;
+        }
+        let def = defs.get(b.def);
+        let has_packet = snapshot.packets.iter().any(|p| (p.x, p.y) == (b.x, b.y));
+        let (px, py) = (b.x as i32 * t, b.y as i32 * t);
+        let (w, h) = (b.w as u32 * tile_px, b.h as u32 * tile_px);
+        out.push(SpriteInstance::new(
+            (px, py),
+            (w, h),
+            building_colour(b, def, has_packet, overlay),
+            LAYER_BUILDING,
+        ));
+        if matches!(def.kind, BuildingKind::Battery { .. }) && b.charge_x256 > 0 {
+            let bar = (w * b.charge_x256 as u32 / 255).max(1);
+            badges.push(SpriteInstance::new(
+                (px, py),
+                (bar, quarter),
+                CHARGE,
+                LAYER_BADGE,
+            ));
+        }
+        if b.blocked && b.state == 2 {
+            badges.push(SpriteInstance::new(
+                (
+                    px + w as i32 - quarter as i32,
+                    py + h as i32 - quarter as i32,
+                ),
+                (quarter, quarter),
+                BLOCKED,
+                LAYER_BADGE,
+            ));
+        }
+    }
+    for p in &snapshot.packets {
+        out.push(SpriteInstance::new(
+            (
+                p.x as i32 * t + (t - half as i32) / 2,
+                p.y as i32 * t + (t - half as i32) / 2,
+            ),
+            (half, half),
+            luts.element_colour(p.element),
+            LAYER_PACKET,
+        ));
+    }
     for c in &snapshot.colonists {
         let (px, py) = lerp_cell_px(c.from, c.to, c.progress, alpha_x256, tile_px);
         let colour = STATE_COLOURS[(c.state as usize).min(STATE_COLOURS.len() - 1)];
@@ -426,7 +531,8 @@ mod tests {
                 carrying: None,
             },
         ];
-        let out = sprite_instances(&snap, &luts, TILE_PX, 0);
+        let defs = BuildingTable::builtin();
+        let out = sprite_instances(&snap, &luts, &defs, TILE_PX, 0, Overlay::None);
         assert_eq!(out.len(), 4, "one ground item, two bodies, one badge");
         assert_eq!(out[0].layer, LAYER_ITEM);
         assert_eq!((out[0].pos, out[0].size), ([10, 16], [4, 4]));
@@ -444,13 +550,106 @@ mod tests {
         assert_eq!((out[3].pos, out[3].size), ([33, 22], [2, 2]));
         assert_eq!(out[3].rgb(), luts.element_colour(4));
         assert_eq!(pack_rgba([1, 2, 3], 255), 0xff03_0201);
-        let later = sprite_instances(&snap, &luts, TILE_PX, 256);
+        let later = sprite_instances(&snap, &luts, &defs, TILE_PX, 256, Overlay::None);
         assert_eq!(
             later[1].pos,
             [33, 16],
             "a full tick later the walker has arrived"
         );
         assert_eq!(later[2].pos, out[2].pos, "the stuck one does not move");
+    }
+
+    #[test]
+    fn building_sprites_cover_footprints_and_tint_by_state_and_overlay() {
+        use crate::snapshot::{BuildingPose, PacketPose};
+        use colony_sim::building::ids;
+        let table = ElementTable::builtin();
+        let luts = Luts::from_table(&table);
+        let defs = BuildingTable::builtin();
+        let pose = |def: u16, x: u32, state: u8, powered: bool, component: u32| BuildingPose {
+            id: 0,
+            def,
+            x,
+            y: 2,
+            w: defs.get(def).size.0,
+            h: defs.get(def).size.1,
+            state,
+            enabled: true,
+            powered,
+            blocked: false,
+            signal: false,
+            consumes: defs.get(def).consumes_power(),
+            charge_x256: 0,
+            component,
+            stored: None,
+        };
+        let mut snap = empty_snapshot();
+        let mut battery = pose(ids::BATTERY, 8, 2, true, 0);
+        battery.charge_x256 = 128;
+        let mut blocked_vent = pose(ids::GAS_VENT, 12, 2, true, NO_BUILDING);
+        blocked_vent.blocked = true;
+        snap.buildings = vec![
+            pose(ids::HAND_CRANK, 1, 2, true, 0),
+            pose(ids::WIRE, 3, 2, true, 0),
+            pose(ids::HEATER, 4, 0, false, NO_BUILDING),
+            pose(ids::HEATER, 5, 2, false, 0),
+            pose(ids::HEATER, 6, 2, false, NO_BUILDING),
+            battery,
+            pose(ids::GAS_PIPE, 11, 2, true, NO_BUILDING),
+            blocked_vent,
+        ];
+        snap.packets = vec![PacketPose {
+            x: 11,
+            y: 2,
+            element: 1,
+        }];
+        let out = sprite_instances(&snap, &luts, &defs, TILE_PX, 0, Overlay::None);
+        // Eight buildings, a charge bar, a blocked badge, one packet.
+        assert_eq!(out.len(), 11);
+        let crank = &out[0];
+        assert_eq!(
+            (crank.pos, crank.size, crank.layer),
+            ([8, 16], [16, 16], LAYER_BUILDING)
+        );
+        assert_eq!(crank.rgb(), defs.get(ids::HAND_CRANK).colour);
+        let planned = &out[2];
+        assert_eq!(planned.rgb(), defs.get(ids::HEATER).colour.map(|v| v / 4));
+        let unpowered = &out[3];
+        assert_eq!(unpowered.rgb(), defs.get(ids::HEATER).colour.map(|v| v / 2));
+        let packet = out.iter().find(|s| s.layer == LAYER_PACKET).unwrap();
+        assert_eq!((packet.pos, packet.size), ([90, 18], [4, 4]));
+        assert_eq!(packet.rgb(), luts.element_colour(1));
+        let bar = out
+            .iter()
+            .find(|s| s.layer == LAYER_BADGE && s.rgb() == CHARGE)
+            .unwrap();
+        assert_eq!(
+            (bar.pos, bar.size),
+            ([64, 16], [8, 2]),
+            "half charged, half the width"
+        );
+        let badge = out.iter().find(|s| s.rgb() == BLOCKED).unwrap();
+        assert_eq!((badge.pos, badge.size), ([102, 22], [2, 2]));
+        assert!(
+            out.windows(2).all(|w| w[0].layer <= w[1].layer),
+            "draw order by layer"
+        );
+
+        let power = sprite_instances(&snap, &luts, &defs, TILE_PX, 0, Overlay::Power);
+        assert_eq!(power[0].rgb(), POWERED, "a generator on a wire");
+        assert_eq!(power[1].rgb(), POWERED, "the wire itself");
+        assert_eq!(power[2].rgb(), UNCONNECTED, "planned and off the wire");
+        assert_eq!(power[3].rgb(), BROWNOUT, "on the wire but unpowered");
+        assert_eq!(power[4].rgb(), UNCONNECTED);
+        assert_eq!(
+            power[6].rgb(),
+            defs.get(ids::GAS_PIPE).colour,
+            "pipes keep their colour"
+        );
+        let pipes = sprite_instances(&snap, &luts, &defs, TILE_PX, 0, Overlay::Pipes);
+        assert_eq!(pipes[6].rgb(), PIPE_FULL);
+        assert_eq!(pipes[7].rgb(), PIPE_EMPTY);
+        assert_eq!(pipes[0].rgb(), defs.get(ids::HAND_CRANK).colour);
     }
 
     #[test]

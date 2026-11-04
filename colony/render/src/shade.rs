@@ -31,6 +31,7 @@ pub fn shade_pixel(
     sy: u32,
 ) -> [u8; 3] {
     let snap = scene.snapshot;
+    let overlay = overlay.for_cells();
     let (px, py) = camera.screen_to_world((sx, sy));
     let t = camera.tile_px() as i64;
     let (cx, cy) = (floor_div(px, t), floor_div(py, t));
