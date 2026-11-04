@@ -1,15 +1,19 @@
 //! Snapshots: a versioned little-endian byte layout of the whole state, plus a trailing
 //! state hash so a corrupted or edited file is rejected rather than loaded.
 //!
-//! Layout (format 2): magic `CSIM`, format version `u32`, element-table hash `u64`,
+//! Layout (format 3): magic `CSIM`, format version `u32`, element-table hash `u64`,
 //! width `u64`, height `u64`, tick `u64`, the element (`u16`), mass (`u32`),
 //! temperature (`i32`), and flags (`u8`) arrays, then the entities (colonists, items,
-//! the job board, written by [`encode_entities`]), then the state hash `u64`. Chunk
+//! the job board, the buildings, the injected energy, written by [`encode_entities`]),
+//! then the state hash `u64`. Each building names its definition rather than indexing
+//! it, so a save loads against any building table that still has those names, and the
+//! hash does not depend on the table's order. Chunk
 //! activity is not saved: a loaded world visits every chunk on its first tick, which
 //! produces the same values as skipping would have. The same entity bytes feed
 //! [`crate::Sim::state_hash`], so the hash can never cover less than the file.
 
 use crate::agent::{AgentState, Colonist};
+use crate::building::{Building, BuildingState, BuildingTable, Packet};
 use crate::element::{ElementId, ElementTable};
 use crate::entity::{Arena, EntityId};
 use crate::fixed::{Mass, Temp};
@@ -17,11 +21,11 @@ use crate::hash::Fnv1a;
 use crate::item::Item;
 use crate::job::{Job, JobBoard, JobKind, JobState};
 use crate::nav::{Goal, Path};
-use crate::sim::Sim;
+use crate::sim::{Parts, Sim};
 use crate::world::{CellBuffers, World};
 
 const MAGIC: &[u8; 4] = b"CSIM";
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 /// Upper bound on any count read from a file.
 const MAX_COUNT: u64 = 1 << 22;
 
@@ -34,6 +38,8 @@ pub enum SaveError {
     HashMismatch,
     BadDimensions,
     BadEntities,
+    /// The save names a building the current table does not have.
+    UnknownBuilding(String),
 }
 
 impl std::fmt::Display for SaveError {
@@ -48,6 +54,12 @@ impl std::fmt::Display for SaveError {
             SaveError::HashMismatch => write!(f, "snapshot state hash does not match its contents"),
             SaveError::BadDimensions => write!(f, "snapshot dimensions are invalid"),
             SaveError::BadEntities => write!(f, "snapshot entity records are inconsistent"),
+            SaveError::UnknownBuilding(name) => {
+                write!(
+                    f,
+                    "snapshot uses building {name:?}, which the building table lacks"
+                )
+            }
         }
     }
 }
@@ -135,7 +147,52 @@ fn put_goal(out: &mut Vec<u8>, goal: Goal) {
             put_u8(out, 1);
             put_cell(out, (x, y));
         }
+        Goal::Near { x, y, w, h } => {
+            put_u8(out, 2);
+            put_cell(out, (x, y));
+            put_u8(out, w);
+            put_u8(out, h);
+        }
     }
+}
+
+fn put_kind(out: &mut Vec<u8>, kind: JobKind) {
+    put_u8(out, kind.tag());
+    match kind.cell() {
+        Some(cell) => put_cell(out, cell),
+        None => put_id(
+            out,
+            kind.building().expect("a job targets a cell or a building"),
+        ),
+    }
+}
+
+fn put_contents(out: &mut Vec<u8>, c: Option<(ElementId, Mass, Temp)>) {
+    match c {
+        None => put_u8(out, 0),
+        Some((e, m, t)) => {
+            put_u8(out, 1);
+            put_u16(out, e.0);
+            put_u32(out, m.0);
+            put_i32(out, t.0);
+        }
+    }
+}
+
+fn put_building(out: &mut Vec<u8>, table: &BuildingTable, b: &Building) {
+    let name = table.get(b.def).name.as_bytes();
+    put_u16(out, name.len() as u16);
+    out.extend_from_slice(name);
+    put_cell(out, (b.x, b.y));
+    put_u8(out, b.state.tag());
+    put_contents(out, b.material);
+    put_contents(out, b.stored);
+    put_u64(out, b.battery as u64);
+    let flags =
+        (b.enabled as u8) | (b.powered as u8) << 1 | (b.signal as u8) << 2 | (b.blocked as u8) << 3;
+    put_u8(out, flags);
+    put_contents(out, b.packet.map(|p| (p.element, p.mass, p.temp)));
+    put_u16(out, b.work);
 }
 
 fn put_colonist(out: &mut Vec<u8>, c: &Colonist) {
@@ -156,7 +213,7 @@ fn put_colonist(out: &mut Vec<u8>, c: &Colonist) {
             put_id(out, *item);
             put_path(out, path);
         }
-        AgentState::Working { ticks_left } => put_u8(out, *ticks_left),
+        AgentState::Working { ticks_left } => put_u16(out, *ticks_left),
     }
 }
 
@@ -192,8 +249,7 @@ fn put_jobs(out: &mut Vec<u8>, board: &JobBoard) {
     put_u32(out, board.jobs.len() as u32);
     for job in &board.jobs {
         put_u32(out, job.id);
-        put_u8(out, job.kind.tag());
-        put_cell(out, job.kind.target());
+        put_kind(out, job.kind);
         put_u8(out, job.priority);
         match job.state {
             JobState::Open => put_u8(out, 0),
@@ -213,11 +269,15 @@ fn put_jobs(out: &mut Vec<u8>, board: &JobBoard) {
     put_u32(out, board.cancelled_count);
 }
 
-/// Appends every entity of the simulation: colonists, items, and the job board.
+/// Appends every entity of the simulation: colonists, items, the job board, the
+/// buildings (naming their definitions), and the injected energy.
 pub fn encode_entities(sim: &Sim, out: &mut Vec<u8>) {
     put_arena(out, sim.colonists(), put_colonist);
     put_arena(out, sim.items(), put_item);
     put_jobs(out, sim.jobs());
+    let table = sim.building_table();
+    put_arena(out, sim.buildings(), |out, b| put_building(out, table, b));
+    out.extend_from_slice(&sim.energy_injected().to_le_bytes());
 }
 
 /// Serialises the whole simulation.
@@ -323,8 +383,85 @@ impl<'a> Reader<'a> {
         match tag {
             0 => Ok(Goal::Cell { x, y }),
             1 => Ok(Goal::Adjacent { x, y }),
+            2 => {
+                let w = self.u8()?;
+                let h = self.u8()?;
+                Ok(Goal::Near { x, y, w, h })
+            }
             _ => Err(SaveError::BadEntities),
         }
+    }
+
+    fn kind(&mut self) -> Result<JobKind, SaveError> {
+        let tag = self.u8()?;
+        Ok(match tag {
+            0 | 1 => {
+                let (x, y) = self.cell()?;
+                if tag == 0 {
+                    JobKind::Dig { x, y }
+                } else {
+                    JobKind::Build { x, y }
+                }
+            }
+            2..=5 => {
+                let building = self.id()?;
+                match tag {
+                    2 => JobKind::Construct { building },
+                    3 => JobKind::Deconstruct { building },
+                    4 => JobKind::Deliver { building },
+                    _ => JobKind::Operate { building },
+                }
+            }
+            _ => return Err(SaveError::BadEntities),
+        })
+    }
+
+    fn contents(&mut self) -> Result<Option<(ElementId, Mass, Temp)>, SaveError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some((
+                ElementId(self.u16()?),
+                Mass(self.u32()?),
+                Temp(self.i32()?),
+            ))),
+            _ => Err(SaveError::BadEntities),
+        }
+    }
+
+    /// A building, with its definition resolved by name in `table`.
+    fn building(&mut self, table: &BuildingTable) -> Result<Building, SaveError> {
+        let len = self.u16()? as usize;
+        let name = std::str::from_utf8(self.take(len)?).map_err(|_| SaveError::BadEntities)?;
+        let def = table
+            .by_name(name)
+            .ok_or_else(|| SaveError::UnknownBuilding(name.to_string()))?;
+        let (x, y) = self.cell()?;
+        let state = BuildingState::from_tag(self.u8()?).ok_or(SaveError::BadEntities)?;
+        let material = self.contents()?;
+        let stored = self.contents()?;
+        let battery = self.u64()? as i64;
+        let flags = self.u8()?;
+        let packet = self.contents()?.map(|(element, mass, temp)| Packet {
+            element,
+            mass,
+            temp,
+        });
+        let work = self.u16()?;
+        Ok(Building {
+            def,
+            x,
+            y,
+            state,
+            material,
+            stored,
+            battery,
+            enabled: flags & 1 != 0,
+            powered: flags & 2 != 0,
+            signal: flags & 4 != 0,
+            blocked: flags & 8 != 0,
+            packet,
+            work,
+        })
     }
 
     fn colonist(&mut self) -> Result<Colonist, SaveError> {
@@ -347,7 +484,7 @@ impl<'a> Reader<'a> {
                 AgentState::Fetching { item, path }
             }
             3 => AgentState::Working {
-                ticks_left: self.u8()?,
+                ticks_left: self.u16()?,
             },
             4 => AgentState::Stuck,
             _ => return Err(SaveError::BadEntities),
@@ -409,13 +546,7 @@ impl<'a> Reader<'a> {
         let mut jobs = Vec::with_capacity(n);
         for _ in 0..n {
             let id = self.u32()?;
-            let tag = self.u8()?;
-            let (x, y) = self.cell()?;
-            let kind = match tag {
-                0 => JobKind::Dig { x, y },
-                1 => JobKind::Build { x, y },
-                _ => return Err(SaveError::BadEntities),
-            };
+            let kind = self.kind()?;
             let priority = self.u8()?;
             let state = match self.u8()? {
                 0 => JobState::Open,
@@ -449,8 +580,13 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Rebuilds a simulation from [`encode`] output, against the same element table.
-pub fn decode(table: ElementTable, bytes: &[u8]) -> Result<Sim, SaveError> {
+/// Rebuilds a simulation from [`encode`] output, against the same element table and a
+/// building table that has every building the save names (indices are remapped by name).
+pub fn decode(
+    table: ElementTable,
+    building_table: BuildingTable,
+    bytes: &[u8],
+) -> Result<Sim, SaveError> {
     let mut r = Reader { bytes, pos: 0 };
     if r.take(4)? != MAGIC {
         return Err(SaveError::BadMagic);
@@ -483,7 +619,25 @@ pub fn decode(table: ElementTable, bytes: &[u8]) -> Result<Sim, SaveError> {
     let colonists = r.arena(|r| r.colonist())?;
     let items = r.arena(|r| r.item())?;
     let jobs = r.jobs()?;
+    let buildings = r.arena(|r| r.building(&building_table))?;
+    let mut injected = [0u8; 16];
+    injected.copy_from_slice(r.take(16)?);
+    let energy_injected = i128::from_le_bytes(injected);
     let expected = r.u64()?;
+    for (_, b) in buildings.iter() {
+        let size = building_table.get(b.def).size;
+        if b.x as usize + size.0 as usize > width || b.y as usize + size.1 as usize > height {
+            return Err(SaveError::BadEntities);
+        }
+        for (e, _, _) in b.material.into_iter().chain(b.stored) {
+            if !table.contains(e) {
+                return Err(SaveError::BadEntities);
+            }
+        }
+        if b.packet.is_some_and(|p| !table.contains(p.element)) {
+            return Err(SaveError::BadEntities);
+        }
+    }
     for &element in &cells.element {
         if !table.contains(ElementId(element)) {
             return Err(SaveError::TableMismatch);
@@ -504,7 +658,17 @@ pub fn decode(table: ElementTable, bytes: &[u8]) -> Result<Sim, SaveError> {
         height,
         cells,
     };
-    let sim = Sim::from_parts_with(table, world, tick, colonists, items, jobs);
+    let sim = Sim::from_parts_with(Parts {
+        table,
+        building_table,
+        world,
+        tick,
+        colonists,
+        items,
+        jobs,
+        buildings,
+        energy_injected,
+    });
     if sim.state_hash() != expected {
         return Err(SaveError::HashMismatch);
     }
@@ -523,7 +687,7 @@ mod tests {
             sim.step();
         }
         let bytes = encode(&sim);
-        let restored = decode(ElementTable::builtin(), &bytes).unwrap();
+        let restored = decode(ElementTable::builtin(), BuildingTable::builtin(), &bytes).unwrap();
         assert_eq!(restored.state_hash(), sim.state_hash());
         assert_eq!(restored.tick_count(), 50);
         assert_eq!(restored.world().cells, sim.world().cells);
@@ -536,30 +700,35 @@ mod tests {
         let mut bad = bytes.clone();
         bad[0] = b'X';
         assert_eq!(
-            decode(ElementTable::builtin(), &bad).unwrap_err(),
+            decode(ElementTable::builtin(), BuildingTable::builtin(), &bad).unwrap_err(),
             SaveError::BadMagic
         );
         let mut bad = bytes.clone();
         bad[4] = 1;
         assert_eq!(
-            decode(ElementTable::builtin(), &bad).unwrap_err(),
+            decode(ElementTable::builtin(), BuildingTable::builtin(), &bad).unwrap_err(),
             SaveError::UnsupportedVersion(1)
         );
         let mut bad = bytes.clone();
         bad[8] ^= 1;
         assert_eq!(
-            decode(ElementTable::builtin(), &bad).unwrap_err(),
+            decode(ElementTable::builtin(), BuildingTable::builtin(), &bad).unwrap_err(),
             SaveError::TableMismatch
         );
         assert_eq!(
-            decode(ElementTable::builtin(), &bytes[..bytes.len() - 3]).unwrap_err(),
+            decode(
+                ElementTable::builtin(),
+                BuildingTable::builtin(),
+                &bytes[..bytes.len() - 3]
+            )
+            .unwrap_err(),
             SaveError::Truncated
         );
         let mut bad = bytes.clone();
         let mass_start = 4 + 4 + 8 * 4 + 64 * 2;
         bad[mass_start + 4 * 20] ^= 1;
         assert_eq!(
-            decode(ElementTable::builtin(), &bad).unwrap_err(),
+            decode(ElementTable::builtin(), BuildingTable::builtin(), &bad).unwrap_err(),
             SaveError::HashMismatch
         );
     }

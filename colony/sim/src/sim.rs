@@ -8,6 +8,7 @@
 //! 3×3 neighbourhood had no relevant activity last tick is copied instead of computed.
 
 use crate::agent::{Colonist, DEFAULT_PRIORITY};
+use crate::building::{Building, BuildingTable};
 use crate::chunk::{ChunkGrid, CHUNK};
 use crate::command::{Command, LogEntry};
 use crate::element::{ElementId, ElementTable};
@@ -39,6 +40,7 @@ pub struct TickStats {
     pub path_solves: u32,
     pub jobs: JobCounts,
     pub colonists: u32,
+    pub buildings: u32,
 }
 
 impl TickStats {
@@ -52,8 +54,23 @@ impl TickStats {
             path_solves: 0,
             jobs: JobCounts::default(),
             colonists: 0,
+            buildings: 0,
         }
     }
+}
+
+/// Everything a simulation is rebuilt from (a loaded snapshot).
+pub struct Parts {
+    pub table: ElementTable,
+    pub building_table: BuildingTable,
+    pub world: World,
+    pub tick: u64,
+    pub colonists: Arena<Colonist>,
+    pub items: Arena<Item>,
+    pub jobs: JobBoard,
+    pub buildings: Arena<Building>,
+    /// Energy heaters and generators have injected so far (Q32.32 joules).
+    pub energy_injected: i128,
 }
 
 /// Which activity set a pass reads and feeds.
@@ -91,44 +108,81 @@ pub struct Sim {
     pub(crate) jobs: JobBoard,
     pub(crate) nav: NavGrid,
     last_path_solves: u32,
+    pub(crate) building_table: BuildingTable,
+    pub(crate) buildings: Arena<Building>,
+    /// Per cell, the arena slot of the building occupying it, or `NO_BUILDING`.
+    pub(crate) cell_building: Vec<u32>,
+    /// Per cell, the `nav::SPECIAL_*` bits derived from buildings.
+    pub(crate) special: Vec<u8>,
+    /// Set when buildings were placed, removed, or finished, so networks rebuild.
+    pub(crate) networks_dirty: bool,
+    pub(crate) energy_injected: i128,
 }
 
 impl Sim {
-    /// An all-vacuum world. Every chunk starts active so the first tick visits it.
+    /// An all-vacuum world with the builtin buildings. Every chunk starts active so the
+    /// first tick visits it.
     pub fn new(table: ElementTable, width: usize, height: usize) -> Sim {
-        Sim::from_parts(table, World::new(width, height), 0)
+        Sim::new_with(table, BuildingTable::builtin(), width, height)
     }
 
-    /// Wraps existing cell state (a loaded snapshot) at a given tick with no entities.
-    pub fn from_parts(table: ElementTable, world: World, tick: u64) -> Sim {
-        Sim::from_parts_with(
+    /// An all-vacuum world with the given building table.
+    pub fn new_with(
+        table: ElementTable,
+        building_table: BuildingTable,
+        width: usize,
+        height: usize,
+    ) -> Sim {
+        Sim::from_parts_with(Parts {
             table,
+            building_table,
+            world: World::new(width, height),
+            tick: 0,
+            colonists: Arena::new(),
+            items: Arena::new(),
+            jobs: JobBoard::new(),
+            buildings: Arena::new(),
+            energy_injected: 0,
+        })
+    }
+
+    /// Wraps existing cell state (a loaded snapshot) at a given tick with no entities and
+    /// the builtin buildings.
+    pub fn from_parts(table: ElementTable, world: World, tick: u64) -> Sim {
+        Sim::from_parts_with(Parts {
+            table,
+            building_table: BuildingTable::builtin(),
             world,
             tick,
-            Arena::new(),
-            Arena::new(),
-            JobBoard::new(),
-        )
+            colonists: Arena::new(),
+            items: Arena::new(),
+            jobs: JobBoard::new(),
+            buildings: Arena::new(),
+            energy_injected: 0,
+        })
     }
 
     /// Wraps existing cell and entity state at a given tick. Every chunk starts active,
-    /// which gives the same results as the activity the snapshot had.
-    pub fn from_parts_with(
-        table: ElementTable,
-        world: World,
-        tick: u64,
-        colonists: Arena<Colonist>,
-        items: Arena<Item>,
-        jobs: JobBoard,
-    ) -> Sim {
+    /// which gives the same results as the activity the snapshot had; the occupancy map,
+    /// walkability, and networks are derived from the entities.
+    pub fn from_parts_with(parts: Parts) -> Sim {
+        let Parts {
+            table,
+            building_table,
+            world,
+            tick,
+            colonists,
+            items,
+            jobs,
+            buildings,
+            energy_injected,
+        } = parts;
         let chunks = ChunkGrid::new(world.width, world.height);
         let n = chunks.len();
-        let mut nav = NavGrid::new(world.width as u32, world.height as u32);
-        nav.refresh_all(&world.cells, &table);
-        // A tick boundary never carries walkability changes, so a loaded world must not either.
-        nav.clear_changed();
-        Sim {
-            back: CellBuffers::new(world.cells.len()),
+        let cells = world.cells.len();
+        let mut sim = Sim {
+            back: CellBuffers::new(cells),
+            nav: NavGrid::new(world.width as u32, world.height as u32),
             table,
             world,
             chunks,
@@ -148,9 +202,20 @@ impl Sim {
             colonists,
             items,
             jobs,
-            nav,
             last_path_solves: 0,
-        }
+            building_table,
+            buildings,
+            cell_building: vec![crate::construct::NO_BUILDING; cells],
+            special: vec![0; cells],
+            networks_dirty: true,
+            energy_injected,
+        };
+        sim.rebuild_occupancy();
+        sim.nav
+            .refresh_all(&sim.world.cells, &sim.table, &sim.special);
+        // A tick boundary never carries walkability changes, so a loaded world must not either.
+        sim.nav.clear_changed();
+        sim
     }
 
     pub fn colonists(&self) -> &Arena<Colonist> {
@@ -169,10 +234,16 @@ impl Sim {
         &self.nav
     }
 
+    /// Mutable access for pathfinding queries, which use the grid's scratch arrays.
+    pub fn nav_mut(&mut self) -> &mut NavGrid {
+        &mut self.nav
+    }
+
     /// Recomputes walkability from the current cells (scenario builders use it before
     /// the first tick; the agents pass keeps it fresh afterwards).
     pub fn refresh_nav(&mut self) {
-        self.nav.refresh_all(&self.world.cells, &self.table);
+        self.nav
+            .refresh_all(&self.world.cells, &self.table, &self.special);
     }
 
     /// Queues a command for the start of the next tick. Commands apply in the order
@@ -249,6 +320,15 @@ impl Sim {
             Command::SetPriority { x, y, priority } => {
                 self.set_priority(x as u32, y as u32, priority);
             }
+            Command::Place { def, x, y } => {
+                self.place(def, x, y);
+            }
+            Command::Deconstruct { x, y } => {
+                self.deconstruct(x, y);
+            }
+            Command::Toggle { x, y } => {
+                self.toggle_building(x, y);
+            }
         }
     }
 
@@ -283,11 +363,38 @@ impl Sim {
     /// agent's dig or build).
     pub fn set_cell(&mut self, x: usize, y: usize, element: ElementId, mass: Mass, temp: Temp) {
         self.world.set(&self.table, x, y, element, mass, temp);
+        self.touch_chunk(x, y);
+    }
+
+    /// Marks the chunk of a cell active in both activity sets without writing the cell
+    /// (a building was placed or removed there, so walkability must be refreshed).
+    pub fn touch_chunk(&mut self, x: usize, y: usize) {
         let idx = self.chunks.index(x / CHUNK, y / CHUNK);
         self.active_mass[idx] = true;
         self.active_heat[idx] = true;
         self.tick_activity_mass[idx] = true;
         self.tick_activity_heat[idx] = true;
+    }
+
+    /// Adds `joules` (Q16.16, may be negative) to a cell's energy by raising its
+    /// temperature; `false` (and nothing injected) when the cell has no heat capacity.
+    /// The caller accounts the energy in `energy_injected`.
+    pub fn add_heat(&mut self, x: usize, y: usize, joules: i64) -> bool {
+        let (element, mass, temp) = self.world.get(x, y);
+        let cap = (mass.raw() as i64 * self.table.shc(element.0)) >> 16;
+        if cap <= 0 {
+            return false;
+        }
+        let delta = ((joules as i128) << 16) / cap as i128;
+        let new_temp =
+            (temp.raw() as i128 + delta).clamp(i32::MIN as i128, i32::MAX as i128) as i32;
+        if new_temp == temp.raw() {
+            return false;
+        }
+        self.world
+            .set(&self.table, x, y, element, mass, Temp(new_temp));
+        self.touch_chunk(x, y);
+        true
     }
 
     /// Fills the half-open rectangle `[x0, x1) × [y0, y1)`.
@@ -309,10 +416,11 @@ impl Sim {
         }
     }
 
-    /// Runs one tick: buoyancy sort (which also records pressure flags), flux, heat,
-    /// agents.
+    /// Runs one tick: commands, buildings and networks, buoyancy sort (which also
+    /// records pressure flags), flux, heat, agents.
     pub fn step(&mut self) -> TickStats {
         self.begin_tick();
+        self.pass_buildings();
         self.pass_sort();
         self.pass_flux();
         self.pass_heat();
@@ -349,6 +457,12 @@ impl Sim {
         self.tick_activity_heat.fill(false);
     }
 
+    /// Buildings and networks: their effects are edits to the front buffer before the
+    /// first gather, like commands. Sequential.
+    pub fn pass_buildings(&mut self) {
+        self.buildings_step();
+    }
+
     pub fn pass_sort(&mut self) {
         self.run_pass(PassKind::Mass, fluid::sort_cell);
     }
@@ -381,6 +495,7 @@ impl Sim {
             path_solves: self.last_path_solves,
             jobs: self.jobs.counts(),
             colonists: self.colonists.len() as u32,
+            buildings: self.buildings.len() as u32,
         };
         self.jobs.prune(self.tick);
         self.tick += 1;
@@ -433,14 +548,33 @@ impl Sim {
         &self.process_heat
     }
 
-    /// Sum of all cell and item masses in raw units. Exactly constant across ticks.
+    /// Sum of all cell, item, building, and packet masses in raw units. Exactly
+    /// constant across ticks.
     pub fn total_mass(&self) -> u64 {
         self.world.cells.mass.iter().map(|m| *m as u64).sum::<u64>()
-            + self
-                .items
-                .iter()
-                .map(|(_, it)| it.mass.raw() as u64)
-                .sum::<u64>()
+            + self.item_mass()
+            + self.building_mass()
+    }
+
+    /// Mass held by buildings: their material, their contents, and pipe packets.
+    pub fn building_mass(&self) -> u64 {
+        self.buildings
+            .iter()
+            .map(|(_, b)| {
+                b.material.map_or(0, |(_, m, _)| m.raw() as u64)
+                    + b.stored.map_or(0, |(_, m, _)| m.raw() as u64)
+                    + b.packet.map_or(0, |p| p.mass.raw() as u64)
+            })
+            .sum()
+    }
+
+    /// `(mass, element, temperature)` of everything a building holds.
+    fn building_contents(b: &Building) -> impl Iterator<Item = (u32, u16, i32)> {
+        b.material
+            .into_iter()
+            .chain(b.stored)
+            .map(|(e, m, t)| (m.raw(), e.0, t.raw()))
+            .chain(b.packet.map(|p| (p.mass.raw(), p.element.0, p.temp.raw())))
     }
 
     /// Sum of item masses in raw units (on the ground and carried).
@@ -462,7 +596,19 @@ impl Sim {
             let cap = (it.mass.raw() as i64 * self.table.shc(it.element.0)) >> 16;
             total += cap as i128 * it.temp.raw() as i128;
         }
+        for (_, b) in self.buildings.iter() {
+            for (mass, element, temp) in Sim::building_contents(b) {
+                let cap = (mass as i64 * self.table.shc(element)) >> 16;
+                total += cap as i128 * temp as i128;
+            }
+        }
         total
+    }
+
+    /// Energy heaters and generators have added so far (Q32.32 joules); the energy
+    /// ledger is `total_energy − energy_injected`.
+    pub fn energy_injected(&self) -> i128 {
+        self.energy_injected
     }
 
     /// Sum of heat capacities, the per-tick bound on energy-ledger drift (Q16.16 J/K).
@@ -476,6 +622,11 @@ impl Sim {
         }
         for (_, it) in self.items.iter() {
             total += ((it.mass.raw() as i64 * self.table.shc(it.element.0)) >> 16) as i128;
+        }
+        for (_, b) in self.buildings.iter() {
+            for (mass, element, _) in Sim::building_contents(b) {
+                total += ((mass as i64 * self.table.shc(element)) >> 16) as i128;
+            }
         }
         total
     }

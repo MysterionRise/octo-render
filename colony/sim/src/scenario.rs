@@ -8,7 +8,7 @@ use crate::rng::Pcg32;
 use crate::sim::Sim;
 
 /// Names accepted by [`by_name`].
-pub const NAMES: [&str; 8] = [
+pub const NAMES: [&str; 9] = [
     "gas-mixing",
     "settled",
     "pressure-burst",
@@ -17,6 +17,7 @@ pub const NAMES: [&str; 8] = [
     "pool",
     "cave",
     "crew",
+    "yard",
 ];
 
 /// Builds a scenario by name with seed 1; see [`by_name_seeded`].
@@ -39,6 +40,7 @@ pub fn by_name_seeded(name: &str, width: usize, height: usize, seed: u64) -> Opt
         "pool" => Some(pool(width, height)),
         "cave" => Some(cave_with_colonists(width, height, seed, 4)),
         "crew" => Some(crew(width, height, seed)),
+        "yard" => Some(yard(width, height, seed, 4)),
         _ => None,
     }
 }
@@ -249,6 +251,44 @@ pub fn hall(width: usize, height: usize, seed: u64, colonists: usize, orders: us
             crate::job::JobKind::Dig { x, y },
             crate::agent::DEFAULT_PRIORITY,
         );
+    }
+    sim
+}
+
+/// An open floor for building: a solid floor and ceiling, oxygen, one-cell boulders
+/// every six cells (walkable over, diggable for material), one four-cell tower near the
+/// right edge whose top only a ladder reaches, and `colonists` colonists spread along
+/// the floor. No orders.
+pub fn yard(width: usize, height: usize, seed: u64, colonists: usize) -> Sim {
+    let mut sim = Sim::new(ElementTable::builtin(), width, height);
+    let rock = Mass::from_kg(1800);
+    let temp = Temp::from_kelvin(295);
+    sim.fill_rect(0, 0, width, height, builtin::OXYGEN, Mass::from_kg(1), temp);
+    sim.fill_rect(0, 0, width, 2, builtin::SANDSTONE, rock, temp);
+    sim.fill_rect(0, height - 1, width, height, builtin::SANDSTONE, rock, temp);
+    sim.fill_rect(0, 0, 1, height, builtin::SANDSTONE, rock, temp);
+    sim.fill_rect(width - 1, 0, width, height, builtin::SANDSTONE, rock, temp);
+    let mut rng = Pcg32::new(seed, 13);
+    // Small worlds (tests of every scenario name) get just the floor.
+    let tower = (width >= 16 && height >= 8).then_some(width - 6);
+    let limit = tower.unwrap_or(width - 1);
+    let mut x = 4usize;
+    while x + 4 < limit {
+        sim.set_cell(x, 2, builtin::SANDSTONE, rock, temp);
+        x += 5 + rng.below(3) as usize;
+    }
+    if let Some(tower) = tower {
+        for y in 2..6.min(height - 2) {
+            sim.set_cell(tower, y, builtin::SANDSTONE, rock, temp);
+        }
+    }
+    sim.refresh_nav();
+    let spots: Vec<usize> = (1..limit)
+        .filter(|&x| sim.nav().is_standing(x as u32, 2) && !sim.nav().is_solid(x as u32, 2))
+        .collect();
+    let stride = (spots.len() / colonists.max(1)).max(1);
+    for x in spots.into_iter().step_by(stride).take(colonists) {
+        sim.spawn_colonist(x, 2);
     }
     sim
 }

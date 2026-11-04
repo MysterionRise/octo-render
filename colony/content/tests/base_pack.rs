@@ -24,6 +24,11 @@ fn base_pack_loads_and_elements_equal_builtin() {
     );
     let b = &pack.buildings;
     assert_eq!(b.len(), 17);
+    assert_eq!(
+        b,
+        &colony_sim::BuildingTable::builtin(),
+        "the base pack's buildings are the kernel's builtin table"
+    );
     assert_eq!(b.by_name("ladder"), Some(0));
     let gen = b.get(b.by_name("oxygen_generator").unwrap());
     assert_eq!(gen.size, (2, 2));

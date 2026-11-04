@@ -1,8 +1,10 @@
 //! Walkability, regions, and pathfinding for colonists.
 //!
 //! A colonist stands on a *standing* cell: a passable cell whose cell below is solid (or
-//! the world edge). Moves are sideways along standing cells, one-cell steps up (with
-//! headroom) and down, and drops of up to [`MAX_FALL`] cells. Regions are the connected
+//! the world edge), or a ladder cell. Moves are sideways along standing cells, one-cell
+//! steps up (with headroom) and down, drops of up to [`MAX_FALL`] cells, and up or down
+//! along ladders. Buildings feed in through a per-cell `special` byte: door cells are
+//! solid but passable, ladder cells are standing and climbable. Regions are the connected
 //! components of standing cells inside each 16×16 block, numbered in row-major first-visit
 //! order so that a loaded save rebuilds identical ids. Long paths run A* over the region
 //! graph and then a local A* restricted to the corridor of regions; everything is integer
@@ -27,6 +29,11 @@ pub const NO_REGION: u32 = u32::MAX;
 pub const SOLID: u8 = 1;
 pub const PASSABLE: u8 = 2;
 pub const STANDING: u8 = 4;
+pub const LADDER: u8 = 8;
+
+/// Bits of the per-cell `special` byte a [`crate::Sim`] derives from its buildings.
+pub const SPECIAL_LADDER: u8 = 1;
+pub const SPECIAL_DOOR: u8 = 2;
 
 /// Where a path should end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,12 +42,60 @@ pub enum Goal {
     Cell { x: u32, y: u32 },
     /// Stand on a 4-neighbour of this cell (to work on it).
     Adjacent { x: u32, y: u32 },
+    /// Stand on a cell 4-adjacent to (and outside) the `w × h` rectangle anchored at
+    /// its bottom-left cell (to work on a building).
+    Near { x: u32, y: u32, w: u8, h: u8 },
 }
 
 impl Goal {
     pub fn target(&self) -> (u32, u32) {
         match *self {
-            Goal::Cell { x, y } | Goal::Adjacent { x, y } => (x, y),
+            Goal::Cell { x, y } | Goal::Adjacent { x, y } | Goal::Near { x, y, .. } => (x, y),
+        }
+    }
+
+    /// Whether standing at `(x, y)` satisfies the goal.
+    pub fn reached_from(&self, x: u32, y: u32) -> bool {
+        match *self {
+            Goal::Cell { x: gx, y: gy } => x == gx && y == gy,
+            Goal::Adjacent { x: gx, y: gy } => {
+                (x == gx && y.abs_diff(gy) == 1) || (y == gy && x.abs_diff(gx) == 1)
+            }
+            Goal::Near { x: rx, y: ry, w, h } => {
+                let (x1, y1) = (rx + w as u32, ry + h as u32); // exclusive
+                let inside = x >= rx && x < x1 && y >= ry && y < y1;
+                let beside = y >= ry && y < y1 && (x + 1 == rx || x == x1);
+                let above_below = x >= rx && x < x1 && (y + 1 == ry || y == y1);
+                !inside && (beside || above_below)
+            }
+        }
+    }
+
+    /// The cells that satisfy the goal, in a fixed order (before the standing check).
+    pub fn candidate_cells(&self) -> Vec<(u32, u32)> {
+        match *self {
+            Goal::Cell { x, y } => vec![(x, y)],
+            Goal::Adjacent { x, y } => vec![
+                (x, y.wrapping_sub(1)),
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y + 1),
+            ],
+            Goal::Near { x, y, w, h } => {
+                let (w, h) = (w as u32, h as u32);
+                let mut out = Vec::with_capacity((2 * (w + h)) as usize);
+                for dx in 0..w {
+                    out.push((x + dx, y.wrapping_sub(1)));
+                }
+                for dy in 0..h {
+                    out.push((x.wrapping_sub(1), y + dy));
+                    out.push((x + w, y + dy));
+                }
+                for dx in 0..w {
+                    out.push((x + dx, y + h));
+                }
+                out
+            }
         }
     }
 }
@@ -100,13 +155,16 @@ pub struct NavGrid {
     rparent: Vec<u32>,
 }
 
+/// `(solid, passable, ladder)` of a cell from its element, mass, and special byte.
 #[inline]
-fn flags_of(table: &ElementTable, element: u16, mass: u32) -> (bool, bool) {
+fn flags_of(table: &ElementTable, element: u16, mass: u32, special: u8) -> (bool, bool, bool) {
     let phase = ElementId(element).phase();
     let solid = phase == Phase::Solid;
-    let passable = !solid && !(phase == Phase::Liquid && mass >= DEEP_LIQUID);
+    let door = special & SPECIAL_DOOR != 0;
+    let ladder = special & SPECIAL_LADDER != 0;
+    let passable = (!solid || door) && !(phase == Phase::Liquid && mass >= DEEP_LIQUID);
     let _ = table;
-    (solid, passable)
+    (solid, passable, ladder)
 }
 
 impl NavGrid {
@@ -165,6 +223,11 @@ impl NavGrid {
         self.flags[self.idx(x, y)] & STANDING != 0
     }
 
+    #[inline]
+    pub fn is_ladder(&self, x: u32, y: u32) -> bool {
+        self.flags[self.idx(x, y)] & LADDER != 0
+    }
+
     pub fn region_of(&self, x: u32, y: u32) -> u32 {
         self.region[self.idx(x, y)]
     }
@@ -197,21 +260,26 @@ impl NavGrid {
         &self.region
     }
 
-    /// Recomputes the flags of one cell from the cell buffers; returns whether it changed.
+    /// Recomputes the flags of one cell from the cell buffers and the special byte;
+    /// returns whether it changed.
     fn update_cell_flags(
         &mut self,
         cells: &CellBuffers,
         table: &ElementTable,
+        special: &[u8],
         x: u32,
         y: u32,
     ) -> bool {
         let i = self.idx(x, y);
-        let (solid, passable) = flags_of(table, cells.element[i], cells.mass[i]);
-        let below_solid = if y == 0 {
+        let (solid, passable, ladder) =
+            flags_of(table, cells.element[i], cells.mass[i], special[i]);
+        let supported = if y == 0 {
             true
         } else {
             let j = self.idx(x, y - 1);
-            flags_of(table, cells.element[j], cells.mass[j]).0
+            let (below_solid, _, below_ladder) =
+                flags_of(table, cells.element[j], cells.mass[j], special[j]);
+            below_solid || below_ladder
         };
         let mut f = 0;
         if solid {
@@ -219,7 +287,9 @@ impl NavGrid {
         }
         if passable {
             f |= PASSABLE;
-            if below_solid {
+            if ladder {
+                f |= LADDER | STANDING;
+            } else if supported {
                 f |= STANDING;
             }
         }
@@ -229,10 +299,10 @@ impl NavGrid {
     }
 
     /// Recomputes everything.
-    pub fn refresh_all(&mut self, cells: &CellBuffers, table: &ElementTable) {
+    pub fn refresh_all(&mut self, cells: &CellBuffers, table: &ElementTable, special: &[u8]) {
         for y in 0..self.h {
             for x in 0..self.w {
-                self.update_cell_flags(cells, table, x, y);
+                self.update_cell_flags(cells, table, special, x, y);
             }
         }
         for b in 0..self.block_count() as u32 {
@@ -247,7 +317,13 @@ impl NavGrid {
     /// Recomputes the flags of every processed chunk (plus the row above each, whose
     /// standing state depends on it), rebuilds the regions of blocks whose flags
     /// changed and the edges around them, and records which chunks changed.
-    pub fn refresh(&mut self, cells: &CellBuffers, table: &ElementTable, processed: &[bool]) {
+    pub fn refresh(
+        &mut self,
+        cells: &CellBuffers,
+        table: &ElementTable,
+        special: &[u8],
+        processed: &[bool],
+    ) {
         let mut dirty_blocks = vec![false; self.block_count()];
         let chunk = CHUNK as u32;
         for cy in 0..self.chunks.rows as u32 {
@@ -263,7 +339,7 @@ impl NavGrid {
                 let mut any = false;
                 for y in y0..y1 {
                     for x in x0..x1 {
-                        if self.update_cell_flags(cells, table, x, y) {
+                        if self.update_cell_flags(cells, table, special, x, y) {
                             any = true;
                             dirty_blocks[self.block_of(x, y) as usize] = true;
                         }
@@ -302,9 +378,10 @@ impl NavGrid {
         )
     }
 
-    /// Symmetric moves (sideways, step up, step down) from a standing cell, for region
-    /// labelling. Appends `(x, y)` destinations.
+    /// Symmetric moves (sideways, step up, step down, along ladders) from a standing
+    /// cell, for region labelling. Appends `(x, y)` destinations.
     fn symmetric_moves(&self, x: u32, y: u32, out: &mut Vec<(u32, u32)>) {
+        self.ladder_moves(x, y, out);
         for nx in [x.wrapping_sub(1), x + 1] {
             if nx >= self.w {
                 continue;
@@ -321,6 +398,17 @@ impl NavGrid {
         }
     }
 
+    /// Up from a ladder cell to a standing cell, and down onto a ladder cell: the two
+    /// directions of the same edge, so regions stay components of symmetric edges.
+    fn ladder_moves(&self, x: u32, y: u32, out: &mut Vec<(u32, u32)>) {
+        if self.is_ladder(x, y) && y + 1 < self.h && self.is_standing(x, y + 1) {
+            out.push((x, y + 1));
+        }
+        if y > 0 && self.is_ladder(x, y - 1) {
+            out.push((x, y - 1));
+        }
+    }
+
     /// Every move from a standing cell with its cost: the symmetric ones and drops of
     /// two to [`MAX_FALL`] cells.
     pub fn moves(&self, x: u32, y: u32, out: &mut Vec<((u32, u32), u32)>) {
@@ -328,6 +416,9 @@ impl NavGrid {
         if !self.is_standing(x, y) {
             return;
         }
+        let mut vertical = Vec::with_capacity(2);
+        self.ladder_moves(x, y, &mut vertical);
+        out.extend(vertical.into_iter().map(|c| (c, 1)));
         for nx in [x.wrapping_sub(1), x + 1] {
             if nx >= self.w {
                 continue;
@@ -566,20 +657,21 @@ impl NavGrid {
     }
 
     fn reaches(&self, goal: Goal, x: u32, y: u32) -> bool {
-        match goal {
-            Goal::Cell { x: gx, y: gy } => x == gx && y == gy,
-            Goal::Adjacent { x: gx, y: gy } => {
-                (x == gx && y.abs_diff(gy) == 1) || (y == gy && x.abs_diff(gx) == 1)
-            }
-        }
+        goal.reached_from(x, y)
     }
 
+    /// Manhattan distance to the goal cell or rectangle, minus one for goals that end
+    /// beside their target; never more than the true cost.
     fn heuristic(&self, goal: Goal, x: u32, y: u32) -> u32 {
-        let (gx, gy) = goal.target();
-        let d = x.abs_diff(gx) + y.abs_diff(gy);
         match goal {
-            Goal::Cell { .. } => d,
-            Goal::Adjacent { .. } => d.saturating_sub(1),
+            Goal::Cell { x: gx, y: gy } => x.abs_diff(gx) + y.abs_diff(gy),
+            Goal::Adjacent { x: gx, y: gy } => (x.abs_diff(gx) + y.abs_diff(gy)).saturating_sub(1),
+            Goal::Near { x: rx, y: ry, w, h } => {
+                let (x1, y1) = (rx + w as u32 - 1, ry + h as u32 - 1);
+                let dx = rx.saturating_sub(x).max(x.saturating_sub(x1));
+                let dy = ry.saturating_sub(y).max(y.saturating_sub(y1));
+                (dx + dy).saturating_sub(1)
+            }
         }
     }
 
@@ -693,29 +785,10 @@ impl NavGrid {
 
     /// Standing cells a goal can be reached from.
     pub fn goal_cells(&self, goal: Goal) -> Vec<(u32, u32)> {
-        match goal {
-            Goal::Cell { x, y } => {
-                if x < self.w && y < self.h && self.is_standing(x, y) {
-                    vec![(x, y)]
-                } else {
-                    Vec::new()
-                }
-            }
-            Goal::Adjacent { x, y } => {
-                let mut out = Vec::new();
-                for (nx, ny) in [
-                    (x, y.wrapping_sub(1)),
-                    (x.wrapping_sub(1), y),
-                    (x + 1, y),
-                    (x, y + 1),
-                ] {
-                    if nx < self.w && ny < self.h && self.is_standing(nx, ny) {
-                        out.push((nx, ny));
-                    }
-                }
-                out
-            }
-        }
+        goal.candidate_cells()
+            .into_iter()
+            .filter(|&(x, y)| x < self.w && y < self.h && self.is_standing(x, y))
+            .collect()
     }
 
     /// Sorted regions of the goal's standing cells.
@@ -827,7 +900,7 @@ mod tests {
 
     fn nav_of(sim: &Sim) -> NavGrid {
         let mut nav = NavGrid::new(sim.world().width as u32, sim.world().height as u32);
-        nav.refresh_all(&sim.world().cells, sim.table());
+        nav.refresh_all(&sim.world().cells, sim.table(), sim.special());
         nav
     }
 
@@ -884,7 +957,7 @@ mod tests {
         assert!(nav.is_standing(0, 1), "100 kg water is walkable");
         assert_eq!(nav.region_of(0, 1), 0, "first region in row-major order");
         let mut lazy = NavGrid::new(6, 4);
-        lazy.refresh_all(&sim.world().cells, sim.table());
+        lazy.refresh_all(&sim.world().cells, sim.table(), sim.special());
         assert_eq!(lazy.regions(), nav.regions());
         assert_eq!(lazy.flags(), nav.flags());
     }
@@ -964,7 +1037,12 @@ mod tests {
         let mut nav = nav_of(&sim);
         for _ in 0..30 {
             sim.step();
-            nav.refresh(&sim.world().cells, sim.table(), sim.processed_chunks());
+            nav.refresh(
+                &sim.world().cells,
+                sim.table(),
+                sim.special(),
+                sim.processed_chunks(),
+            );
         }
         sim.fill_rect(
             40,
@@ -985,7 +1063,12 @@ mod tests {
             Temp::from_kelvin(300),
         );
         sim.step();
-        nav.refresh(&sim.world().cells, sim.table(), sim.processed_chunks());
+        nav.refresh(
+            &sim.world().cells,
+            sim.table(),
+            sim.special(),
+            sim.processed_chunks(),
+        );
         let full = nav_of(&sim);
         assert_eq!(nav.flags(), full.flags());
         assert_eq!(nav.regions(), full.regions());

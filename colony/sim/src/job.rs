@@ -1,17 +1,52 @@
-//! The job board: dig and build orders, reservations, retries, and counts.
+//! The job board: dig, build, and building orders, reservations, retries, and counts.
 
 use crate::entity::EntityId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
-    Dig { x: u32, y: u32 },
-    Build { x: u32, y: u32 },
+    Dig {
+        x: u32,
+        y: u32,
+    },
+    Build {
+        x: u32,
+        y: u32,
+    },
+    /// Bring the material (if any) and build the placed building.
+    Construct {
+        building: EntityId,
+    },
+    /// Take a built building apart and drop its contents.
+    Deconstruct {
+        building: EntityId,
+    },
+    /// Bring an item the building wants (feedstock, storage).
+    Deliver {
+        building: EntityId,
+    },
+    /// Work at the building (a hand crank).
+    Operate {
+        building: EntityId,
+    },
 }
 
 impl JobKind {
-    pub fn target(&self) -> (u32, u32) {
+    /// The cell of a dig or build order.
+    pub fn cell(&self) -> Option<(u32, u32)> {
         match *self {
-            JobKind::Dig { x, y } | JobKind::Build { x, y } => (x, y),
+            JobKind::Dig { x, y } | JobKind::Build { x, y } => Some((x, y)),
+            _ => None,
+        }
+    }
+
+    /// The building of a building order.
+    pub fn building(&self) -> Option<EntityId> {
+        match *self {
+            JobKind::Construct { building }
+            | JobKind::Deconstruct { building }
+            | JobKind::Deliver { building }
+            | JobKind::Operate { building } => Some(building),
+            _ => None,
         }
     }
 
@@ -19,6 +54,10 @@ impl JobKind {
         match self {
             JobKind::Dig { .. } => 0,
             JobKind::Build { .. } => 1,
+            JobKind::Construct { .. } => 2,
+            JobKind::Deconstruct { .. } => 3,
+            JobKind::Deliver { .. } => 4,
+            JobKind::Operate { .. } => 5,
         }
     }
 }
@@ -125,21 +164,23 @@ impl JobBoard {
         self.jobs.iter_mut().find(|j| j.id == id)
     }
 
-    /// The live job at a cell, if any.
+    /// The live dig or build job at a cell, if any.
     pub fn live_at(&self, x: u32, y: u32) -> Option<&Job> {
         self.jobs
             .iter()
-            .find(|j| j.is_live() && j.kind.target() == (x, y))
+            .find(|j| j.is_live() && j.kind.cell() == Some((x, y)))
     }
 
-    /// Cancels every live job at a cell; returns how many.
-    pub fn cancel_at(&mut self, x: u32, y: u32, tick: u64) -> usize {
+    /// The live jobs of a building, in id order.
+    pub fn live_for_building(&self, building: EntityId) -> impl Iterator<Item = &Job> {
+        self.jobs
+            .iter()
+            .filter(move |j| j.is_live() && j.kind.building() == Some(building))
+    }
+
+    fn cancel_where(&mut self, tick: u64, pred: impl Fn(&Job) -> bool) -> usize {
         let mut n = 0;
-        for job in self
-            .jobs
-            .iter_mut()
-            .filter(|j| j.is_live() && j.kind.target() == (x, y))
-        {
+        for job in self.jobs.iter_mut().filter(|j| j.is_live() && pred(j)) {
             job.state = JobState::Cancelled;
             job.finished_tick = tick;
             n += 1;
@@ -151,12 +192,22 @@ impl JobBoard {
         n
     }
 
+    /// Cancels every live dig or build job at a cell; returns how many.
+    pub fn cancel_at(&mut self, x: u32, y: u32, tick: u64) -> usize {
+        self.cancel_where(tick, |j| j.kind.cell() == Some((x, y)))
+    }
+
+    /// Cancels every live job of a building; returns how many.
+    pub fn cancel_for_building(&mut self, building: EntityId, tick: u64) -> usize {
+        self.cancel_where(tick, |j| j.kind.building() == Some(building))
+    }
+
     pub fn set_priority_at(&mut self, x: u32, y: u32, priority: u8) -> bool {
         let mut changed = false;
         for job in self
             .jobs
             .iter_mut()
-            .filter(|j| j.is_live() && j.kind.target() == (x, y))
+            .filter(|j| j.is_live() && j.kind.cell() == Some((x, y)))
         {
             if job.priority != priority {
                 job.priority = priority;
@@ -279,6 +330,21 @@ mod tests {
         assert_ne!(other, id);
         assert_eq!(board.cancel_at(4, 5, 20), 1);
         assert_eq!(board.counts().cancelled, 2);
+        let b = EntityId {
+            index: 7,
+            generation: 2,
+        };
+        let construct = board.add(JobKind::Construct { building: b }, 5);
+        assert_eq!(
+            board.add(JobKind::Construct { building: b }, 5),
+            construct,
+            "one construct job per building"
+        );
+        board.add(JobKind::Deliver { building: b }, 5);
+        assert_eq!(board.live_for_building(b).count(), 2);
+        assert_eq!(board.cancel_at(7, 2, 21), 0, "building jobs have no cell");
+        assert_eq!(board.cancel_for_building(b, 21), 2);
+        assert_eq!(board.live_for_building(b).count(), 0);
     }
 
     #[test]

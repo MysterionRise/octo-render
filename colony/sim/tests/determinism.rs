@@ -1,7 +1,7 @@
 //! Kernel invariants the design document promises: exact mass conservation, bounded
 //! energy drift, bit-identical runs, parallel equals sequential, and chunk skipping.
 
-use colony_sim::{builtin, save, scenario, Command, ElementTable, Mass, Sim, Temp};
+use colony_sim::{builtin, save, scenario, BuildingTable, Command, ElementTable, Mass, Sim, Temp};
 
 fn run(sim: &mut Sim, ticks: usize) -> Vec<u64> {
     (0..ticks)
@@ -247,7 +247,8 @@ fn save_then_continue_matches_the_uninterrupted_run() {
         first_half.step();
     }
     let bytes = save::encode(&first_half);
-    let mut resumed = save::decode(ElementTable::builtin(), &bytes).unwrap();
+    let mut resumed =
+        save::decode(ElementTable::builtin(), BuildingTable::builtin(), &bytes).unwrap();
     assert_eq!(resumed.state_hash(), whole.state_hash());
     for _ in 0..60 {
         whole.step();

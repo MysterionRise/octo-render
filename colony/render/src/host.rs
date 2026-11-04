@@ -248,7 +248,11 @@ fn run(
                     generation_changed = true;
                     let _ = events.send(HostEvent::Restarted);
                 }
-                HostRequest::Load(bytes) => match save::decode(w.sim.table().clone(), &bytes) {
+                HostRequest::Load(bytes) => match save::decode(
+                    w.sim.table().clone(),
+                    w.sim.building_table().clone(),
+                    &bytes,
+                ) {
                     Ok(sim) => {
                         let tick = sim.tick_count();
                         w.replace_sim(sim);

@@ -291,6 +291,175 @@ impl BuildingTable {
     }
 }
 
+/// Indices of the [`BuildingTable::builtin`] entries.
+pub mod ids {
+    pub const LADDER: u16 = 0;
+    pub const DOOR: u16 = 1;
+    pub const STORAGE_BIN: u16 = 2;
+    pub const HEATER: u16 = 3;
+    pub const OXYGEN_GENERATOR: u16 = 4;
+    pub const HAND_CRANK: u16 = 5;
+    pub const BATTERY: u16 = 6;
+    pub const WIRE: u16 = 7;
+    pub const GAS_PUMP: u16 = 8;
+    pub const GAS_PIPE: u16 = 9;
+    pub const GAS_VENT: u16 = 10;
+    pub const TEMPERATURE_SENSOR: u16 = 11;
+    pub const PRESSURE_SENSOR: u16 = 12;
+    pub const SIGNAL_WIRE: u16 = 13;
+    pub const AND_GATE: u16 = 14;
+    pub const OR_GATE: u16 = 15;
+    pub const NOT_GATE: u16 = 16;
+}
+
+impl BuildingTable {
+    /// The buildings of the base content pack, in kernel units, for scenarios, tests,
+    /// and benches; `colony-content` pins its `base/buildings.ron` to this table.
+    pub fn builtin() -> BuildingTable {
+        use crate::element::builtin::{ICE, OXYGEN, SANDSTONE};
+        use crate::fixed::q16;
+        let cost = |kg: u32| (SANDSTONE, Mass::from_kg(kg));
+        let simple = |name: &str,
+                      size: (u8, u8),
+                      kind: BuildingKind,
+                      kg: u32,
+                      ticks: u16,
+                      colour: [u8; 3]| {
+            let (e, m) = cost(kg);
+            BuildingDef::new(name, size, kind)
+                .with_cost(e, m)
+                .with_build_ticks(ticks)
+                .with_colour(colour)
+        };
+        BuildingTable::new(vec![
+            simple(
+                "ladder",
+                (1, 1),
+                BuildingKind::Ladder,
+                50,
+                20,
+                [210, 180, 140],
+            ),
+            simple("door", (1, 2), BuildingKind::Door, 200, 30, [139, 111, 71]),
+            simple(
+                "storage_bin",
+                (2, 2),
+                BuildingKind::Storage {
+                    capacity: Mass::from_kg(2000),
+                },
+                200,
+                30,
+                [176, 160, 112],
+            ),
+            simple(
+                "heater",
+                (1, 1),
+                BuildingKind::Heater {
+                    joules_per_tick: q16(50, 0),
+                },
+                100,
+                30,
+                [255, 127, 80],
+            )
+            .with_power(q16(-6, 0)),
+            simple(
+                "oxygen_generator",
+                (2, 2),
+                BuildingKind::OxygenGenerator {
+                    feedstock: ICE,
+                    feed_per_tick: Mass::from_grams(50),
+                    output: OXYGEN,
+                    joules_per_tick: q16(25, 0),
+                },
+                400,
+                60,
+                [95, 211, 200],
+            )
+            .with_power(q16(-12, 0)),
+            simple(
+                "hand_crank",
+                (2, 2),
+                BuildingKind::HandCrank {
+                    joules_per_tick: q16(40, 0),
+                },
+                200,
+                40,
+                [201, 162, 39],
+            )
+            .with_power(q16(40, 0)),
+            simple(
+                "battery",
+                (2, 2),
+                BuildingKind::Battery {
+                    capacity: q16(40_000, 0),
+                },
+                300,
+                40,
+                [127, 191, 63],
+            ),
+            simple("wire", (1, 1), BuildingKind::Wire, 25, 10, [224, 192, 64]),
+            simple(
+                "gas_pump",
+                (1, 1),
+                BuildingKind::GasPump {
+                    per_tick: Mass::from_grams(50),
+                },
+                200,
+                40,
+                [79, 163, 240],
+            )
+            .with_power(q16(-24, 0)),
+            simple(
+                "gas_pipe",
+                (1, 1),
+                BuildingKind::Pipe,
+                25,
+                10,
+                [111, 143, 176],
+            ),
+            simple(
+                "gas_vent",
+                (1, 1),
+                BuildingKind::Vent,
+                100,
+                20,
+                [159, 192, 224],
+            ),
+            simple(
+                "temperature_sensor",
+                (1, 1),
+                BuildingKind::TemperatureSensor {
+                    above: Temp::from_kelvin(300),
+                },
+                50,
+                20,
+                [224, 80, 80],
+            ),
+            simple(
+                "pressure_sensor",
+                (1, 1),
+                BuildingKind::PressureSensor {
+                    above: Mass::from_grams(1500),
+                },
+                50,
+                20,
+                [80, 160, 224],
+            ),
+            simple(
+                "signal_wire",
+                (1, 1),
+                BuildingKind::SignalWire,
+                10,
+                10,
+                [64, 224, 128],
+            ),
+            simple("and_gate", (1, 1), BuildingKind::And, 50, 20, [48, 192, 96]),
+            simple("or_gate", (1, 1), BuildingKind::Or, 50, 20, [48, 160, 128]),
+            simple("not_gate", (1, 1), BuildingKind::Not, 50, 20, [32, 128, 96]),
+        ])
+    }
+}
+
 /// A packet travelling through pipes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Packet {
@@ -349,6 +518,8 @@ pub struct Building {
     pub packet: Option<Packet>,
     /// Could not act last tick (vent full, heater in vacuum, generator starved).
     pub blocked: bool,
+    /// Operating ticks banked by colonists (hand cranks), spent by the power step.
+    pub work: u16,
 }
 
 impl Building {
@@ -366,6 +537,7 @@ impl Building {
             signal: false,
             packet: None,
             blocked: false,
+            work: 0,
         }
     }
 
@@ -426,6 +598,35 @@ mod tests {
         let mut changed = t.defs().to_vec();
         changed[1].kind = BuildingKind::Heater { joules_per_tick: 7 };
         assert_ne!(BuildingTable::new(changed).hash(), t.hash());
+    }
+
+    #[test]
+    fn builtin_ids_name_their_entries() {
+        let t = BuildingTable::builtin();
+        assert_eq!(t.len(), 17);
+        for (i, name) in [
+            (ids::LADDER, "ladder"),
+            (ids::DOOR, "door"),
+            (ids::STORAGE_BIN, "storage_bin"),
+            (ids::HEATER, "heater"),
+            (ids::OXYGEN_GENERATOR, "oxygen_generator"),
+            (ids::HAND_CRANK, "hand_crank"),
+            (ids::BATTERY, "battery"),
+            (ids::WIRE, "wire"),
+            (ids::GAS_PUMP, "gas_pump"),
+            (ids::GAS_PIPE, "gas_pipe"),
+            (ids::GAS_VENT, "gas_vent"),
+            (ids::TEMPERATURE_SENSOR, "temperature_sensor"),
+            (ids::PRESSURE_SENSOR, "pressure_sensor"),
+            (ids::SIGNAL_WIRE, "signal_wire"),
+            (ids::AND_GATE, "and_gate"),
+            (ids::OR_GATE, "or_gate"),
+            (ids::NOT_GATE, "not_gate"),
+        ] {
+            assert_eq!(t.by_name(name), Some(i), "{name}");
+        }
+        assert!(t.get(ids::HEATER).consumes_power());
+        assert!(!t.get(ids::HAND_CRANK).consumes_power());
     }
 
     #[test]

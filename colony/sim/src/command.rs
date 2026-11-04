@@ -48,6 +48,22 @@ pub enum Command {
         y: usize,
         priority: u8,
     },
+    /// Place building `def` with its bottom-left cell at `(x, y)`; ignored if invalid.
+    Place {
+        def: u16,
+        x: usize,
+        y: usize,
+    },
+    /// Remove a planned building at the cell, or order a built one taken apart.
+    Deconstruct {
+        x: usize,
+        y: usize,
+    },
+    /// Flip the enabled switch of the building at the cell.
+    Toggle {
+        x: usize,
+        y: usize,
+    },
 }
 
 /// A command with the tick it was applied at.
@@ -64,6 +80,9 @@ const TAG_BUILD: u8 = 4;
 const TAG_CANCEL: u8 = 5;
 const TAG_SPAWN: u8 = 6;
 const TAG_PRIORITY: u8 = 7;
+const TAG_PLACE: u8 = 8;
+const TAG_DECONSTRUCT: u8 = 9;
+const TAG_TOGGLE: u8 = 10;
 
 fn put_usize(out: &mut Vec<u8>, v: usize) {
     out.extend_from_slice(&(v as u64).to_le_bytes());
@@ -133,6 +152,22 @@ pub fn encode_log(log: &[LogEntry]) -> Vec<u8> {
                 put_usize(&mut out, y);
                 out.push(priority);
             }
+            Command::Place { def, x, y } => {
+                out.push(TAG_PLACE);
+                put_usize(&mut out, def as usize);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+            }
+            Command::Deconstruct { x, y } => {
+                out.push(TAG_DECONSTRUCT);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+            }
+            Command::Toggle { x, y } => {
+                out.push(TAG_TOGGLE);
+                put_usize(&mut out, x);
+                put_usize(&mut out, y);
+            }
         }
     }
     out
@@ -187,15 +222,23 @@ pub fn decode_log(bytes: &[u8]) -> Option<Vec<LogEntry>> {
                     temp,
                 }
             }
-            TAG_DIG | TAG_BUILD | TAG_CANCEL | TAG_SPAWN => {
+            TAG_DIG | TAG_BUILD | TAG_CANCEL | TAG_SPAWN | TAG_DECONSTRUCT | TAG_TOGGLE => {
                 let x = usize_field()?;
                 let y = usize_field()?;
                 match tag {
                     TAG_DIG => Command::Dig { x, y },
                     TAG_BUILD => Command::Build { x, y },
                     TAG_CANCEL => Command::CancelOrders { x, y },
-                    _ => Command::SpawnColonist { x, y },
+                    TAG_SPAWN => Command::SpawnColonist { x, y },
+                    TAG_DECONSTRUCT => Command::Deconstruct { x, y },
+                    _ => Command::Toggle { x, y },
                 }
+            }
+            TAG_PLACE => {
+                let def = u16::try_from(usize_field()?).ok()?;
+                let x = usize_field()?;
+                let y = usize_field()?;
+                Command::Place { def, x, y }
             }
             TAG_PRIORITY => {
                 let x = usize_field()?;
@@ -255,6 +298,18 @@ mod tests {
                 LogEntry {
                     tick: 12,
                     command: Command::CancelOrders { x: 5, y: 6 },
+                },
+                LogEntry {
+                    tick: 20,
+                    command: Command::Place { def: 4, x: 8, y: 9 },
+                },
+                LogEntry {
+                    tick: 21,
+                    command: Command::Deconstruct { x: 8, y: 9 },
+                },
+                LogEntry {
+                    tick: 22,
+                    command: Command::Toggle { x: 8, y: 10 },
                 },
                 LogEntry {
                     tick: 13,

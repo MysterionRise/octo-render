@@ -174,7 +174,7 @@ pub fn elements_from_specs(specs: &[ElementSpec]) -> Result<ElementTable, Conten
         let thresholds = s.freeze_k.is_some() || s.boil_k.is_some();
         if links || thresholds {
             if let (Some(f), Some(b)) = (s.freeze_k, s.boil_k) {
-                if !(f < b) {
+                if f >= b {
                     return Err(ContentError::Invalid(format!(
                         "{subject}: freeze_k must be below boil_k"
                     )));

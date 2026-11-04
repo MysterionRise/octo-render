@@ -2,7 +2,8 @@
 //! the agents pass that runs after the heat pass. Every edit a colonist makes to a cell
 //! goes through `Sim::set_cell`, exactly like a command, so the gather passes see it next
 //! tick and the conservation and determinism arguments are unchanged. Every gram a dig
-//! removes becomes a debris item; every build consumes one.
+//! removes becomes a debris item; every build consumes one; buildings take their cost
+//! from a carried item and give it back on deconstruction.
 
 use crate::element::ElementId;
 use crate::entity::EntityId;
@@ -15,8 +16,11 @@ use crate::sim::Sim;
 
 /// Ticks one move between cells takes (5 cells per second at 10 Hz).
 pub const MOVE_TICKS: u8 = 2;
-pub const DIG_TICKS: u8 = 20;
-pub const BUILD_TICKS: u8 = 20;
+pub const DIG_TICKS: u16 = 20;
+pub const BUILD_TICKS: u16 = 20;
+pub const DELIVER_TICKS: u16 = 10;
+/// One stint at a hand crank; the building banks the ticks for its power step.
+pub const OPERATE_TICKS: u16 = 10;
 /// Path solves (assignment scans and route planning) per tick, shared by all colonists.
 pub const PATH_BUDGET: u32 = 16;
 /// At most this many of the budget go to job-assignment scans, so walkers always get
@@ -35,7 +39,7 @@ pub enum AgentState {
     Idle,
     Walking { goal: Goal, path: Option<Path> },
     Fetching { item: EntityId, path: Option<Path> },
-    Working { ticks_left: u8 },
+    Working { ticks_left: u16 },
     Stuck,
 }
 
@@ -78,10 +82,6 @@ impl Colonist {
     }
 }
 
-fn adjacent(a: (u32, u32), b: (u32, u32)) -> bool {
-    (a.0 == b.0 && a.1.abs_diff(b.1) == 1) || (a.1 == b.1 && a.0.abs_diff(b.0) == 1)
-}
-
 impl Sim {
     /// Adds a colonist on a non-solid, non-deep-liquid cell; gravity settles it.
     pub fn spawn_colonist(&mut self, x: usize, y: usize) -> Option<EntityId> {
@@ -99,17 +99,24 @@ impl Sim {
     }
 
     /// Adds a dig or build order; a dig needs a solid target and a build a non-solid one,
-    /// otherwise the order is ignored and `NO_JOB` returned.
+    /// neither may touch a building's cell, otherwise the order is ignored and `NO_JOB`
+    /// returned. Building orders come from placement, not from here.
     pub fn order(&mut self, kind: JobKind, priority: u8) -> u32 {
-        let (x, y) = kind.target();
+        let Some((x, y)) = kind.cell() else {
+            return NO_JOB;
+        };
         if x as usize >= self.world.width || y as usize >= self.world.height {
             return NO_JOB;
         }
-        let solid =
-            self.world.get(x as usize, y as usize).0.phase() == crate::element::Phase::Solid;
+        let i = self.world.index(x as usize, y as usize);
+        if self.cell_building[i] != crate::construct::NO_BUILDING {
+            return NO_JOB;
+        }
+        let solid = ElementId(self.world.cells.element[i]).phase() == crate::element::Phase::Solid;
         let valid = match kind {
             JobKind::Dig { .. } => solid,
             JobKind::Build { .. } => !solid,
+            _ => false,
         };
         if !valid {
             return NO_JOB;
@@ -125,6 +132,34 @@ impl Sim {
         self.jobs.set_priority_at(x, y, priority)
     }
 
+    /// Where a colonist stands to work on a job.
+    pub(crate) fn job_goal(&self, kind: JobKind) -> Option<Goal> {
+        match kind {
+            JobKind::Dig { x, y } | JobKind::Build { x, y } => Some(Goal::Adjacent { x, y }),
+            _ => {
+                let (x, y, w, h) = self.building_rect(kind.building()?)?;
+                Some(Goal::Near { x, y, w, h })
+            }
+        }
+    }
+
+    /// Ticks of work a job takes once the colonist is in place.
+    fn work_ticks(&self, kind: JobKind) -> u16 {
+        match kind {
+            JobKind::Dig { .. } => DIG_TICKS,
+            JobKind::Build { .. } => BUILD_TICKS,
+            JobKind::Construct { building } => self
+                .buildings
+                .get(building)
+                .map_or(1, |b| self.building_table.get(b.def).build_ticks.max(1)),
+            JobKind::Deconstruct { building } => self.buildings.get(building).map_or(1, |b| {
+                (self.building_table.get(b.def).build_ticks / 2).max(1)
+            }),
+            JobKind::Deliver { .. } => DELIVER_TICKS,
+            JobKind::Operate { .. } => OPERATE_TICKS,
+        }
+    }
+
     fn job_valid(&self, job_id: u32) -> bool {
         let Some(job) = self.jobs.get(job_id) else {
             return false;
@@ -132,17 +167,33 @@ impl Sim {
         if !matches!(job.state, JobState::Reserved(_)) {
             return false;
         }
-        let (x, y) = job.kind.target();
-        let solid = self.nav.is_solid(x, y);
         match job.kind {
-            JobKind::Dig { .. } => solid,
-            JobKind::Build { .. } => !solid,
+            JobKind::Dig { x, y } => self.nav.is_solid(x, y),
+            JobKind::Build { x, y } => !self.nav.is_solid(x, y),
+            JobKind::Construct { building } => {
+                self.buildings.get(building).is_some_and(|b| !b.is_built())
+            }
+            JobKind::Deconstruct { building } => {
+                self.buildings.get(building).is_some_and(|b| b.is_built())
+            }
+            JobKind::Deliver { building } => self.delivery_wanted(building).is_some(),
+            JobKind::Operate { building } => self
+                .buildings
+                .get(building)
+                .is_some_and(|b| b.is_built() && b.enabled && b.work < 2 * OPERATE_TICKS),
         }
     }
 
     /// Gives the colonist's job back and drops what it carries.
     fn release(&mut self, c: &mut Colonist) {
         if c.job != NO_JOB {
+            if let Some(JobKind::Construct { building }) = self.jobs.get(c.job).map(|j| j.kind) {
+                if let Some(b) = self.buildings.get_mut(building) {
+                    if b.state == crate::building::BuildingState::UnderConstruction {
+                        b.state = crate::building::BuildingState::Planned;
+                    }
+                }
+            }
             self.jobs.release(c.job, self.tick);
         }
         if let AgentState::Fetching { item, .. } = c.state {
@@ -172,7 +223,7 @@ impl Sim {
                 continue;
             }
             let (x, mut y) = (it.x, it.y);
-            while y > 0 && !self.nav.is_solid(x, y - 1) {
+            while y > 0 && !self.nav.is_solid(x, y - 1) && !self.nav.is_ladder(x, y) {
                 y -= 1;
             }
             if y != it.y {
@@ -183,7 +234,7 @@ impl Sim {
 
     fn gravity(&mut self, c: &mut Colonist) {
         let (x, y) = c.cell;
-        if self.nav.is_solid(x, y) {
+        if self.nav.is_solid(x, y) && !self.nav.is_passable(x, y) {
             self.release(c);
             c.state = AgentState::Stuck;
             return;
@@ -203,12 +254,10 @@ impl Sim {
                         *path = None
                     }
                     AgentState::Working { .. } => {
-                        if let Some(job) = self.jobs.get(c.job) {
-                            let (tx, ty) = job.kind.target();
-                            c.state = AgentState::Walking {
-                                goal: Goal::Adjacent { x: tx, y: ty },
-                                path: None,
-                            };
+                        let goal = self.jobs.get(c.job).and_then(|j| self.job_goal(j.kind));
+                        match goal {
+                            Some(goal) => c.state = AgentState::Walking { goal, path: None },
+                            None => self.release(c),
                         }
                     }
                     _ => {}
@@ -222,6 +271,31 @@ impl Sim {
         }
         self.release(c);
         c.state = AgentState::Stuck;
+    }
+
+    /// The nearest unreserved ground item of `wanted` (any element when `None`) with at
+    /// least `min_mass`, by region distance from the last Dijkstra.
+    fn nearest_item(&self, wanted: Option<ElementId>, min_mass: Mass) -> Option<(u32, EntityId)> {
+        let mut nearest: Option<(u32, EntityId)> = None;
+        for (iid, it) in self.items.iter() {
+            if !it.on_ground()
+                || it.reserved_by.is_some()
+                || it.mass < min_mass
+                || wanted.is_some_and(|e| e != it.element)
+            {
+                continue;
+            }
+            let r = self.nav.region_of(it.x, it.y);
+            if r == NO_REGION {
+                continue;
+            }
+            if let Some(d) = self.nav.region_dist(r) {
+                if nearest.is_none_or(|(bd, _)| d < bd) {
+                    nearest = Some((d, iid));
+                }
+            }
+        }
+        nearest
     }
 
     /// Picks the best open job for an idle colonist; costs one budget unit.
@@ -244,8 +318,9 @@ impl Sim {
         self.nav.dijkstra_regions(start, ASSIGN_CAP);
         let mut best: Option<(u32, u32, Option<EntityId>)> = None; // (score, job id, item)
         for job in self.jobs.open_jobs() {
-            let (tx, ty) = job.kind.target();
-            let goal = Goal::Adjacent { x: tx, y: ty };
+            let Some(goal) = self.job_goal(job.kind) else {
+                continue;
+            };
             let target_dist = self
                 .nav
                 .goal_regions(goal)
@@ -255,25 +330,23 @@ impl Sim {
             let Some(target_dist) = target_dist else {
                 continue;
             };
-            let (dist, item) = match job.kind {
-                JobKind::Dig { .. } => (target_dist, None),
-                JobKind::Build { .. } => {
-                    let mut nearest: Option<(u32, EntityId)> = None;
-                    for (iid, it) in self.items.iter() {
-                        if !it.on_ground() || it.reserved_by.is_some() {
-                            continue;
-                        }
-                        let r = self.nav.region_of(it.x, it.y);
-                        if r == NO_REGION {
-                            continue;
-                        }
-                        if let Some(d) = self.nav.region_dist(r) {
-                            if nearest.is_none_or(|(bd, _)| d < bd) {
-                                nearest = Some((d, iid));
-                            }
-                        }
-                    }
-                    let Some((d, iid)) = nearest else {
+            let wanted = match job.kind {
+                JobKind::Dig { .. } | JobKind::Deconstruct { .. } | JobKind::Operate { .. } => None,
+                JobKind::Build { .. } => Some((None, Mass(1))),
+                JobKind::Construct { building } => self
+                    .buildings
+                    .get(building)
+                    .and_then(|b| self.building_table.get(b.def).cost)
+                    .map(|(e, m)| (Some(e), m)),
+                JobKind::Deliver { building } => match self.delivery_wanted(building) {
+                    Some((e, _)) => Some((e, Mass(1))),
+                    None => continue,
+                },
+            };
+            let (dist, item) = match wanted {
+                None => (target_dist, None),
+                Some((element, min_mass)) => {
+                    let Some((d, iid)) = self.nearest_item(element, min_mass) else {
                         continue;
                     };
                     (d + target_dist, Some(iid))
@@ -291,7 +364,9 @@ impl Sim {
             return;
         }
         c.job = job_id;
-        let (tx, ty) = self.jobs.get(job_id).unwrap().kind.target();
+        let goal = self
+            .job_goal(self.jobs.get(job_id).unwrap().kind)
+            .expect("scored jobs have goals");
         match item {
             Some(iid) => {
                 self.items.get_mut(iid).unwrap().reserved_by = id;
@@ -301,10 +376,7 @@ impl Sim {
                 };
             }
             None => {
-                c.state = AgentState::Walking {
-                    goal: Goal::Adjacent { x: tx, y: ty },
-                    path: None,
-                };
+                c.state = AgentState::Walking { goal, path: None };
             }
         }
     }
@@ -369,23 +441,24 @@ impl Sim {
         match next {
             None => {
                 // Arrived.
+                let kind = self.jobs.get(c.job).unwrap().kind;
                 match c.state.clone() {
                     AgentState::Fetching { item, .. } => {
                         let it = self.items.get_mut(item).unwrap();
                         it.holder = id;
                         c.carrying = item;
-                        let (tx, ty) = self.jobs.get(c.job).unwrap().kind.target();
-                        c.state = AgentState::Walking {
-                            goal: Goal::Adjacent { x: tx, y: ty },
-                            path: None,
-                        };
+                        let goal = self.job_goal(kind).expect("a reserved job has a goal");
+                        c.state = AgentState::Walking { goal, path: None };
                     }
                     AgentState::Walking { .. } => {
-                        let ticks = match self.jobs.get(c.job).unwrap().kind {
-                            JobKind::Dig { .. } => DIG_TICKS,
-                            JobKind::Build { .. } => BUILD_TICKS,
+                        if let JobKind::Construct { building } = kind {
+                            if let Some(b) = self.buildings.get_mut(building) {
+                                b.state = crate::building::BuildingState::UnderConstruction;
+                            }
+                        }
+                        c.state = AgentState::Working {
+                            ticks_left: self.work_ticks(kind),
                         };
-                        c.state = AgentState::Working { ticks_left: ticks };
                     }
                     _ => {}
                 }
@@ -404,18 +477,75 @@ impl Sim {
         }
     }
 
-    fn work(&mut self, id: EntityId, c: &mut Colonist) {
+    /// Moves the fluid in `cell` into a neighbouring passable cell holding the same
+    /// element or vacuum (the colonist's own cell first, then down, left, right, up),
+    /// never into `avoid`; `false` when nothing can take it.
+    pub(crate) fn displace_fluid(
+        &mut self,
+        cell: (u32, u32),
+        avoid: &[(u32, u32)],
+        prefer: (u32, u32),
+    ) -> bool {
+        let (tx, ty) = cell;
+        let (fluid, fmass, ftemp) = self.world.get(tx as usize, ty as usize);
+        if fmass.raw() == 0 {
+            return true;
+        }
+        let candidates = [
+            prefer,
+            (tx, ty.wrapping_sub(1)),
+            (tx.wrapping_sub(1), ty),
+            (tx + 1, ty),
+            (tx, ty + 1),
+        ];
+        let (w, h) = (self.world.width as u32, self.world.height as u32);
+        let receiver = candidates.into_iter().find(|&(x, y)| {
+            x < w && y < h && !avoid.contains(&(x, y)) && self.nav.is_passable(x, y) && {
+                let (el, _, _) = self.world.get(x as usize, y as usize);
+                el == fluid || el == ElementId::VACUUM
+            }
+        });
+        let Some((rx, ry)) = receiver else {
+            return false;
+        };
+        let (_, rmass, rtemp) = self.world.get(rx as usize, ry as usize);
+        let total = rmass.raw() as u64 + fmass.raw() as u64;
+        assert!(total <= u32::MAX as u64, "fluid displacement overflow");
+        let temp = mix_temp(
+            rmass.raw() as u64,
+            rtemp.raw(),
+            fmass.raw() as u64,
+            fmass.raw() as i128 * ftemp.raw() as i128,
+        );
+        self.set_cell(
+            rx as usize,
+            ry as usize,
+            fluid,
+            Mass(total as u32),
+            Temp(temp),
+        );
+        self.set_cell(
+            tx as usize,
+            ty as usize,
+            ElementId::VACUUM,
+            Mass::ZERO,
+            Temp::ZERO,
+        );
+        true
+    }
+
+    fn work(&mut self, c: &mut Colonist) {
         if !self.job_valid(c.job) {
             self.release(c);
             return;
         }
         let job = *self.jobs.get(c.job).unwrap();
-        let (tx, ty) = job.kind.target();
-        if !adjacent(c.cell, (tx, ty)) {
-            c.state = AgentState::Walking {
-                goal: Goal::Adjacent { x: tx, y: ty },
-                path: None,
-            };
+        let Some(goal) = self.job_goal(job.kind) else {
+            self.release(c);
+            return;
+        };
+        if !goal.reached_from(c.cell.0, c.cell.1) {
+            c.state = AgentState::Walking { goal, path: None };
             return;
         }
         let AgentState::Working { ticks_left } = &mut c.state else {
@@ -425,8 +555,8 @@ impl Sim {
         if *ticks_left > 0 {
             return;
         }
-        match job.kind {
-            JobKind::Dig { .. } => {
+        let done = match job.kind {
+            JobKind::Dig { x: tx, y: ty } => {
                 let (element, mass, temp) = self.world.get(tx as usize, ty as usize);
                 self.items.insert(Item {
                     x: tx,
@@ -444,8 +574,9 @@ impl Sim {
                     Mass::ZERO,
                     Temp::ZERO,
                 );
+                true
             }
-            JobKind::Build { .. } => {
+            JobKind::Build { x: tx, y: ty } => {
                 let Some(item) = self.items.get(c.carrying).copied() else {
                     self.release(c);
                     return;
@@ -456,56 +587,33 @@ impl Sim {
                     .items
                     .iter()
                     .any(|(_, it)| it.on_ground() && (it.x, it.y) == (tx, ty));
-                if occupied {
+                if occupied || !self.displace_fluid((tx, ty), &[(tx, ty)], c.cell) {
                     self.release(c);
                     return;
-                }
-                let (fluid, fmass, ftemp) = self.world.get(tx as usize, ty as usize);
-                if fmass.raw() > 0 {
-                    let candidates = [
-                        c.cell,
-                        (tx, ty.wrapping_sub(1)),
-                        (tx.wrapping_sub(1), ty),
-                        (tx + 1, ty),
-                        (tx, ty + 1),
-                    ];
-                    let (w, h) = (self.world.width as u32, self.world.height as u32);
-                    let receiver = candidates.into_iter().find(|&(x, y)| {
-                        x < w && y < h && (x, y) != (tx, ty) && self.nav.is_passable(x, y) && {
-                            let (el, _, _) = self.world.get(x as usize, y as usize);
-                            el == fluid || el == ElementId::VACUUM
-                        }
-                    });
-                    let Some((rx, ry)) = receiver else {
-                        self.release(c);
-                        return;
-                    };
-                    let (_, rmass, rtemp) = self.world.get(rx as usize, ry as usize);
-                    let total = rmass.raw() as u64 + fmass.raw() as u64;
-                    assert!(total <= u32::MAX as u64, "fluid displacement overflow");
-                    let temp = mix_temp(
-                        rmass.raw() as u64,
-                        rtemp.raw(),
-                        fmass.raw() as u64,
-                        fmass.raw() as i128 * ftemp.raw() as i128,
-                    );
-                    self.set_cell(
-                        rx as usize,
-                        ry as usize,
-                        fluid,
-                        Mass(total as u32),
-                        Temp(temp),
-                    );
                 }
                 self.set_cell(tx as usize, ty as usize, item.element, item.mass, item.temp);
                 self.items.remove(c.carrying);
                 c.carrying = EntityId::NONE;
+                true
             }
+            JobKind::Construct { building } => self.complete_construct(c, building),
+            JobKind::Deconstruct { building } => self.complete_deconstruct(c, building),
+            JobKind::Deliver { building } => self.complete_deliver(c, building),
+            JobKind::Operate { building } => match self.buildings.get_mut(building) {
+                Some(b) => {
+                    b.work = b.work.saturating_add(OPERATE_TICKS);
+                    true
+                }
+                None => false,
+            },
+        };
+        if !done {
+            self.release(c);
+            return;
         }
         self.jobs.complete(c.job, self.tick);
         c.job = NO_JOB;
         c.state = AgentState::Idle;
-        let _ = id;
     }
 
     fn agent_tick(
@@ -528,14 +636,9 @@ impl Sim {
             }
             AgentState::Idle => {
                 if c.job != NO_JOB {
-                    if let Some(job) = self.jobs.get(c.job) {
-                        let (tx, ty) = job.kind.target();
-                        c.state = AgentState::Walking {
-                            goal: Goal::Adjacent { x: tx, y: ty },
-                            path: None,
-                        };
-                    } else {
-                        c.job = NO_JOB;
+                    match self.jobs.get(c.job).and_then(|j| self.job_goal(j.kind)) {
+                        Some(goal) => c.state = AgentState::Walking { goal, path: None },
+                        None => self.release(&mut c),
                     }
                 } else {
                     let due = (self.tick + id.index as u64).is_multiple_of(RESCAN_PERIOD);
@@ -553,7 +656,7 @@ impl Sim {
             AgentState::Walking { .. } | AgentState::Fetching { .. } => {
                 self.walk(id, &mut c, budget, solves)
             }
-            AgentState::Working { .. } => self.work(id, &mut c),
+            AgentState::Working { .. } => self.work(&mut c),
         }
         if let Some(slot) = self.colonists.get_mut(id) {
             *slot = c;
@@ -564,8 +667,12 @@ impl Sim {
     /// items, then run every colonist in a rotating index order under a shared path
     /// budget. Returns the number of path solves.
     pub(crate) fn agents_step(&mut self) -> u32 {
-        self.nav
-            .refresh(&self.world.cells, &self.table, &self.process_heat);
+        self.nav.refresh(
+            &self.world.cells,
+            &self.table,
+            &self.special,
+            &self.process_heat,
+        );
         self.settle_items();
         let nav_changed = self.nav.changed_chunks().iter().any(|c| *c);
         let ids = self.colonists.ids();

@@ -2,6 +2,7 @@
 //! budgets, replay, and saves with entities.
 
 use colony_sim::agent::{AgentState, DEFAULT_PRIORITY, PATH_BUDGET};
+use colony_sim::BuildingTable;
 use colony_sim::{
     builtin, save, scenario, Command, ElementTable, JobKind, JobState, Mass, Sim, Temp,
 };
@@ -385,7 +386,8 @@ fn save_format_2_round_trips_entities_and_continues_identically() {
     run(&mut whole, 80);
     run(&mut half, 80);
     let bytes = save::encode(&half);
-    let mut resumed = save::decode(ElementTable::builtin(), &bytes).unwrap();
+    let mut resumed =
+        save::decode(ElementTable::builtin(), BuildingTable::builtin(), &bytes).unwrap();
     assert_eq!(resumed.state_hash(), whole.state_hash());
     assert_eq!(resumed.colonists(), whole.colonists());
     assert_eq!(resumed.items(), whole.items());
