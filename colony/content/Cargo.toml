@@ -1,0 +1,10 @@
+[package]
+name = "colony-content"
+version = "0.1.0"
+edition = "2021"
+description = "Content packs for the colony engine: RON elements and buildings in human units, validated and converted to the kernel's fixed-point tables"
+
+[dependencies]
+colony-sim = { path = "../sim", default-features = false }
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"

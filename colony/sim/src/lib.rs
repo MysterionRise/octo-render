@@ -17,6 +17,7 @@
 //! exactly conserving by construction.
 
 pub mod agent;
+pub mod building;
 pub mod chunk;
 pub mod command;
 pub mod element;
@@ -36,6 +37,7 @@ pub mod world;
 pub mod worldgen;
 
 pub use agent::{AgentState, Colonist};
+pub use building::{Building, BuildingDef, BuildingKind, BuildingState, BuildingTable, Packet};
 pub use command::{Command, LogEntry};
 pub use element::{builtin, ElementDef, ElementId, ElementTable, Phase};
 pub use entity::{Arena, EntityId};

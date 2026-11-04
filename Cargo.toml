@@ -8,6 +8,7 @@ members = [
     "crates/renderer",
     "crates/app",
     "colony/sim",
+    "colony/content",
     "colony/headless",
     "colony/render",
     "colony/game",
