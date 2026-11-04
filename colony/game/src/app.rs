@@ -1,15 +1,18 @@
-//! The window: winit event loop, input, the frame loop (snapshot, upload, draw, egui).
+//! The window: winit event loop, input, the frame loop (snapshot, upload, sprites,
+//! draw, egui), and the content watcher that hot-reloads `buildings.ron`.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use colony_render::host::STEP_PERIOD;
 use colony_render::palette::Luts;
 use colony_render::{
-    sprite_instances, CellRenderer, HostEvent, HostRequest, PixelCamera, SimHost, Snapshot, TILE_PX,
+    sprite_instances, CellRenderer, HostEvent, HostRequest, PixelCamera, SimHost, Snapshot,
+    SpriteInstance, TILE_PX,
 };
-use colony_sim::scenario;
+use colony_sim::{scenario, BuildingTable};
 use octo_gpu::{GpuContext, GpuContextOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -20,10 +23,15 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::input::{self, command_for, drags, Action, Held, Tool};
 use crate::ui::{self, UiAction, UiState};
-use crate::Options;
+use crate::{apply_content, Options};
 
 /// World pixels per second of keyboard panning at zoom 1.
 const PAN_SPEED: f32 = 480.0;
+/// How often the content directory is checked for a changed `buildings.ron`.
+const CONTENT_POLL: Duration = Duration::from_secs(1);
+/// Placement preview colours.
+const PREVIEW_OK: [u8; 3] = [90, 255, 130];
+const PREVIEW_BAD: [u8; 3] = [255, 90, 90];
 
 pub fn run(opts: Options) -> ExitCode {
     let event_loop = match EventLoop::new() {
@@ -53,6 +61,15 @@ struct Gfx {
     egui_renderer: egui_wgpu::Renderer,
 }
 
+/// The content directory being watched and the last `buildings.ron` time seen.
+struct ContentWatch {
+    dir: PathBuf,
+    modified: Option<SystemTime>,
+    last_poll: Instant,
+    /// A table sent to the host whose answer is still pending.
+    pending: Option<BuildingTable>,
+}
+
 struct App {
     opts: Options,
     window: Option<Arc<Window>>,
@@ -67,12 +84,25 @@ struct App {
     cursor: Option<(u32, u32)>,
     left_down: bool,
     right_down: bool,
+    /// The cell the held tool last acted on, so a drag acts once per cell.
+    last_tool_cell: Option<(usize, usize)>,
     last_frame: Instant,
     pan_accum: (f32, f32),
+    content: Option<ContentWatch>,
 }
 
 impl App {
     fn new(opts: Options) -> App {
+        let content = opts
+            .content
+            .clone()
+            .or_else(colony_content::base_dir)
+            .map(|dir| ContentWatch {
+                modified: buildings_mtime(&dir),
+                dir,
+                last_poll: Instant::now(),
+                pending: None,
+            });
         let ui = UiState {
             paused: false,
             speed: opts.speed,
@@ -80,6 +110,9 @@ impl App {
             seed: opts.seed,
             overlay: opts.overlay,
             tool: Tool::default(),
+            selected_def: 0,
+            building_table: BuildingTable::builtin(),
+            watching_content: content.is_some(),
             status: String::new(),
             fps: 0.0,
             frame_ms: 0.0,
@@ -97,8 +130,10 @@ impl App {
             cursor: None,
             left_down: false,
             right_down: false,
+            last_tool_cell: None,
             last_frame: Instant::now(),
             pan_accum: (0.0, 0.0),
+            content,
         }
     }
 
@@ -114,12 +149,21 @@ impl App {
         let Some((x, y)) = gfx.camera.screen_to_cell(cursor) else {
             return;
         };
+        if self.last_tool_cell == Some((x, y)) {
+            return;
+        }
+        self.last_tool_cell = Some((x, y));
         let tool = match button {
             MouseButton::Left => self.ui.tool,
             MouseButton::Right => Tool::Pour,
             _ => return,
         };
-        host.send(HostRequest::Command(command_for(tool, x, y)));
+        host.send(HostRequest::Command(command_for(
+            tool,
+            x,
+            y,
+            self.ui.selected_def,
+        )));
     }
 
     /// How far into the current step period the sim thread is, in 1/256ths, for
@@ -140,11 +184,76 @@ impl App {
         ((elapsed / period.max(1e-3)).clamp(0.0, 1.0) * 256.0) as u32
     }
 
-    fn apply_ui_actions(&mut self, actions: Vec<UiAction>) {
-        let Some(host) = &self.host else {
+    /// The footprint of the selected building under the cursor, green when it can be
+    /// placed there as far as the snapshot shows.
+    fn placement_preview(&self) -> Option<SpriteInstance> {
+        if self.ui.tool != Tool::Place {
+            return None;
+        }
+        let (gfx, snapshot, cursor) = (self.gfx.as_ref()?, self.latest.as_ref()?, self.cursor?);
+        let (x, y) = gfx.camera.screen_to_cell(cursor)?;
+        if !self.ui.building_table.contains(self.ui.selected_def) {
+            return None;
+        }
+        let def = self.ui.building_table.get(self.ui.selected_def);
+        let ok = snapshot.placement_valid(def, x as u32, y as u32);
+        let t = TILE_PX as i32;
+        Some(SpriteInstance::new(
+            (x as i32 * t, y as i32 * t),
+            (def.size.0 as u32 * TILE_PX, def.size.1 as u32 * TILE_PX),
+            if ok { PREVIEW_OK } else { PREVIEW_BAD },
+            colony_render::sprites::LAYER_BADGE,
+        ))
+    }
+
+    /// Reads `buildings.ron` from the watched directory and asks the host to install it.
+    fn reload_buildings(&mut self) {
+        let (Some(watch), Some(host)) = (&mut self.content, &self.host) else {
+            self.ui.status = "no content directory to reload from".to_string();
             return;
         };
+        let path = watch.dir.join("buildings.ron");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.ui.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        match colony_content::parse_buildings(&text, host.table()).and_then(|table| {
+            colony_content::reload_compatible(&self.ui.building_table, &table).map(|_| table)
+        }) {
+            Ok(table) => {
+                watch.pending = Some(table.clone());
+                host.send(HostRequest::ReloadBuildings(table));
+                self.ui.status = "reloading buildings.ron".to_string();
+            }
+            Err(e) => self.ui.status = format!("buildings.ron: {e}"),
+        }
+    }
+
+    /// Once a second, checks whether `buildings.ron` changed on disk.
+    fn poll_content(&mut self, now: Instant) {
+        let changed = match &mut self.content {
+            Some(watch) if now.duration_since(watch.last_poll) >= CONTENT_POLL => {
+                watch.last_poll = now;
+                let modified = buildings_mtime(&watch.dir);
+                let changed = modified.is_some() && modified != watch.modified;
+                watch.modified = modified;
+                changed
+            }
+            _ => false,
+        };
+        if changed {
+            self.reload_buildings();
+        }
+    }
+
+    fn apply_ui_actions(&mut self, actions: Vec<UiAction>) {
         for action in actions {
+            let Some(host) = &self.host else {
+                return;
+            };
             match action {
                 UiAction::SetPaused(p) => {
                     self.ui.paused = p;
@@ -162,7 +271,11 @@ impl App {
                         h as usize,
                         self.ui.seed,
                     ) {
-                        Some(sim) => {
+                        Some(mut sim) => {
+                            if let Err(e) = sim.set_building_table(self.ui.building_table.clone()) {
+                                self.ui.status = e;
+                                continue;
+                            }
                             host.send(HostRequest::Restart(Box::new(sim)));
                             self.ui.status = format!(
                                 "restarted {} with seed {}",
@@ -177,7 +290,35 @@ impl App {
                     Ok(bytes) => host.send(HostRequest::Load(bytes)),
                     Err(e) => self.ui.status = format!("snapshot.csim: {e}"),
                 },
+                UiAction::Reload => self.reload_buildings(),
             }
+        }
+    }
+
+    fn handle_host_events(&mut self) {
+        let Some(host) = &self.host else {
+            return;
+        };
+        for event in host.events() {
+            self.ui.status = match event {
+                HostEvent::Saved(Ok(path)) => format!("saved {}", path.display()),
+                HostEvent::Saved(Err(e)) => format!("save failed: {e}"),
+                HostEvent::Loaded(Ok(tick)) => format!("loaded tick {tick}"),
+                HostEvent::Loaded(Err(e)) => format!("load failed: {e}"),
+                HostEvent::Restarted => "restarted".to_string(),
+                HostEvent::Reloaded(Ok(n)) => {
+                    if let Some(table) = self.content.as_mut().and_then(|w| w.pending.take()) {
+                        self.ui.building_table = table;
+                    }
+                    format!("reloaded buildings.ron: {n} buildings")
+                }
+                HostEvent::Reloaded(Err(e)) => {
+                    if let Some(w) = self.content.as_mut() {
+                        w.pending = None;
+                    }
+                    format!("reload refused: {e}")
+                }
+            };
         }
     }
 
@@ -200,23 +341,16 @@ impl App {
         };
         self.ui.fps = 1000.0 / self.ui.frame_ms.max(0.001);
 
-        // Host events and the newest snapshot; a stalled sim leaves the last one.
-        if let Some(host) = &self.host {
-            for event in host.events() {
-                self.ui.status = match event {
-                    HostEvent::Saved(Ok(path)) => format!("saved {}", path.display()),
-                    HostEvent::Saved(Err(e)) => format!("save failed: {e}"),
-                    HostEvent::Loaded(Ok(tick)) => format!("loaded tick {tick}"),
-                    HostEvent::Loaded(Err(e)) => format!("load failed: {e}"),
-                    HostEvent::Restarted => "restarted".to_string(),
-                };
-            }
-            if let Some(s) = host.take_latest() {
-                self.latest = Some(s);
-                self.latest_at = now;
-            }
+        // Host events, content changes, and the newest snapshot; a stalled sim leaves
+        // the last one.
+        self.handle_host_events();
+        self.poll_content(now);
+        if let Some(s) = self.host.as_ref().and_then(|h| h.take_latest()) {
+            self.latest = Some(s);
+            self.latest_at = now;
         }
         let alpha = self.step_alpha_x256();
+        let preview = self.placement_preview();
         let gfx = self.gfx.as_mut().unwrap();
         let host = self.host.as_ref().unwrap();
 
@@ -254,14 +388,20 @@ impl App {
             gfx.camera.pan(ix as i64, iy as i64);
         }
 
-        // Probe under the cursor, and the colonist there if any.
+        // Probe under the cursor, with the colonist and building there if any.
         let probe = self
             .cursor
             .and_then(|c| gfx.camera.screen_to_cell(c))
             .and_then(|(x, y)| {
                 self.latest.as_ref().and_then(|s| {
-                    s.probe(host.table(), x as u32, y as u32)
-                        .map(|p| ((x, y), p, s.colonist_at(x as u32, y as u32).copied()))
+                    s.probe(host.table(), x as u32, y as u32).map(|p| {
+                        (
+                            (x, y),
+                            p,
+                            s.colonist_at(x as u32, y as u32).copied(),
+                            s.building_at(x as u32, y as u32).copied(),
+                        )
+                    })
                 })
             });
 
@@ -289,7 +429,15 @@ impl App {
                 gfx.renderer.upload(&gfx.gpu.queue, s);
                 self.uploaded = Some(s.clone());
             }
-            let sprites = sprite_instances(s, &gfx.luts, TILE_PX, alpha);
+            let mut sprites = sprite_instances(
+                s,
+                &gfx.luts,
+                &self.ui.building_table,
+                TILE_PX,
+                alpha,
+                self.ui.overlay,
+            );
+            sprites.extend(preview);
             gfx.renderer
                 .set_sprites(&gfx.gpu.device, &gfx.gpu.queue, &sprites);
         }
@@ -384,6 +532,13 @@ impl App {
     }
 }
 
+/// The modification time of `buildings.ron` in a content directory.
+fn buildings_mtime(dir: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(dir.join("buildings.ron"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -402,13 +557,23 @@ impl ApplicationHandler for App {
         ));
         log::info!("surface format {:?}", gpu.surface_format);
         let (w, h) = self.world();
-        let sim =
+        let mut sim =
             scenario::by_name_seeded(&self.opts.scenario, w as usize, h as usize, self.opts.seed)
                 .unwrap_or_else(|| {
                     eprintln!("unknown scenario {:?}; using cave", self.opts.scenario);
                     self.ui.scenario = "cave".to_string();
                     scenario::cave(w as usize, h as usize)
                 });
+        if let Some(dir) = self.content.as_ref().map(|c| c.dir.clone()) {
+            match apply_content(&mut sim, &dir) {
+                Ok(n) => self.ui.status = format!("{n} buildings from {}", dir.display()),
+                Err(e) => {
+                    eprintln!("{e}");
+                    self.ui.status = e;
+                }
+            }
+        }
+        self.ui.building_table = sim.building_table().clone();
         let host = SimHost::spawn(sim, self.opts.speed, false);
         let renderer = CellRenderer::new(
             &gpu.device,
@@ -528,6 +693,7 @@ impl ApplicationHandler for App {
                     MouseButton::Right => self.right_down = down,
                     _ => {}
                 }
+                self.last_tool_cell = None;
                 if down && !consumed && !over_ui {
                     self.apply_tool(button);
                 }

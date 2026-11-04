@@ -1,15 +1,18 @@
 //! `colony-game`: the windowed viewer for the colony-sim kernel, plus offscreen
 //! screenshot and benchmark modes that need no window (but do need a GPU adapter).
+//! A content directory (`--content`, or `colony/content/base` in a checkout) supplies
+//! the building table and is watched so `buildings.ron` hot-reloads.
 
 mod app;
 mod input;
 mod offscreen;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use colony_render::Overlay;
+use colony_sim::Sim;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
@@ -23,6 +26,7 @@ pub struct Options {
     pub speed: u32,
     pub screenshot: Option<PathBuf>,
     pub benchmark: Option<usize>,
+    pub content: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -38,29 +42,51 @@ impl Default for Options {
             speed: 1,
             screenshot: None,
             benchmark: None,
+            content: None,
         }
     }
 }
 
+/// Installs a content pack's buildings into a scenario; the pack's elements must equal
+/// the builtin table the scenarios are built on. Returns the number of buildings.
+pub fn apply_content(sim: &mut Sim, dir: &Path) -> Result<usize, String> {
+    let pack = colony_content::load_pack(dir).map_err(|e| e.to_string())?;
+    if colony_sim::save::table_hash(&pack.elements) != colony_sim::save::table_hash(sim.table()) {
+        return Err(format!(
+            "{}: the pack's elements differ from the builtin table the scenarios use",
+            dir.display()
+        ));
+    }
+    let n = pack.buildings.len();
+    sim.set_building_table(pack.buildings)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(n)
+}
+
 const USAGE: &str =
     "usage: colony-game [--scenario NAME] [--width N] [--height N] [--seed N] [--zoom 1..8]
-                   [--overlay none|temperature|pressure] [--speed 1..3]
+                   [--overlay none|temperature|pressure|power|pipes] [--speed 1..3] [--content DIR]
        colony-game --screenshot FILE.png [--ticks N] [other flags]
        colony-game --benchmark FRAMES [--ticks N] [other flags]
 
-  --scenario    gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave, crew (default cave)
+  --scenario    gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave, crew, yard,
+                powered (default cave)
   --width/--height   world size in cells (default 256 x 192)
   --seed        world seed for the noise and cave scenarios (default 1)
   --ticks       steps to run before a screenshot or benchmark (default 0)
   --zoom        integer zoom, 1 to 8 (default 3)
-  --overlay     none, temperature, or pressure (default none)
+  --overlay     none, temperature, pressure, power, or pipes (default none)
+  --content     a content pack directory (elements.ron, buildings.ron); its buildings.ron is
+                watched and hot-reloaded (default: colony/content/base in a checkout)
   --speed       initial sim speed multiplier, 1 to 3 (default 1)
   --screenshot  render one 1920x1080 frame offscreen to a PNG and exit (needs a GPU adapter)
   --benchmark   render FRAMES frames offscreen at 1920x1080 and report ms per frame
 
 Window controls: WASD or arrows pan, + and - or the wheel zoom, space pauses, 1/2/3 set
-the speed, Q/E/C/N/P/O pick the dig, build, cancel, spawn, pour, or oxygen tool, left
-click applies it, right click pours water, Esc quits. Hover a colonist for its state.";
+the speed, Q/E/B/X/T/C/N/P/O pick the dig, build, place, deconstruct, toggle, cancel,
+spawn, pour, or oxygen tool, left click applies it (the build menu picks what the place
+tool puts down), right click pours water, Esc quits. Hover a cell for its colonist and
+building.";
 
 fn parse_num<T: std::str::FromStr>(s: &str, flag: &str) -> Result<T, String> {
     s.parse()
@@ -102,6 +128,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                     .ok_or_else(|| format!("--overlay: unknown overlay {name:?}"))?;
             }
             "--screenshot" => o.screenshot = Some(PathBuf::from(value(&mut i, flag)?)),
+            "--content" => o.content = Some(PathBuf::from(value(&mut i, flag)?)),
             "--benchmark" => o.benchmark = Some(parse_num(&value(&mut i, flag)?, flag)?),
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown flag {other}\n{USAGE}")),
@@ -142,7 +169,7 @@ mod tests {
     #[test]
     fn defaults_and_every_flag_parse() {
         assert_eq!(parse(&[]).unwrap(), Options::default());
-        let o = parse(&args("--scenario pool --width 64 --height 48 --seed 9 --ticks 20 --zoom 2 --overlay pressure --speed 3 --screenshot out.png --benchmark 50")).unwrap();
+        let o = parse(&args("--scenario pool --width 64 --height 48 --seed 9 --ticks 20 --zoom 2 --overlay pressure --speed 3 --screenshot out.png --benchmark 50 --content packs/base")).unwrap();
         assert_eq!(o.scenario, "pool");
         assert_eq!(
             (o.width, o.height, o.seed, o.ticks, o.zoom, o.speed),
@@ -151,6 +178,19 @@ mod tests {
         assert_eq!(o.overlay, Overlay::Pressure);
         assert_eq!(o.screenshot, Some(PathBuf::from("out.png")));
         assert_eq!(o.benchmark, Some(50));
+        assert_eq!(o.content, Some(PathBuf::from("packs/base")));
+        assert_eq!(
+            parse(&args("--overlay power")).unwrap().overlay,
+            Overlay::Power
+        );
+    }
+
+    #[test]
+    fn the_base_pack_installs_into_a_scenario() {
+        let dir = colony_content::base_dir().expect("a source checkout has the base pack");
+        let mut sim = colony_sim::scenario::yard(32, 12, 1, 0);
+        assert_eq!(apply_content(&mut sim, &dir), Ok(17));
+        assert!(apply_content(&mut sim, Path::new("/nonexistent")).is_err());
     }
 
     #[test]

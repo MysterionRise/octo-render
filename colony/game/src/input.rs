@@ -14,6 +14,12 @@ pub enum Tool {
     Dig,
     /// Order the cell built from debris (it must not be solid).
     Build,
+    /// Place the selected building with its bottom-left cell here.
+    Place,
+    /// Remove a planned building, or order a built one taken apart.
+    Deconstruct,
+    /// Flip a building's enabled switch.
+    Toggle,
     /// Cancel the orders on the cell.
     Cancel,
     /// Add a colonist on the cell.
@@ -25,9 +31,12 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 6] = [
+    pub const ALL: [Tool; 9] = [
         Tool::Dig,
         Tool::Build,
+        Tool::Place,
+        Tool::Deconstruct,
+        Tool::Toggle,
         Tool::Cancel,
         Tool::Spawn,
         Tool::Pour,
@@ -38,6 +47,9 @@ impl Tool {
         match self {
             Tool::Dig => "dig (Q)",
             Tool::Build => "build (E)",
+            Tool::Place => "place (B)",
+            Tool::Deconstruct => "deconstruct (X)",
+            Tool::Toggle => "toggle (T)",
             Tool::Cancel => "cancel (C)",
             Tool::Spawn => "spawn (N)",
             Tool::Pour => "pour (P)",
@@ -46,11 +58,14 @@ impl Tool {
     }
 }
 
-/// The command a tool sends for a cell.
-pub fn command_for(tool: Tool, x: usize, y: usize) -> Command {
+/// The command a tool sends for a cell; `def` is the building the place tool uses.
+pub fn command_for(tool: Tool, x: usize, y: usize, def: u16) -> Command {
     match tool {
         Tool::Dig => Command::Dig { x, y },
         Tool::Build => Command::Build { x, y },
+        Tool::Place => Command::Place { def, x, y },
+        Tool::Deconstruct => Command::Deconstruct { x, y },
+        Tool::Toggle => Command::Toggle { x, y },
         Tool::Cancel => Command::CancelOrders { x, y },
         Tool::Spawn => Command::SpawnColonist { x, y },
         Tool::Pour => Command::SetCell {
@@ -70,10 +85,10 @@ pub fn command_for(tool: Tool, x: usize, y: usize) -> Command {
     }
 }
 
-/// Whether dragging with the button held keeps applying the tool (orders and paints
-/// do; spawning does not, one colonist per click).
+/// Whether dragging with the button held keeps applying the tool to new cells
+/// (orders, placements, and paints do; spawning and toggling act once per click).
 pub fn drags(tool: Tool) -> bool {
-    tool != Tool::Spawn
+    !matches!(tool, Tool::Spawn | Tool::Toggle)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +120,9 @@ pub fn map_key(code: KeyCode) -> Option<Action> {
         Digit3 | Numpad3 => Action::Speed(3),
         KeyQ => Action::Tool(Tool::Dig),
         KeyE => Action::Tool(Tool::Build),
+        KeyB => Action::Tool(Tool::Place),
+        KeyX => Action::Tool(Tool::Deconstruct),
+        KeyT => Action::Tool(Tool::Toggle),
         KeyC => Action::Tool(Tool::Cancel),
         KeyN => Action::Tool(Tool::Spawn),
         KeyP => Action::Tool(Tool::Pour),
@@ -158,6 +176,12 @@ mod tests {
         assert_eq!(map_key(KeyCode::Escape), Some(Action::Quit));
         assert_eq!(map_key(KeyCode::KeyQ), Some(Action::Tool(Tool::Dig)));
         assert_eq!(map_key(KeyCode::KeyE), Some(Action::Tool(Tool::Build)));
+        assert_eq!(map_key(KeyCode::KeyB), Some(Action::Tool(Tool::Place)));
+        assert_eq!(
+            map_key(KeyCode::KeyX),
+            Some(Action::Tool(Tool::Deconstruct))
+        );
+        assert_eq!(map_key(KeyCode::KeyT), Some(Action::Tool(Tool::Toggle)));
         assert_eq!(map_key(KeyCode::KeyC), Some(Action::Tool(Tool::Cancel)));
         assert_eq!(map_key(KeyCode::KeyN), Some(Action::Tool(Tool::Spawn)));
         assert_eq!(map_key(KeyCode::KeyP), Some(Action::Tool(Tool::Pour)));
@@ -167,21 +191,33 @@ mod tests {
 
     #[test]
     fn every_tool_maps_a_click_to_a_command() {
-        assert_eq!(command_for(Tool::Dig, 3, 4), Command::Dig { x: 3, y: 4 });
+        assert_eq!(command_for(Tool::Dig, 3, 4, 0), Command::Dig { x: 3, y: 4 });
         assert_eq!(
-            command_for(Tool::Build, 3, 4),
+            command_for(Tool::Build, 3, 4, 0),
             Command::Build { x: 3, y: 4 }
         );
         assert_eq!(
-            command_for(Tool::Cancel, 3, 4),
+            command_for(Tool::Place, 3, 4, 7),
+            Command::Place { def: 7, x: 3, y: 4 }
+        );
+        assert_eq!(
+            command_for(Tool::Deconstruct, 3, 4, 7),
+            Command::Deconstruct { x: 3, y: 4 }
+        );
+        assert_eq!(
+            command_for(Tool::Toggle, 3, 4, 7),
+            Command::Toggle { x: 3, y: 4 }
+        );
+        assert_eq!(
+            command_for(Tool::Cancel, 3, 4, 0),
             Command::CancelOrders { x: 3, y: 4 }
         );
         assert_eq!(
-            command_for(Tool::Spawn, 3, 4),
+            command_for(Tool::Spawn, 3, 4, 0),
             Command::SpawnColonist { x: 3, y: 4 }
         );
         assert!(matches!(
-            command_for(Tool::Pour, 3, 4),
+            command_for(Tool::Pour, 3, 4, 0),
             Command::SetCell {
                 x: 3,
                 y: 4,
@@ -190,15 +226,16 @@ mod tests {
             }
         ));
         assert!(matches!(
-            command_for(Tool::Oxygen, 1, 1),
+            command_for(Tool::Oxygen, 1, 1, 0),
             Command::SetCell {
                 element: builtin::OXYGEN,
                 ..
             }
         ));
-        assert!(drags(Tool::Dig) && !drags(Tool::Spawn));
+        assert!(drags(Tool::Dig) && drags(Tool::Place));
+        assert!(!drags(Tool::Spawn) && !drags(Tool::Toggle));
         assert_eq!(Tool::default(), Tool::Dig);
-        assert_eq!(Tool::ALL.len(), 6);
+        assert_eq!(Tool::ALL.len(), 9);
     }
 
     #[test]

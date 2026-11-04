@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 colony-sim = { path = "../sim" }
 colony-render = { path = "../render" }
+colony-content = { path = "../content" }
 octo-gpu = { path = "../../crates/gpu" }
 wgpu = "24"
 winit = "0.30"

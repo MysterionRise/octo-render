@@ -9,7 +9,7 @@ use colony_render::palette::Luts;
 use colony_render::{sprite_instances, CellRenderer, PixelCamera, Snapshot, TILE_PX};
 use colony_sim::{scenario, TickStats};
 
-use crate::Options;
+use crate::{apply_content, Options};
 
 pub const FRAME_SIZE: (u32, u32) = (1920, 1080);
 
@@ -28,6 +28,12 @@ pub fn run(opts: &Options) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+    if let Some(dir) = &opts.content {
+        if let Err(e) = apply_content(&mut sim, dir) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
     let n = sim.chunks().len();
     let mut stats = TickStats::fresh(n, 0);
     for _ in 0..opts.ticks {
@@ -41,7 +47,14 @@ pub fn run(opts: &Options) -> ExitCode {
     renderer.set_sprites(
         &device,
         &queue,
-        &sprite_instances(&snapshot, &luts, TILE_PX, 0),
+        &sprite_instances(
+            &snapshot,
+            &luts,
+            sim.building_table(),
+            TILE_PX,
+            0,
+            opts.overlay,
+        ),
     );
     let camera = PixelCamera::new(world, TILE_PX, FRAME_SIZE, opts.zoom);
     renderer.set_view(&queue, &camera, opts.overlay);
