@@ -81,10 +81,50 @@ pub fn conduct_cell(grid: &Grid, x: usize, y: usize) -> CellOut {
     }
 }
 
+/// One side of an exchange: heat capacity (Q16.16 J/K), conductivity (Q16.16 J/(K·tick)),
+/// phase, and temperature.
+#[derive(Clone, Copy, Debug)]
+pub struct Body {
+    pub cap: i64,
+    pub conduct: i64,
+    pub phase: Phase,
+    pub temp: i32,
+}
+
+/// The energy (Q16.16 J) that flows from the warmer of two bodies to the cooler one in
+/// one exchange: `min(conductivities) × pair_mult × |ΔT|`, clamped to a quarter of the
+/// smaller capacity times `|ΔT|`. Zero when either body has no capacity. The one rule
+/// for cells, pipe packets, and anything else that conducts.
+pub fn pair_flow(table: &ElementTable, a: Body, b: Body) -> u64 {
+    if a.cap <= 0 || b.cap <= 0 {
+        return 0;
+    }
+    let dt = (a.temp as i64 - b.temp as i64).unsigned_abs();
+    if dt == 0 {
+        return 0;
+    }
+    let k = (a.conduct.min(b.conduct) * table.pair_mult(a.phase, b.phase)) >> 16;
+    if k == 0 {
+        return 0;
+    }
+    let q = scale_mag(dt, k);
+    let cap_min = a.cap.min(b.cap) as u64;
+    let q_max = match dt.checked_mul(cap_min) {
+        Some(product) => (product / 4) >> 16,
+        None => ((dt as u128 * cap_min as u128 / 4) >> 16) as u64,
+    };
+    q.min(q_max)
+}
+
 /// The cell's temperature after conduction, or `None` when nothing moved.
 fn conduct(grid: &Grid, st: &Stencil, cap_c: i64) -> Option<i32> {
     let c = &st.cell;
-    let k_c = grid.table.conduct(c.element);
+    let body_c = Body {
+        cap: cap_c,
+        conduct: grid.table.conduct(c.element),
+        phase: c.phase,
+        temp: c.temp,
+    };
     let mut dq: i128 = 0;
     let mut active = false;
     for n in st.iter() {
@@ -92,23 +132,13 @@ fn conduct(grid: &Grid, st: &Stencil, cap_c: i64) -> Option<i32> {
         if dt == 0 {
             continue;
         }
-        let cap_n = capacity(grid, n);
-        if cap_n == 0 {
-            continue;
-        }
-        let k =
-            (k_c.min(grid.table.conduct(n.element)) * grid.table.pair_mult(c.phase, n.phase)) >> 16;
-        if k == 0 {
-            continue;
-        }
-        let mag = dt.unsigned_abs();
-        let q = scale_mag(mag, k);
-        let cap_min = cap_c.min(cap_n) as u64;
-        let q_max = match mag.checked_mul(cap_min) {
-            Some(product) => (product / 4) >> 16,
-            None => ((mag as u128 * cap_min as u128 / 4) >> 16) as u64,
+        let body_n = Body {
+            cap: capacity(grid, n),
+            conduct: grid.table.conduct(n.element),
+            phase: n.phase,
+            temp: n.temp,
         };
-        let q = q.min(q_max);
+        let q = pair_flow(grid.table, body_c, body_n);
         if q != 0 {
             active = true;
             dq += if dt > 0 { q as i128 } else { -(q as i128) };

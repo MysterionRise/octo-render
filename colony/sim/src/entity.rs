@@ -98,6 +98,11 @@ impl<T> Arena<T> {
         }
     }
 
+    /// The live value in a slot by index alone (for callers that hold slot indices).
+    pub fn get_mut_slot(&mut self, index: u32) -> Option<&mut T> {
+        self.slots.get_mut(index as usize).and_then(|s| s.as_mut())
+    }
+
     pub fn len(&self) -> usize {
         self.slots.len() - self.free.len()
     }

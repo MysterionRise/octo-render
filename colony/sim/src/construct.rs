@@ -4,7 +4,7 @@
 //! `Sim::add_heat`, so the gather passes see it next tick and nothing is written during a
 //! pass. Mass moves between cells, items, and buildings in closed transfers.
 
-use crate::agent::{Colonist, DEFAULT_PRIORITY};
+use crate::agent::{Colonist, DEFAULT_PRIORITY, OPERATE_TICKS};
 use crate::building::{Building, BuildingKind, BuildingState, BuildingTable};
 use crate::element::{ElementId, Phase};
 use crate::entity::EntityId;
@@ -23,6 +23,9 @@ pub const DELIVER_PRIORITY: u8 = 2;
 
 /// How many ticks of feed an oxygen generator stores.
 pub const FEED_STORE_TICKS: u64 = 600;
+
+/// Operating a hand crank ranks below digging and building.
+pub const OPERATE_PRIORITY: u8 = 4;
 
 impl Sim {
     pub fn buildings(&self) -> &crate::entity::Arena<Building> {
@@ -97,6 +100,40 @@ impl Sim {
         true
     }
 
+    /// Places a building already built, with no material taken from anywhere (door
+    /// cells are created from the cost). For scenarios and tests; it does not conserve
+    /// mass against an earlier state.
+    pub fn place_built(&mut self, def: u16, x: usize, y: usize) -> Option<EntityId> {
+        if !self.placement_valid(def, x, y) {
+            return None;
+        }
+        let d = self.building_table.get(def).clone();
+        let mut b = Building::new(def, x as u32, y as u32);
+        b.state = BuildingState::Built;
+        if d.kind == BuildingKind::Door {
+            if let Some((element, cost)) = d.cost {
+                let n = d.cells();
+                let each = cost.raw() / n;
+                let remainder = cost.raw() - each * n;
+                for (i, (cx, cy)) in b.footprint(&d).enumerate() {
+                    let m = each + if i == 0 { remainder } else { 0 };
+                    self.set_cell(
+                        cx as usize,
+                        cy as usize,
+                        element,
+                        Mass(m),
+                        Temp::from_kelvin(295),
+                    );
+                }
+            }
+        } else {
+            b.material = d.cost.map(|(e, m)| (e, m, Temp::from_kelvin(295)));
+        }
+        let id = self.buildings.insert(b);
+        self.occupy(id);
+        Some(id)
+    }
+
     /// Places a building as `Planned` and opens its construction job.
     pub fn place(&mut self, def: u16, x: usize, y: usize) -> Option<EntityId> {
         if !self.placement_valid(def, x, y) {
@@ -124,6 +161,22 @@ impl Sim {
         } else {
             self.remove_building(id, (x as u32, y as u32));
         }
+        true
+    }
+
+    /// Banks operating ticks on a hand crank, as a colonist's stint would; `false` for
+    /// anything else. For tests and tools.
+    pub fn operate(&mut self, id: EntityId, ticks: u16) -> bool {
+        let Some(b) = self.buildings.get_mut(id) else {
+            return false;
+        };
+        if !matches!(
+            self.building_table.get(b.def).kind,
+            BuildingKind::HandCrank { .. }
+        ) {
+            return false;
+        }
+        b.work = b.work.saturating_add(ticks);
         true
     }
 
@@ -418,6 +471,39 @@ impl Sim {
         true
     }
 
+    /// Whether a hand crank wants a colonist: built, enabled, its bank nearly empty, and
+    /// its component has a consumer or a battery that is not full.
+    fn crank_wanted(&self, id: EntityId) -> bool {
+        let Some(b) = self.buildings.get(id) else {
+            return false;
+        };
+        if !b.is_built() || !b.enabled || b.work >= OPERATE_TICKS {
+            return false;
+        }
+        if !matches!(
+            self.building_table.get(b.def).kind,
+            BuildingKind::HandCrank { .. }
+        ) {
+            return false;
+        }
+        let Some(&ci) = self.networks.component_of.get(id.index as usize) else {
+            return false;
+        };
+        if ci == crate::construct::NO_BUILDING {
+            return false;
+        }
+        self.networks.power[ci as usize].members.iter().any(|&s| {
+            let Some(m) = self.buildings.slot(s as usize).1 else {
+                return false;
+            };
+            let def = self.building_table.get(m.def);
+            match def.kind {
+                BuildingKind::Battery { capacity } => m.is_built() && m.battery < capacity,
+                _ => m.is_built() && m.enabled && def.consumes_power(),
+            }
+        })
+    }
+
     /// Opens the delivery and operating jobs buildings want (deduplicated by the board).
     fn regenerate_building_jobs(&mut self) {
         for id in self.buildings.ids() {
@@ -425,14 +511,80 @@ impl Sim {
                 self.jobs
                     .add(JobKind::Deliver { building: id }, DELIVER_PRIORITY);
             }
+            if self.crank_wanted(id) {
+                self.jobs
+                    .add(JobKind::Operate { building: id }, OPERATE_PRIORITY);
+            }
         }
     }
 
-    /// The buildings pass: network rebuilds and steps, then every building's effect.
-    pub(crate) fn buildings_step(&mut self) {
-        if self.networks_dirty {
-            self.networks_dirty = false;
+    /// Every tick: heaters warm their cell, oxygen generators turn stored feedstock into
+    /// gas and heat. Each effect is a closed transfer plus an accounted injection.
+    fn building_effects(&mut self) {
+        for id in self.buildings.ids() {
+            let b = self.buildings.get(id).unwrap().clone();
+            if !b.is_built() || !b.enabled || !b.powered {
+                continue;
+            }
+            let (x, y) = (b.x as usize, b.y as usize);
+            match self.building_table.get(b.def).kind {
+                BuildingKind::Heater { joules_per_tick } => {
+                    let added = self.add_heat(x, y, joules_per_tick);
+                    self.energy_injected += added;
+                    self.buildings.get_mut(id).unwrap().blocked = added == 0;
+                }
+                BuildingKind::OxygenGenerator {
+                    feed_per_tick,
+                    output,
+                    joules_per_tick,
+                    ..
+                } => {
+                    let Some((fe, fm, ft)) = b.stored else {
+                        self.buildings.get_mut(id).unwrap().blocked = true;
+                        continue;
+                    };
+                    let (el, m, t) = self.world.get(x, y);
+                    let room = el == ElementId::VACUUM
+                        || (el == output
+                            && m.raw() as u64 + feed_per_tick.raw() as u64
+                                <= crate::network::GAS_CAP.raw() as u64);
+                    if fm < feed_per_tick || !room {
+                        self.buildings.get_mut(id).unwrap().blocked = true;
+                        continue;
+                    }
+                    let feed = feed_per_tick.raw();
+                    let before = self.cell_energy(x, y)
+                        + (((feed as i64 * self.table.shc(fe.0)) >> 16) as i128 * ft.raw() as i128);
+                    let (mass, temp) = if el == ElementId::VACUUM {
+                        (Mass(feed), ft)
+                    } else {
+                        (
+                            Mass(m.raw() + feed),
+                            Temp(mix_temp(
+                                m.raw() as u64,
+                                t.raw(),
+                                feed as u64,
+                                feed as i128 * ft.raw() as i128,
+                            )),
+                        )
+                    };
+                    self.set_cell(x, y, output, mass, temp);
+                    self.energy_injected += self.cell_energy(x, y) - before;
+                    self.energy_injected += self.add_heat(x, y, joules_per_tick);
+                    let g = self.buildings.get_mut(id).unwrap();
+                    g.stored = (fm.raw() > feed).then_some((fe, Mass(fm.raw() - feed), ft));
+                    g.blocked = false;
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// The buildings pass: network rebuilds and steps, every building's effect, then
+    /// the jobs buildings want.
+    pub(crate) fn buildings_step(&mut self) {
+        self.step_networks();
+        self.building_effects();
         self.regenerate_building_jobs();
     }
 }

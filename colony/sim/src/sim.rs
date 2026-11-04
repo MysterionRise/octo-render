@@ -19,6 +19,7 @@ use crate::heat::capacity;
 use crate::item::Item;
 use crate::job::{JobBoard, JobCounts, JobKind};
 use crate::nav::NavGrid;
+use crate::network::{NetworkStats, Networks};
 use crate::world::{CellBuffers, CellOut, Grid, World};
 use crate::{fluid, heat};
 
@@ -41,6 +42,7 @@ pub struct TickStats {
     pub jobs: JobCounts,
     pub colonists: u32,
     pub buildings: u32,
+    pub networks: NetworkStats,
 }
 
 impl TickStats {
@@ -55,6 +57,7 @@ impl TickStats {
             jobs: JobCounts::default(),
             colonists: 0,
             buildings: 0,
+            networks: NetworkStats::default(),
         }
     }
 }
@@ -116,6 +119,7 @@ pub struct Sim {
     pub(crate) special: Vec<u8>,
     /// Set when buildings were placed, removed, or finished, so networks rebuild.
     pub(crate) networks_dirty: bool,
+    pub(crate) networks: Networks,
     pub(crate) energy_injected: i128,
 }
 
@@ -208,6 +212,7 @@ impl Sim {
             cell_building: vec![crate::construct::NO_BUILDING; cells],
             special: vec![0; cells],
             networks_dirty: true,
+            networks: Networks::default(),
             energy_injected,
         };
         sim.rebuild_occupancy();
@@ -376,25 +381,38 @@ impl Sim {
         self.tick_activity_heat[idx] = true;
     }
 
-    /// Adds `joules` (Q16.16, may be negative) to a cell's energy by raising its
-    /// temperature; `false` (and nothing injected) when the cell has no heat capacity.
-    /// The caller accounts the energy in `energy_injected`.
-    pub fn add_heat(&mut self, x: usize, y: usize, joules: i64) -> bool {
+    /// Adds `joules` (Q16.16, may be negative) to a cell's energy by changing its
+    /// temperature. Returns the energy actually added (Q32.32, the temperature step
+    /// times the capacity; zero when the cell has no heat capacity), which the caller
+    /// accounts in `energy_injected`.
+    pub fn add_heat(&mut self, x: usize, y: usize, joules: i64) -> i128 {
         let (element, mass, temp) = self.world.get(x, y);
         let cap = (mass.raw() as i64 * self.table.shc(element.0)) >> 16;
         if cap <= 0 {
-            return false;
+            return 0;
         }
         let delta = ((joules as i128) << 16) / cap as i128;
         let new_temp =
             (temp.raw() as i128 + delta).clamp(i32::MIN as i128, i32::MAX as i128) as i32;
         if new_temp == temp.raw() {
-            return false;
+            return 0;
         }
         self.world
             .set(&self.table, x, y, element, mass, Temp(new_temp));
         self.touch_chunk(x, y);
-        true
+        (new_temp as i128 - temp.raw() as i128) * cap as i128
+    }
+
+    /// Energy of one cell (Q32.32 joules): capacity times temperature.
+    pub fn cell_energy(&self, x: usize, y: usize) -> i128 {
+        let (element, mass, temp) = self.world.get(x, y);
+        let cap = (mass.raw() as i64 * self.table.shc(element.0)) >> 16;
+        cap as i128 * temp.raw() as i128
+    }
+
+    /// The networks (power components, pipe runs, automation) as last rebuilt.
+    pub fn networks(&self) -> &Networks {
+        &self.networks
     }
 
     /// Fills the half-open rectangle `[x0, x1) × [y0, y1)`.
@@ -496,6 +514,7 @@ impl Sim {
             jobs: self.jobs.counts(),
             colonists: self.colonists.len() as u32,
             buildings: self.buildings.len() as u32,
+            networks: self.networks.stats,
         };
         self.jobs.prune(self.tick);
         self.tick += 1;

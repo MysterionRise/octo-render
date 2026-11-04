@@ -32,16 +32,17 @@ fn mass_is_conserved_exactly_in_every_scenario() {
 fn energy_drift_stays_within_the_rounding_bound() {
     for name in scenario::NAMES {
         let mut sim = scenario::by_name(name, 70, 45).unwrap();
-        let start = sim.total_energy();
+        let start = sim.total_energy() - sim.energy_injected();
         let ticks = 300;
         for _ in 0..ticks {
             sim.step();
         }
         // Each cell can lose at most one raw temperature unit per exchange to
         // truncation, in the heat pass and again in the flux mixing: two LSBs × its
-        // capacity per tick, summed over the world.
+        // capacity per tick, summed over the world. Heaters and generators inject
+        // energy on purpose; the ledger subtracts what they recorded.
         let bound = 2 * ticks as i128 * sim.total_capacity();
-        let drift = (sim.total_energy() - start).abs();
+        let drift = (sim.total_energy() - sim.energy_injected() - start).abs();
         assert!(
             drift <= bound,
             "{name}: energy drift {drift} exceeds bound {bound}"

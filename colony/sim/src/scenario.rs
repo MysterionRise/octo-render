@@ -8,7 +8,7 @@ use crate::rng::Pcg32;
 use crate::sim::Sim;
 
 /// Names accepted by [`by_name`].
-pub const NAMES: [&str; 9] = [
+pub const NAMES: [&str; 10] = [
     "gas-mixing",
     "settled",
     "pressure-burst",
@@ -18,6 +18,7 @@ pub const NAMES: [&str; 9] = [
     "cave",
     "crew",
     "yard",
+    "powered",
 ];
 
 /// Builds a scenario by name with seed 1; see [`by_name_seeded`].
@@ -41,6 +42,7 @@ pub fn by_name_seeded(name: &str, width: usize, height: usize, seed: u64) -> Opt
         "cave" => Some(cave_with_colonists(width, height, seed, 4)),
         "crew" => Some(crew(width, height, seed)),
         "yard" => Some(yard(width, height, seed, 4)),
+        "powered" => Some(powered(width, height, seed, 4)),
         _ => None,
     }
 }
@@ -290,6 +292,52 @@ pub fn yard(width: usize, height: usize, seed: u64, colonists: usize) -> Sim {
     for x in spots.into_iter().step_by(stride).take(colonists) {
         sim.spawn_colonist(x, 2);
     }
+    sim
+}
+
+/// A yard with a working colony's worth of machinery already built: a hand crank, wire,
+/// a battery, a heater under a temperature sensor whose NOT gate switches it (a
+/// thermostat), and a gas pump feeding a pipe run to a vent. Colonists keep the crank
+/// turning. Worlds under 32×10 get the plain yard.
+pub fn powered(width: usize, height: usize, seed: u64, colonists: usize) -> Sim {
+    use crate::building::ids;
+    let mut sim = yard(width, height, seed, colonists);
+    if width < 32 || height < 10 {
+        return sim;
+    }
+    let temp = Temp::from_kelvin(295);
+    let x0 = 6usize;
+    for x in x0 - 1..=x0 + 22 {
+        if sim.world().get(x, 2).0 == builtin::SANDSTONE {
+            sim.set_cell(x, 2, builtin::OXYGEN, Mass::from_kg(1), temp);
+        }
+    }
+    sim.refresh_nav();
+    let built = |sim: &mut Sim, def: u16, x: usize, y: usize| {
+        sim.place_built(def, x, y)
+            .unwrap_or_else(|| panic!("powered: cannot place {def} at ({x}, {y})"));
+    };
+    built(&mut sim, ids::HAND_CRANK, x0, 2);
+    for x in x0 + 2..x0 + 10 {
+        built(&mut sim, ids::WIRE, x, 2);
+    }
+    built(&mut sim, ids::BATTERY, x0 + 10, 2);
+    for x in x0 + 12..x0 + 14 {
+        built(&mut sim, ids::WIRE, x, 2);
+    }
+    built(&mut sim, ids::HEATER, x0 + 14, 2);
+    built(&mut sim, ids::WIRE, x0 + 15, 2);
+    built(&mut sim, ids::GAS_PUMP, x0 + 16, 2);
+    built(&mut sim, ids::GAS_PIPE, x0 + 16, 3);
+    built(&mut sim, ids::GAS_PIPE, x0 + 16, 4);
+    for x in x0 + 17..x0 + 20 {
+        built(&mut sim, ids::GAS_PIPE, x, 4);
+    }
+    built(&mut sim, ids::GAS_VENT, x0 + 20, 4);
+    built(&mut sim, ids::TEMPERATURE_SENSOR, x0 + 14, 3);
+    built(&mut sim, ids::SIGNAL_WIRE, x0 + 14, 4);
+    built(&mut sim, ids::NOT_GATE, x0 + 13, 4);
+    sim.refresh_nav();
     sim
 }
 
