@@ -66,6 +66,25 @@ fn tick_benches(c: &mut Criterion) {
     });
     group.finish();
 
+    // M5: the buildings pass alone (networks, effects, job regeneration) on the powered
+    // scenario, and its whole tick.
+    let mut group = c.benchmark_group("buildings");
+    group.bench_function(BenchmarkId::new("powered-pass-buildings", 512), |b| {
+        let mut sim = scenario::powered(512, 512, 1, 4);
+        sim.set_parallel(false);
+        b.iter(|| {
+            sim.begin_tick();
+            sim.pass_buildings();
+            sim.end_tick()
+        });
+    });
+    group.bench_function(BenchmarkId::new("powered-tick-sequential", 512), |b| {
+        let mut sim = scenario::powered(512, 512, 1, 4);
+        sim.set_parallel(false);
+        b.iter(|| sim.step());
+    });
+    group.finish();
+
     let mut group = c.benchmark_group("hash");
     group.bench_function("state-hash-512", |b| {
         let sim = scenario::crew(512, 512, 1);

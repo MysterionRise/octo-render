@@ -21,20 +21,25 @@ struct Options {
     compare: Option<(PathBuf, PathBuf)>,
     profile: bool,
     seed: u64,
+    content: Option<PathBuf>,
 }
 
 const USAGE: &str = "usage: colony-headless [--scenario NAME] [--width N] [--height N] [--ticks N]
                        [--threads N] [--hash-out FILE] [--png-dir DIR] [--png-every N] [--profile] [--seed N]
+                       [--content DIR]
        colony-headless --compare A.hashes B.hashes
 
-  --scenario   gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave, crew (default gas-mixing)
+  --scenario   gas-mixing, settled, pressure-burst, hot-rock, noise, pool, cave, crew, yard,
+               powered (default gas-mixing)
   --width/--height   world size in cells (default 512 x 512)
   --ticks      ticks to run (default 300)
   --threads    0 = all cores, 1 = sequential (default 1)
   --hash-out   write one 'tick hash' line per tick
   --png-dir    write element and temperature PNGs every --png-every ticks (default 100)
-  --profile    also report the time spent in each pass (sort, flux, heat)
+  --profile    also report the time spent in each pass (buildings, sort, flux, heat, agents)
   --seed       world seed for the noise and cave scenarios (default 1)
+  --content    a content pack directory (elements.ron, buildings.ron); its elements must
+               equal the builtin table and its buildings extend the builtin ones
   --compare    print the first tick where two hash logs differ";
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -50,6 +55,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         compare: None,
         profile: false,
         seed: 1,
+        content: None,
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> Result<String, String> {
@@ -76,6 +82,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             "--profile" => o.profile = true,
             "--seed" => o.seed = parse_num(&value(&mut i, flag)?, flag)? as u64,
+            "--content" => o.content = Some(PathBuf::from(value(&mut i, flag)?)),
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown flag {other}\n{USAGE}")),
         }
@@ -148,6 +155,31 @@ fn run(opts: &Options) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+    if let Some(dir) = &opts.content {
+        match colony_content::load_pack(dir) {
+            Ok(pack) => {
+                if colony_sim::save::table_hash(&pack.elements)
+                    != colony_sim::save::table_hash(sim.table())
+                {
+                    eprintln!(
+                        "{}: the pack's elements differ from the builtin table the scenarios use",
+                        dir.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let n = pack.buildings.len();
+                if let Err(e) = sim.set_building_table(pack.buildings) {
+                    eprintln!("{}: {e}", dir.display());
+                    return ExitCode::FAILURE;
+                }
+                println!("content: {} buildings from {}", n, dir.display());
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     sim.set_parallel(opts.threads != 1);
     let pool = match opts.threads {
         1 => None,
@@ -164,12 +196,12 @@ fn run(opts: &Options) -> ExitCode {
     }
     let mut hashes = String::new();
     let mut times = Vec::with_capacity(opts.ticks);
-    let mut pass_times = [std::time::Duration::ZERO; 4];
+    let mut pass_times = [std::time::Duration::ZERO; 5];
     let mut processed_total = 0usize;
     let mut processed_mass_total = 0usize;
     let mut path_solves_total = 0usize;
     let start_mass = sim.total_mass();
-    let start_energy = sim.total_energy();
+    let start_energy = sim.total_energy() - sim.energy_injected();
     let chunks = sim.chunks().len();
     println!(
         "scenario {} {}x{} ({} chunks), {} ticks, threads {}",
@@ -190,17 +222,20 @@ fn run(opts: &Options) -> ExitCode {
             let mut timed = || {
                 sim.begin_tick();
                 let mut mark = Instant::now();
-                sim.pass_sort();
+                sim.pass_buildings();
                 pass_times[0] += mark.elapsed();
                 mark = Instant::now();
-                sim.pass_flux();
+                sim.pass_sort();
                 pass_times[1] += mark.elapsed();
                 mark = Instant::now();
-                sim.pass_heat();
+                sim.pass_flux();
                 pass_times[2] += mark.elapsed();
                 mark = Instant::now();
-                sim.pass_agents();
+                sim.pass_heat();
                 pass_times[3] += mark.elapsed();
+                mark = Instant::now();
+                sim.pass_agents();
+                pass_times[4] += mark.elapsed();
                 sim.end_tick()
             };
             match &pool {
@@ -258,11 +293,28 @@ fn run(opts: &Options) -> ExitCode {
     if opts.profile {
         let per = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / n as f64;
         println!(
-            "passes: sort {:.3} ms, flux {:.3} ms, heat {:.3} ms, agents {:.3} ms per tick",
+            "passes: buildings {:.3} ms, sort {:.3} ms, flux {:.3} ms, heat {:.3} ms, agents {:.3} ms per tick",
             per(pass_times[0]),
             per(pass_times[1]),
             per(pass_times[2]),
-            per(pass_times[3])
+            per(pass_times[3]),
+            per(pass_times[4])
+        );
+    }
+    if !sim.buildings().is_empty() {
+        let n = sim.networks().stats;
+        println!(
+            "buildings: {} ({} built), {} power components, {} pipe runs, {} signal networks; last step generated {} J, consumed {} J, {} brown-outs, {} packets; {} J injected in all",
+            sim.buildings().len(),
+            sim.buildings().iter().filter(|(_, b)| b.is_built()).count(),
+            n.power_components,
+            n.pipe_networks,
+            n.signal_networks,
+            n.generated >> 16,
+            n.consumed >> 16,
+            n.brownouts,
+            n.packets,
+            sim.energy_injected() >> 32
         );
     }
     if !sim.colonists().is_empty() {
@@ -292,7 +344,7 @@ fn run(opts: &Options) -> ExitCode {
             "NOT CONSERVED"
         }
     );
-    let drift = sim.total_energy() - start_energy;
+    let drift = sim.total_energy() - sim.energy_injected() - start_energy;
     let bound = 2 * n as i128 * sim.total_capacity();
     println!(
         "energy: drift {} of bound {} ({})",

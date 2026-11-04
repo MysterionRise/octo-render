@@ -72,3 +72,14 @@ fn golden_crew_128x96_seed_1_after_200_ticks_pins_entities_too() {
     }
     check("crew-128x96-1-200.hash", sim.state_hash());
 }
+
+#[test]
+fn golden_powered_128x64_seed_1_after_300_ticks_pins_buildings_and_networks() {
+    let mut sim = scenario::powered(128, 64, 1, 4);
+    for _ in 0..300 {
+        sim.step();
+    }
+    assert!(sim.energy_injected() > 0, "the heater ran");
+    assert!(sim.networks().stats.packets > 0, "the pump ran");
+    check("powered-128x64-1-300.hash", sim.state_hash());
+}
